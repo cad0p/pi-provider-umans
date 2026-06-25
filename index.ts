@@ -848,6 +848,13 @@ export default async function (pi: ExtensionAPI) {
       const limit = concurrencyLimit();
       // Unlimited plan: skip the capacity check (still honor priority.low).
       const capacityFree = async (): Promise<boolean> => {
+        // C2: consult the SHARED pause before launching. A 429 observed by any
+        // local process writes pausedUntil to the shared file; reading it here
+        // makes every sibling back off immediately, even before /usage
+        // propagates priority.low (5s refresh lag, or a transient gateway-side
+        // blip not yet reflected in /usage). Without this, process B would see
+        // priority.low === false and launch right into the 429 that A just hit.
+        if (concurrencyQueue.snapshot().paused) return false;
         if (limit === undefined) return true; // Code Max / unlimited
         const snap = await fetchUsageSnapshot(apiKey);
         if (!snap) return true; // /usage unreachable → don't block forever; trust headroom

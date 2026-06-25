@@ -289,6 +289,34 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- C2: shared pausedUntil is read by a sibling before launching ---
+// capacityFree (the head-waiter poll in acquireSlot) now consults
+// concurrencyQueue.snapshot().paused before launching, so a 429 observed by
+// process A immediately backs off process B even before /usage propagates
+// priority.low. Since capacityFree is a closure, we assert the observable
+// behavior it depends on: a sibling's snapshot().paused reflects the shared
+// pause written by another instance, and clears when it elapses.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const qA = createConcurrencyQueue({ stateFile });
+  const qB = createConcurrencyQueue({ stateFile }); // simulates a second process
+
+  // A writes a 10s pause (e.g. it just got a 429). B must see it immediately.
+  const until = Date.now() + 10_000;
+  qA.pauseUntil(until, "HTTP 429 from gateway");
+  const snapB = qB.snapshot();
+  assert(snapB.paused === true, "C2: sibling sees shared paused before /usage catches up");
+  assert(snapB.pausedUntil === until, "C2: sibling sees the exact shared deadline");
+
+  // A clears it (e.g. /usage reports priority.low === false). B sees it lift.
+  qA.clearPause();
+  assert(qB.snapshot().paused === false, "C2: sibling sees pause lift when cleared");
+
+  qA.reset(); qB.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- createConcurrencyQueue: disabled mode is a no-op ---
 {
   const q = createConcurrencyQueue({ disabled: true });
