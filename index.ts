@@ -835,7 +835,11 @@ export default async function (pi: ExtensionAPI) {
     const parts: string[] = [];
     if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
     if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
-    const guaranteed = guaranteedConcurrency !== undefined ? String(guaranteedConcurrency) : "?";
+    // The gate's effective cap honors UMANS_CONCURRENCY_LIMIT over the live
+    // server value, so the bar reflects what the gate actually enforces.
+    const gateSnap = concurrencyGate?.snapshot();
+    const effectiveLimit = gateSnap?.limit ?? guaranteedConcurrency;
+    const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
     // Real account-wide conc from /v1/usage (includes other clients, not just
     // this pi instance). Refreshed only by the 5s poll; shows "?" until first
     // poll lands — never locally synthesized from sent-message turn counts.
