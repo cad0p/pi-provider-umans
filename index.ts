@@ -96,6 +96,10 @@ const SEARCH_MAX_TOKENS = 2048;
 // Concurrency gate tuning. When the server reports priority.low or a 429 is
 // received, new acquisitions are paused until boxedUntil (or this floor).
 const PRIORITY_BACKOFF_MS = 30_000; // conservative default; server may report a boxed_until
+// ADV-3: max time the head-waiter capacity poll will wait for a free slot
+// before failing open (launching anyway). Bounds the queue against a
+// hostile/misbehaving /usage that always reports full.
+const CAPACITY_POLL_TIMEOUT_MS = 60_000;
 
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
@@ -869,17 +873,33 @@ export default async function (pi: ExtensionAPI) {
         return true;
       };
       // Poll at 300ms while full/deprioritized. If the turn is aborted
-      // mid-poll, `signal` (checked here via acquireSlot's caller, and again
-      // in waitForLaunch before/after the poll) cancels the waiter; otherwise
-      // the watchdog reaps the token after >30s and session_shutdown clears the
-      // waiter on process exit.
+      // mid-poll, `signal` cancels the waiter; otherwise the watchdog reaps
+      // the token after >30s and session_shutdown clears the waiter on exit.
+      // ADV-3: cap the total poll elapsed at CAPACITY_POLL_TIMEOUT_MS so a
+      // hostile/misbehaving /usage (always reports full, or an account stuck
+      // at the cap) cannot wedge the queue forever. After the cap, fail open
+      // (launch anyway) — matching the /usage-unreachable fallback's stance
+      // that the queue must not block indefinitely.
+      const pollStart = Date.now();
+      let stalled = false;
       while (!(await capacityFree())) {
         if (signal?.aborted) {
           concurrencyQueue.cancel(ourId);
           released = true;
           throw new Error("concurrency-queue: acquireSlot aborted mid-poll");
         }
+        if (Date.now() - pollStart >= CAPACITY_POLL_TIMEOUT_MS) {
+          stalled = true;
+          break; // fail open below
+        }
         await new Promise((r) => setTimeout(r, 300));
+      }
+      if (stalled) {
+        // ADV-3: fail-open after the cap. The turn proceeds ungated; the
+        // watchdog still bounds the token hold. We deliberately do not throw —
+        // a wedged /usage should not break the user's turn, only the gate.
+        // The status bar's `q <queued>*` already reflects the wait; the
+        // launch itself is silent so as not to spam notifies on every poll.
       }
       released = true;
       return () => {

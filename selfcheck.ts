@@ -317,6 +317,50 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- ADV-4: a live-PID waiter aged past staleWaiterMs is re-inserted, not lost ---
+// waitForLaunch's mutate now detects a missing waiter entry (reaped by
+// staleWaiterMs) and re-inserts it at the tail with a fresh timestamp, so a
+// long-queued turn does not poll forever with head.id !== ourId permanently
+// true. We simulate a short staleWaiterMs and verify the entry survives past
+// it (re-inserted by the 50ms poll) before aborting cleanly via signal.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  // staleWaiterMs=80ms so a waiter aged past it would be reaped on the next
+  // mutate — but waitForLaunch re-inserts before that can strand us.
+  const q = createConcurrencyQueue({ stateFile, staleWaiterMs: 80 });
+  const { readFileSync } = await import("node:fs");
+
+  // Waiter 1 holds the token.
+  const id1 = q.join()!;
+  await q.waitForLaunch(id1);
+
+  // Waiter 2 joins and blocks (token held by 1), with an abort signal so we
+  // can cleanly stop the poll loop afterward.
+  const id2 = q.join()!;
+  const ctrl = new AbortController();
+  const p2 = q.waitForLaunch(id2, ctrl.signal).catch(() => { /* aborted */ });
+  await new Promise((r) => setTimeout(r, 60)); // pre-reap: entry present
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.some((w: { id: string }) => w.id === id2),
+    "ADV-4: waiter 2 queued before staleWaiterMs");
+
+  // Wait well past staleWaiterMs (80ms). Without re-insertion, the next
+  // reapStale would drop id2 and waitForLaunch would poll forever. With
+  // re-insertion, the poll re-adds id2 with a fresh ts each cycle, surviving.
+  await new Promise((r) => setTimeout(r, 200));
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.some((w: { id: string }) => w.id === id2),
+    "ADV-4: live-PID waiter re-inserted after staleWaiterMs (not lost)");
+
+  // Cleanly stop the poll loop via abort (cancel + reject).
+  ctrl.abort();
+  await p2;
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- createConcurrencyQueue: disabled mode is a no-op ---
 {
   const q = createConcurrencyQueue({ disabled: true });

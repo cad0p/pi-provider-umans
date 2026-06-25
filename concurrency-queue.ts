@@ -404,6 +404,17 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // nobody holds (ADV-2 token leak).
           if (signal?.aborted) return;
           const got = mutate((now, state) => {
+            // ADV-4: if our waiter entry was reaped by staleWaiterMs (5 min)
+            // while we were still queued (e.g. a deep FIFO + slow models, or
+            // a perpetually-full /usage per ADV-3), re-insert it at the tail
+            // with a fresh timestamp so we don't poll forever with
+            // head.id !== ourId permanently true. Only dead-PID waiters are
+            // reaped for real; a live-PID waiter here means we were aged out
+            // and must re-join.
+            const stillQueued = state.waiters.some((w) => w.id === ourId);
+            if (!stillQueued) {
+              state.waiters.push({ id: ourId, pid: ourPid(), ts: now });
+            }
             // Are we the head and is the token free?
             const head = state.waiters[0];
             if (!head || head.id !== ourId) return false; // not our turn
