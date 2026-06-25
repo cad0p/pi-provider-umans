@@ -1254,6 +1254,13 @@ export default async function (pi: ExtensionAPI) {
     release();
     updateStatus(undefined as any);
   }
+  // CLN2-L5: message_end and turn_end both release the oldest inflight slot
+  // (one-per-turn, FIFO order). Dedupe the two-line body into a helper. The
+  // agent_end drain loop is a different shape (while size) and stays as-is.
+  function releaseOldest(): void {
+    const oldest = inflightSlots.values().next().value;
+    releaseSlot(oldest);
+  }
 
   pi.on("before_provider_request", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
@@ -1353,8 +1360,7 @@ export default async function (pi: ExtensionAPI) {
     // the assistant message_end fired). The primary release is at assistant
     // message_end (below) so the slot frees as soon as the response stream
     // completes, letting siblings run during this turn's tool execution.
-    const oldest = inflightSlots.values().next().value;
-    releaseSlot(oldest);
+    releaseOldest();
     updateStatus(ctx);
   });
   pi.on("message_update", async (event, ctx) => {
@@ -1390,8 +1396,7 @@ export default async function (pi: ExtensionAPI) {
     // poll see an accurate count AND frees the slot during this turn's tool
     // execution (tools don't consume a server concurrency slot). turn_end and
     // agent_end remain as safety nets for turns that never reach here.
-    const oldest = inflightSlots.values().next().value;
-    releaseSlot(oldest);
+    releaseOldest();
     const req = liveRequest;
     let ttft: number | undefined;
     let tps: number | undefined;
