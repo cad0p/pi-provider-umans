@@ -94,7 +94,7 @@ This provider ships a **cross-process FIFO queue** to keep you under the soft ca
 - **Capacity is decided solely by the live `/v1/usage` response** (`concurrent_sessions` vs `limits.concurrency.limit`, and `usage.priority.low`), polled by the head waiter at ~300 ms. The file never tries to count slots it can't see — so multiple machines using the same key each run their own local queue and coordinate through the server + its headroom, not a local counter.
 - The **launch token** is held from send until `after_provider_response` (headers arrived = the server registered the request as in-flight), so the next head's `/usage` poll sees it and waits its turn. Launches are race-free within a machine; turns still stream concurrently.
 - When `/v1/usage` reports **`priority.low === true`**, or the gateway returns a **429**, the shared `pausedUntil` is written to the file — **all** local `pi` processes back off together until it elapses (Retry-After aware). `priority.low` is account-wide, so cross-machine processes also see it via `/usage`.
-- A **watchdog** reclaims the token if the holding process dies (PID check) or holds it >30 s, so a crashed turn never stalls the queue.
+- A **watchdog** reclaims the token if the holding process dies (PID check) or holds it >120 s, so a crashed turn never stalls the queue.
 - Vision handoff and web-search side-calls go through the **same queue**.
 - The status bar shows live state: `q <queued>*` (the `*` marks this process holding the token / launching) and `PAUSED <Ns>` while backing off.
 - **Unlimited plans** (Code Max, `limit === undefined`): the queue still serializes launches + honors `priority.low`, but skips the capacity check.

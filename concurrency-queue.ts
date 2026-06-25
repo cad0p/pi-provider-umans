@@ -23,7 +23,7 @@
  *   machine: the next poll sees a /usage that already reflects the completed
  *   request. (Releasing earlier — at after_provider_response headers — is too
  *   early: the request is still in-flight on the server until the body streams,
- *   so the next poll would see stale capacity.) The watchdog (reapStale, 30s
+ *   so the next poll would see stale capacity.) The watchdog (reapStale, 120s
  *   token cap) reclaims a crashed/aborted holder; the AbortSignal plumbed
  *   through waitForLaunch/acquireSlot cancels an aborted turn's waiter entry
  *   so it doesn't block siblings for staleWaiterMs (5 min).
@@ -98,7 +98,13 @@ export interface QueueConfig {
 }
 
 const DEFAULT_STATE_FILE = `${homedir()}/.pi/agent/umans-concurrency.json`;
-const DEFAULT_STALE_TOKEN_MS = 30_000;
+// CORR2-3 / CMP-MED-4: 120s comfortably exceeds long streaming turns (xhigh/max
+// thinking, long outputs, slow TTFT). The watchdog is a LAST RESORT (dead PID
+// or truly hung process), not a tight bound on legitimate turns — the hard_cap
+// burst headroom (CORR2-1) absorbs any transient over-limit from a reaped
+// token. 30s was too tight and reaped tokens held by legitimately long streaming
+// turns, racing a sibling launch the same way as the message_end release race.
+const DEFAULT_STALE_TOKEN_MS = 120_000;
 const DEFAULT_STALE_WAITER_MS = 5 * 60_000;
 const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_LOCK_TIMEOUT_MS = 2_000;

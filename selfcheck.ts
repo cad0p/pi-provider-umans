@@ -325,6 +325,34 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "reapStale: dead-pid and stale waiters removed, fresh kept");
 }
 
+// --- COV2-M1: stale-token-by-time branch (live pid, old ts) is reaped ---
+// reapStale reaps a token when isPidDead(pid) OR (now - ts) > staleTokenMs.
+// The dead-pid branch is covered above; this exercises the TIME branch with a
+// LIVE process.pid but an old ts (a live-but-hung holder — D4's purpose).
+{
+  const now = 1_700_000_000_000;
+  const cfg = {
+    stateFile: "/dev/null", staleTokenMs: 30_000, staleWaiterMs: 300_000,
+    lockRetryMs: 5, lockTimeoutMs: 2_000, now: () => now, pid: () => process.pid,
+  } as const;
+  // Live PID but ts 31s old — past staleTokenMs (30s). The token is reaped by
+  // the time check even though isPidDead(process.pid) is false.
+  const state = {
+    waiters: [],
+    token: { id: "t1", pid: process.pid, ts: now - 31_000 },
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  };
+  const reaped = reapStale(state, cfg as any, now);
+  assert(reaped.token === null,
+    "COV2-M1: live-PID token with old ts (31s > staleTokenMs 30s) is reaped by time check");
+
+  // Same live PID but ts within the ceiling — token is kept.
+  const fresh = { ...state, token: { id: "t1", pid: process.pid, ts: now - 5_000 } };
+  const reapedFresh = reapStale(fresh, cfg as any, now);
+  assert(reapedFresh.token !== null && reapedFresh.token?.id === "t1",
+    "COV2-M1: live-PID token with fresh ts is kept");
+}
+
 // --- S2: clampPauseUntil caps an over-large pause to now + MAX_PAUSE_MS ---
 {
   const now = 1_700_000_000_000;

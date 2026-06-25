@@ -825,13 +825,14 @@ export default async function (pi: ExtensionAPI) {
   // vision/search side-call). Joins the cross-process FIFO, waits until we are
   // head + have claimed the launch token, then polls /v1/usage until the server
   // reports a free slot (and no priority.low). Returns a release fn that drops
-  // the token + our waiter entry; call it on after_provider_response (or
-  // turn_end/agent_end as a safety net). Returns undefined when the queue is
-  // disabled (fire-and-forget). The `apiKey` is used for the head-waiter poll.
+  // the token + our waiter entry; call it on assistant message_end (the
+  // primary release path) or turn_end/agent_end as a safety net. Returns
+  // undefined when the queue is disabled (fire-and-forget). The `apiKey` is
+  // used for the head-waiter poll.
   //
   // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
-  // any token held >30s (or whose PID died) is reclaimed by the next acquirer,
-  // so a crashed/aborted turn can stall the queue for at most 30s. For an
+  // any token held >120s (or whose PID died) is reclaimed by the next acquirer,
+  // so a crashed/aborted turn can stall the queue for at most 120s. For an
   // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
   // waitForLaunch cancels the waiter entry and rejects immediately (C4/ADV-2).
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
@@ -871,7 +872,7 @@ export default async function (pi: ExtensionAPI) {
       };
       // Poll at 300ms while full/deprioritized. If the turn is aborted
       // mid-poll, `signal` cancels the waiter; otherwise the watchdog reaps
-      // the token after >30s and session_shutdown clears the waiter on exit.
+      // the token after >120s and session_shutdown clears the waiter on exit.
       // ADV-3: cap the total poll elapsed at CAPACITY_POLL_TIMEOUT_MS so a
       // hostile/misbehaving /usage (always reports full, or an account stuck
       // at the cap) cannot wedge the queue forever. After the cap, fail open
