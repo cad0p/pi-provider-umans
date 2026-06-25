@@ -1346,11 +1346,10 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    // Primary release path (D2): the full response is done, so the server has
-    // decremented concurrent_sessions. Releasing here (not at
-    // after_provider_response headers) is what makes the next waiter's /usage
-    // poll see an accurate count and serialize correctly. agent_end is the
-    // final drain safety net for aborted turns that never reach turn_end.
+    // Safety net: release any slot still held (e.g. a turn that errored before
+    // the assistant message_end fired). The primary release is at assistant
+    // message_end (below) so the slot frees as soon as the response stream
+    // completes, letting siblings run during this turn's tool execution.
     const oldest = inflightSlots.values().next().value;
     releaseSlot(oldest);
     updateStatus(ctx);
@@ -1381,6 +1380,15 @@ export default async function (pi: ExtensionAPI) {
     const msg = event.message as any;
     if (!isActiveUmans(ctx, msg)) return;
     if (msg?.role !== "assistant") return;
+    // Primary release path (D2): the assistant response stream just completed,
+    // so the server has decremented concurrent_sessions. Releasing here (not at
+    // after_provider_response headers, which fire ~1s in, nor at turn_end,
+    // which fires after tool execution) is what makes the next waiter's /usage
+    // poll see an accurate count AND frees the slot during this turn's tool
+    // execution (tools don't consume a server concurrency slot). turn_end and
+    // agent_end remain as safety nets for turns that never reach here.
+    const oldest = inflightSlots.values().next().value;
+    releaseSlot(oldest);
     const req = liveRequest;
     let ttft: number | undefined;
     let tps: number | undefined;
