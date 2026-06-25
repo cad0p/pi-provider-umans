@@ -1433,7 +1433,16 @@ export default async function (pi: ExtensionAPI) {
     liveRequest = undefined;
     lastMetrics = {};
     imageStore.clear();
-    inflightSlots.clear();
+    // ADV2-F1: drain inflightSlots by invoking each release fn (like agent_end),
+    // not clear() which drops the closures without calling them. Currently
+    // inflightSlots holds at most one main-turn slot (side-calls manage their
+    // own release via releaseSlot in a finally), but a future change (e.g. a
+    // streaming side-call that adds to the set) would silently leak via clear().
+    // reset() only clears ourTokenId's entry, so draining here ensures every
+    // held slot's token/waiter is released.
+    while (inflightSlots.size) {
+      releaseOldest();
+    }
     concurrencyQueue.reset();
     setWidget(ctx, undefined);
   });
