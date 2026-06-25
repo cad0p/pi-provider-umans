@@ -705,7 +705,11 @@ export default async function (pi: ExtensionAPI) {
       }
       if (snap.paused) {
         const secs = Math.max(0, Math.round((snap.pausedUntil - Date.now()) / 1000));
-        parts.push(`PAUSED ${secs}s`);
+        // CMP-LOW-4: surface the pause reason (e.g. "HTTP 429 from gateway", or
+        // the server's priority.reason) alongside the deadline so the user
+        // knows WHY the account is backed off, not just how long.
+        const reason = snap.pausedReason ? ` (${snap.pausedReason})` : "";
+        parts.push(`PAUSED ${secs}s${reason}`);
       }
     }
     return `Umans ${parts.join(" │ ")}`;

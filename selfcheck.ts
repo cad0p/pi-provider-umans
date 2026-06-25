@@ -662,9 +662,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   qA.pauseUntil(until, "429 from A");
   const snapB = qB.snapshot();
   assert(snapB.paused && snapB.pausedUntil === until, "pause written by A visible to B (shared file)");
+  // CMP-LOW-4: pausedReason is surfaced in the snapshot so the status bar
+  // can show WHY the account is backed off (e.g. "HTTP 429 from gateway").
+  assert(snapB.pausedReason === "429 from A", "CMP-LOW-4: pausedReason visible to sibling (shared file)");
 
   qA.clearPause();
   assert(qB.snapshot().paused === false, "clearPause by A reflected in B");
+  assert(qB.snapshot().pausedReason === null, "CMP-LOW-4: pausedReason null after clearPause");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });

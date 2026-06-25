@@ -486,7 +486,7 @@ export interface ConcurrencyQueue {
   /** Clear deprioritization early (e.g. when /usage reports priority.low===false). */
   clearPause(): void;
   /** Snapshot for status-bar display. */
-  snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number };
+  snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   /** Remove our waiter entry if still present (best-effort, used on abort). */
   cancel(ourId: string): void;
   /** Hard-reset: clear the state file (used on session shutdown by the last owner). */
@@ -502,7 +502,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       waitForLaunch: () => Promise.resolve(() => {}),
       pauseUntil: () => {},
       clearPause: () => {},
-      snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0 }),
+      snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null }),
       cancel: () => {},
       reset: () => {},
       holdsToken: () => false,
@@ -631,7 +631,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       });
     },
 
-    snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number } {
+    snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null } {
       // Read without mutating; still reap for an accurate view.
       const now = cfg.now();
       const state = reapStale(readState(cfg.stateFile, now), cfg, now);
@@ -640,6 +640,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         tokenHeld: holdsToken,
         paused: state.pausedUntil > now,
         pausedUntil: state.pausedUntil,
+        pausedReason: state.pausedUntil > now ? state.pausedReason : null,
       };
     },
 
