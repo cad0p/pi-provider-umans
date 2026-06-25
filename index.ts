@@ -41,6 +41,7 @@ import {
   parsePriority as parsePriorityShared,
   clampPauseUntil,
   type ConcurrencyQueue,
+  type PriorityState,
 } from "./concurrency-queue.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
@@ -766,7 +767,7 @@ export default async function (pi: ExtensionAPI) {
       // priority.low is account-wide, so any pi process seeing it pauses all of
       // them via the shared queue file; clearing it when low===false lets the
       // queue drain as soon as the server says traffic is healthy again.
-      priorityState = parsePriority(data.usage?.priority);
+      priorityState = parsePriorityShared(data.usage?.priority);
       if (priorityState.low) {
         concurrencyQueue.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
       } else {
@@ -807,7 +808,7 @@ export default async function (pi: ExtensionAPI) {
       return {
         concurrentSessions: data.usage?.concurrent_sessions,
         limit: data.limits?.concurrency?.limit ?? undefined,
-        priority: parsePriority(data.usage?.priority),
+        priority: parsePriorityShared(data.usage?.priority),
       };
     } catch {
       return null;
