@@ -286,12 +286,19 @@ export function readState(path: string, now: number): QueueState {
 export function isPidDead(pid: number): boolean {
   if (!pid || pid <= 0) return true;
   try {
-    // process.kill(pid, 0) throws if the process doesn't exist (or we lack
-    // permission); in either case we treat the token as reclaimable.
+    // process.kill(pid, 0) throws ESRCH (no such process) or EPERM (process
+    // exists but caller lacks permission). ESRCH -> dead. EPERM -> the process
+    // IS alive (just not ours); treat it as alive so we don't falsely reap a
+    // live holder's token (CORR2-4 / CMP-LOW-1). In a single-user pi setup all
+    // processes share the same UID, so EPERM is vanishingly rare; treating it
+    // as alive is the fail-safe (the queue stalls briefly rather than yanking a
+    // live holder's token).
     process.kill(pid, 0);
-    return false;
-  } catch {
-    return true;
+    return false; // exists and we have permission (or it's our own)
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return false; // exists, just no permission -> treat as alive
+    return true; // ESRCH (no such process) or anything else -> dead
   }
 }
 
