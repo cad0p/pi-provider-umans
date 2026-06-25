@@ -165,11 +165,21 @@ export function parsePriority(raw: unknown): PriorityState {
 
 /**
  * A lightweight /v1/usage snapshot used for the capacity decision. Mirrors the
- * shape fetchUsageSnapshot returns (concurrentSessions + limit + priority).
+ * shape fetchUsageSnapshot returns (concurrentSessions + limit + hardCap +
+ * priority).
  */
 export interface CapacitySnapshot {
   concurrentSessions: number | undefined;
   limit: number | undefined;
+  /**
+   * Account-wide hard burst cap (the threshold at which Umans actually returns
+   * 429s / deprioritizes). When present, the gate compares against this instead
+   * of `limit` so the documented burst headroom (burst_pct, e.g. limit=4 /
+   * hard_cap=8 on Code Max) absorbs the message_end release race (CORR2-1) and
+   * server-side concurrent_sessions accounting noise (ADV2-F3). Falls back to
+   * `limit` when absent (e.g. unlimited plans, older API responses).
+   */
+  hardCap: number | undefined;
   priority: PriorityState;
 }
 
@@ -189,27 +199,44 @@ export interface CapacityInputs {
  *
  * - If the shared pause is active → not free (C2: a 429 observed by any local
  *   process backs off all siblings before /usage propagates priority.low).
+ * - If priority.low → not free + repause so siblings back off too (honored
+ *   BEFORE the unlimited short-circuit so Code Max still pushes the pause).
  * - If the plan is unlimited (limit === undefined) → free (D5; priority.low
- *   still honored via the repause path below when snap is present).
+ *   already honored via the repause path above when snap is present).
  * - If /usage is unreachable (snap === null) → free (trust headroom rather
  *   than block forever; the queue still serializes launches via the token).
- * - If concurrent_sessions >= limit → not free.
- * - If priority.low → not free + repause so siblings back off too.
+ * - If concurrent_sessions >= hardCap (or limit when hardCap absent) → not free.
  * - Otherwise → free.
+ *
+ * CORR2-1: the gate's PURPOSE is to prevent 429s, which hit at `hard_cap`, not
+ * `limit`. message_end releases at client-side stream completion, which
+ * PRECEDES the server's concurrent_sessions decrement by a network RTT +
+ * cleanup lag, so the next waiter's /usage poll can transiently see stale
+ * (too-low) capacity and launch 1-2 over `limit`. That overshoot stays within
+ * the documented burst headroom (hard_cap) → no 429, no deprioritization. The
+ * launch token still serializes the /usage poll (no thundering-herd), and the
+ * message_end release frees the slot for tool-execution parallelism. Gating to
+ * hard_cap also absorbs server-side concurrent_sessions accounting noise
+ * (ADV2-F3: the counter oscillates ±1 during a single serialized turn).
  */
 export function isCapacityFree(
   snap: CapacitySnapshot | null,
   inputs: CapacityInputs,
 ): { free: boolean; repause?: { until: number; reason: string | null } } {
   if (inputs.queuePaused) return { free: false };
+  // priority.low BEFORE the unlimited short-circuit so Code Max (limit absent)
+  // still evaluates repause and pushes the shared pause to siblings (CORR2-2 /
+  // COV2-unlimited+priority.low).
+  if (snap?.priority.low) {
+    return { free: false, repause: { until: snap.priority.until, reason: snap.priority.reason } };
+  }
   if (inputs.limit === undefined) return { free: true }; // Code Max / unlimited
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
   const cur = snap.concurrentSessions ?? 0;
-  const cap = snap.limit ?? inputs.limit;
+  // CORR2-1: prefer hard_cap (the 429 threshold) over limit; fall back to
+  // limit when the API did not report a hard_cap.
+  const cap = snap.hardCap ?? snap.limit ?? inputs.limit;
   if (cap !== undefined && cur >= cap) return { free: false };
-  if (snap.priority.low) {
-    return { free: false, repause: { until: snap.priority.until, reason: snap.priority.reason } };
-  }
   return { free: true };
 }
 

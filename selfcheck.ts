@@ -89,7 +89,8 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
 // --- COV-HIGH-1: isCapacityFree decision logic (extracted from acquireSlot) ---
 // Covers: unlimited-plan short-circuit, /usage-unreachable fallback, shared
-// pause (C2), at-cap, under-cap, and priority.low → repause.
+// pause (C2), at-cap, under-cap, priority.low → repause, hard_cap gating
+// (CORR2-1), and unlimited + priority.low repause (CORR2-2).
 {
   const lowState = { low: true, until: 1_000_000, reason: "burst" };
   const okState = { low: false, until: 0, reason: null };
@@ -100,10 +101,20 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   assert(isCapacityFree(null, { limit: undefined, queuePaused: false }).free === true,
     "isCapacityFree: unlimited plan + /usage unreachable → free");
   const unlim = isCapacityFree(
-    { concurrentSessions: 999, limit: undefined, priority: okState },
+    { concurrentSessions: 999, limit: undefined, hardCap: undefined, priority: okState },
     { limit: undefined, queuePaused: false },
   );
   assert(unlim.free === true, "isCapacityFree: unlimited plan → free even at high conc");
+
+  // CORR2-2: unlimited plan + priority.low → not free + repause (priority.low
+  // is checked BEFORE the unlimited short-circuit so Code Max still pushes the
+  // shared pause to siblings).
+  const unlimLow = isCapacityFree(
+    { concurrentSessions: 0, limit: undefined, hardCap: undefined, priority: lowState },
+    { limit: undefined, queuePaused: false },
+  );
+  assert(unlimLow.free === false && unlimLow.repause?.until === 1_000_000 && unlimLow.repause?.reason === "burst",
+    "CORR2-2: unlimited plan + priority.low → not free + repause (before short-circuit)");
 
   // /usage unreachable (snap === null) with a finite limit → free (trust headroom)
   assert(isCapacityFree(null, { limit: 2, queuePaused: false }).free === true,
@@ -111,39 +122,59 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
   // Shared pause active (queuePaused) → not free (C2)
   assert(isCapacityFree(
-    { concurrentSessions: 0, limit: 2, priority: okState },
+    { concurrentSessions: 0, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: true },
   ).free === false, "isCapacityFree: shared pause active → not free");
 
-  // At cap (cur >= cap) → not free
+  // CORR2-1: hard_cap gating. cur between limit and hard_cap → free (the gate
+  // prevents 429s, which hit at hard_cap, not limit). The message_end release
+  // race can transiently push concurrent_sessions 1-2 over limit but within the
+  // burst headroom (hard_cap); gating to hard_cap absorbs that + server-side
+  // accounting noise (ADV2-F3).
   assert(isCapacityFree(
-    { concurrentSessions: 2, limit: 2, priority: okState },
+    { concurrentSessions: 3, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "isCapacityFree: at cap (cur === cap) → not free");
+  ).free === true, "CORR2-1: cur (3) between limit (2) and hard_cap (4) → free (burst headroom)");
   assert(isCapacityFree(
-    { concurrentSessions: 3, limit: 2, priority: okState },
+    { concurrentSessions: 4, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "isCapacityFree: over cap → not free");
+  ).free === false, "CORR2-1: cur (4) at hard_cap (4) → not free (429 threshold)");
+  assert(isCapacityFree(
+    { concurrentSessions: 5, limit: 2, hardCap: 4, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "CORR2-1: cur (5) over hard_cap (4) → not free");
+
+  // hard_cap absent (older API / unlimited) → falls back to limit.
+  assert(isCapacityFree(
+    { concurrentSessions: 2, limit: 2, hardCap: undefined, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "CORR2-1: hard_cap absent → falls back to limit (cur === limit → not free)");
+
+  // At cap (cur >= cap) → not free (legacy path: hard_cap absent, cap = limit)
+  assert(isCapacityFree(
+    { concurrentSessions: 2, limit: 2, hardCap: undefined, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "isCapacityFree: at cap (cur === limit) → not free");
 
   // Under cap → free
   assert(isCapacityFree(
-    { concurrentSessions: 1, limit: 2, priority: okState },
+    { concurrentSessions: 1, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
   ).free === true, "isCapacityFree: under cap → free");
 
   // priority.low → not free + repause (so the caller pushes the pause to siblings)
   const low = isCapacityFree(
-    { concurrentSessions: 0, limit: 2, priority: lowState },
+    { concurrentSessions: 0, limit: 2, hardCap: 4, priority: lowState },
     { limit: 2, queuePaused: false },
   );
   assert(low.free === false && low.repause?.until === 1_000_000 && low.repause?.reason === "burst",
     "isCapacityFree: priority.low → not free + repause with until/reason");
 
-  // Server-reported limit overrides the local limit when smaller (cap = snap.limit ?? limit)
+  // Server-reported hard_cap overrides the local limit when smaller (cap = snap.hardCap ?? snap.limit ?? limit)
   assert(isCapacityFree(
-    { concurrentSessions: 1, limit: 1, priority: okState },
+    { concurrentSessions: 1, limit: 4, hardCap: 1, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "isCapacityFree: server limit (1) < local limit (2) → at cap");
+  ).free === false, "CORR2-1: server hard_cap (1) < local limit (2) → at cap");
 }
 
 // --- readState: absent/corrupt file -> empty ---

@@ -784,11 +784,12 @@ export default async function (pi: ExtensionAPI) {
 
   // Lightweight one-shot /v1/usage fetch used by the head waiter to decide
   // whether to launch. Cheaper than refreshUsage: it only needs
-  // concurrent_sessions + priority, and it must be fast so the queue doesn't
-  // stall. Returns null on any failure (caller retries).
+  // concurrent_sessions + limit + hard_cap + priority, and it must be fast so
+  // the queue doesn't stall. Returns null on any failure (caller retries).
   async function fetchUsageSnapshot(apiKey: string): Promise<{
     concurrentSessions: number | undefined;
     limit: number | undefined;
+    hardCap: number | undefined;
     priority: PriorityState;
   } | null> {
     const ctrl = new AbortController();
@@ -804,12 +805,13 @@ export default async function (pi: ExtensionAPI) {
       });
       if (!res.ok) return null;
       const data = await res.json() as {
-        limits?: { concurrency?: { limit?: number } };
+        limits?: { concurrency?: { limit?: number; hard_cap?: number } };
         usage?: { concurrent_sessions?: number; priority?: unknown };
       };
       return {
         concurrentSessions: data.usage?.concurrent_sessions,
         limit: data.limits?.concurrency?.limit ?? undefined,
+        hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
         priority: parsePriority(data.usage?.priority),
       };
     } catch {
