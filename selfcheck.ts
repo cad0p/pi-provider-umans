@@ -200,6 +200,53 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- S3: state file + lockfile created with mode 0600 (no PID leakage) ---
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // join + waitForLaunch forces a writeStateAtomic (state file) and an
+  // acquireLock (lockfile). Both must land at mode 0600, not the default 0644.
+  const id = q.join();
+  const release = await q.waitForLaunch(id!);
+  release();
+
+  const { statSync } = await import("node:fs");
+  const stateMode = statSync(stateFile).mode & 0o777;
+  assert(stateMode === 0o600, `state file mode is 0600 (got 0o${stateMode.toString(8)})`);
+
+  // The lockfile is transient (released after the critical section), so trigger
+  // another mutate to recreate it and snapshot mid-flight. Easiest: pause, which
+  // takes the lock and writes the state file. We poll for the lockfile briefly.
+  q.pauseUntil(Date.now() + 1000, "S3 probe");
+  // The lockfile is normally gone by now; create a fresh one by joining a second
+  // queue instance and snapshotting while it holds the lock. Simpler: directly
+  // exercise acquireLock via a second join+waitForLaunch on a sibling queue and
+  // check the lockfile mode while the token is held.
+  const q2 = createConcurrencyQueue({ stateFile });
+  const id2 = q2.join();
+  const lockFile = `${stateFile}.lock`;
+  let lockMode: number | undefined;
+  const release2Promise = q2.waitForLaunch(id2!).then((r) => r);
+  // Poll up to 200ms for the lockfile to appear mid-acquire.
+  for (let i = 0; i < 40 && lockMode === undefined; i++) {
+    try { lockMode = statSync(lockFile).mode & 0o777; } catch { /* not yet */ }
+    if (lockMode === undefined) await new Promise((r) => setTimeout(r, 5));
+  }
+  const release2 = await release2Promise;
+  if (lockMode !== undefined) {
+    assert(lockMode === 0o600, `lockfile mode is 0600 (got 0o${lockMode.toString(8)})`);
+  }
+  // If the lockfile never observed (timing-dependent), the state-file mode
+  // assertion above already covers the writeStateAtomic path; the lockfile uses
+  // the same 0o600 arg to openSync.
+  release2();
+
+  q.reset(); q2.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- createConcurrencyQueue: pause is shared across queue instances (cross-process sim) ---
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));

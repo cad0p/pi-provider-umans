@@ -236,7 +236,7 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   let fd: number | undefined;
   while (fd === undefined) {
     try {
-      fd = openSync(lockFile, "wx");
+      fd = openSync(lockFile, "wx", 0o600);
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. If the
@@ -278,8 +278,8 @@ function writeStateAtomic(path: string, state: QueueState): void {
   const dir = dirname(path);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state), "utf8");
-  renameSync(tmp, path); // atomic on POSIX & Windows
+  writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+  renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
 }
 
 /**
