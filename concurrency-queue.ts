@@ -35,7 +35,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { existsSync, mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 
