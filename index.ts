@@ -1285,8 +1285,21 @@ export default async function (pi: ExtensionAPI) {
     // nets for turns that never reach message_end.
     const release = await acquireSlot(apiKey, ctx.signal);
     if (release) {
-      inflightSlots.add(release);
-      updateStatus(ctx);
+      // ADV2-F2: wrap acquire + register in a try/finally so a throw between
+      // acquireSlot resolving and the safety-net registration (message_end /
+      // turn_end / agent_end / session_shutdown) doesn't leak the token until
+      // the 120s watchdog. On the happy path the release fn is owned by
+      // inflightSlots and released at message_end; a throw here releases it
+      // immediately. (updateStatus swallows internally, but this guards any
+      // future throw in the registration path.)
+      let registered = false;
+      try {
+        inflightSlots.add(release);
+        registered = true;
+        updateStatus(ctx);
+      } finally {
+        if (!registered) releaseSlot(release);
+      }
     }
   });
 
