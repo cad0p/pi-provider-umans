@@ -314,6 +314,14 @@ export function isPidDead(pid: number): boolean {
  * cleared (defense-in-depth, in case the clamp in pauseUntil is bypassed by a
  * compromised sibling or a hand-edited file — SEC2-MED-1). Returns the cleaned
  * state; does not write to disk.
+ *
+ * CMP-MED-3: PID reuse is a known blind spot of the kill(pid, 0) probe — if a
+ * holding pi process crashes, its PID can be recycled by an unrelated process
+ * within the staleTokenMs window, and isPidDead would return false (alive).
+ * The TIMESTAMP staleness check (now - token.ts > staleTokenMs) is the real
+ * safety net that bounds this: a reused PID still ages out, so the worst case
+ * is a bounded stall, not a permanent wedge. isPidDead is a fast-path
+ * optimization; the timestamp is the authoritative bound.
  */
 export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: number): QueueState {
   const staleToken = state.token && (
@@ -352,6 +360,19 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
  * timeout, a crashed holder left it behind — unlink it and retry. This keeps
  * a crashed process from permanently wedging the queue. (The critical section
  * is milliseconds, so an old lockfile is definitively stale.)
+ *
+ * CMP-MED-2: the 2s lockTimeoutMs is a hard CORRECTNESS ceiling on the
+ * critical section, not just a liveness bound — no slow operation may be added
+ * inside `mutate` (readState / reapStale / fn / writeStateAtomic). A
+ * legitimately slow writer (disk pressure under a burst of `pi -p` jobs) that
+ * holds the lock >2s will have its lockfile yanked mid-write, potentially
+ * racing two writers (lost write). `proper-lockfile` decouples this with an
+ * mtime-refresh while held; this implementation intentionally does not (the
+ * critical section is sub-2s on local SSD). NFS caveat: `open(O_EXCL)` is
+ * broken on NFS file systems (proper-lockfile switched to `mkdir` for this).
+ * This is fine for the local home-directory path (~/.pi/agent on APFS) but
+ * would break on an NFS-mounted home — do not deploy this onto NFS without
+ * switching to `mkdir`-based locking.
  */
 function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   const deadline = cfg.now() + cfg.lockTimeoutMs;
