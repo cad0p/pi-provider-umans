@@ -157,6 +157,114 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV-HIGH-2: parsePriority ISO-string + malformed branches ---
+// boxed_until may be an ISO string (the most common form in real /v1/usage
+// responses), an epoch-seconds number, or null. The ISO path (Date.parse) and
+// a malformed string (NaN → fallback) were previously untested.
+{
+  const future = "2026-12-31T00:00:00Z";
+  const pIso = parsePriority({ low: true, boxed_until: future, reason: "boxed" });
+  assert(pIso.low === true && pIso.until === Date.parse(future),
+    "COV-HIGH-2: parsePriority ISO boxed_until -> ms via Date.parse");
+  assert(pIso.reason === "boxed", "COV-HIGH-2: parsePriority ISO reason captured");
+
+  // Malformed string → Date.parse returns NaN → falls back to now+backoff.
+  const pBad = parsePriority({ low: true, boxed_until: "not-a-date" });
+  assert(pBad.low === true && pBad.until > Date.now(),
+    "COV-HIGH-2: parsePriority malformed ISO -> falls back to now+backoff");
+
+  // Empty string boxed_until with low=true → fallback (string is falsy-empty).
+  const pEmpty = parsePriority({ low: true, boxed_until: "" });
+  assert(pEmpty.until > Date.now(),
+    "COV-HIGH-2: parsePriority empty-string boxed_until -> fallback");
+
+  // low=false ignores boxed_until entirely (until stays 0).
+  assert(parsePriority({ low: false, boxed_until: future }).until === 0,
+    "COV-HIGH-2: parsePriority low=false ignores boxed_until");
+}
+
+// --- COV-HIGH-3: readState corrupt-input fixtures ---
+// readState guards waiters (Array.isArray), pausedUntil/pausedTs (typeof number),
+// and falls back to empty on JSON throw. Previously only the absent-file case
+// was tested. Exercise: truncated JSON, garbage waiters, non-object token,
+// string pausedUntil.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync } = await import("node:fs");
+
+  // Truncated JSON → throws → caught → empty state.
+  writeFileSync(stateFile, '{"waiters":[');
+  const truncated = readState(stateFile, Date.now());
+  assert(truncated.waiters.length === 0 && truncated.token === null,
+    "COV-HIGH-3: readState truncated JSON -> empty state (no throw)");
+
+  // Garbage waiters array (entries lack id/pid/ts) → returned as-is; reapStale
+  // would later filter them via isPidDead(undefined)=true. readState itself does
+  // not validate entry shape, only that waiters is an array.
+  writeFileSync(stateFile, JSON.stringify({ waiters: [{ foo: 1 }, { bar: 2 }] }));
+  const garbage = readState(stateFile, Date.now());
+  assert(garbage.waiters.length === 2,
+    "COV-HIGH-3: readState garbage waiters array returned as-is (shape validated by reapStale)");
+
+  // Non-object token (a string) → parsed.token ?? null passes it through;
+  // reapStale reads state.token.pid (undefined) → isPidDead(undefined)=true → reaped.
+  writeFileSync(stateFile, JSON.stringify({ token: "not-an-object" }));
+  const badTok = readState(stateFile, Date.now());
+  assert(badTok.token === "not-an-object",
+    "COV-HIGH-3: readState non-object token passed through (reaped later by reapStale)");
+
+  // String pausedUntil → typeof !== number → falls to 0.
+  writeFileSync(stateFile, JSON.stringify({ pausedUntil: "123", pausedTs: "456" }));
+  const strPause = readState(stateFile, Date.now());
+  assert(strPause.pausedUntil === 0 && strPause.pausedTs === 0,
+    "COV-HIGH-3: readState string pausedUntil/pausedTs -> 0 (typeof guard)");
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV-HIGH-4: cancel paths (non-existent id, non-head waiter, token-holder) ---
+// cancel is a hot path (called on every acquireSlot release) but was never
+// exercised by selfcheck. Covers: no-op on missing id, removal of a non-head
+// waiter (no token release), and release of a held token.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+  const { readFileSync } = await import("node:fs");
+
+  // Seed two waiters + a token held by id1.
+  const id1 = q.join()!;
+  const id2 = q.join()!;
+  // Manually claim the token for id1 by waiting for launch.
+  await q.waitForLaunch(id1);
+  assert(q.holdsToken() === true, "COV-HIGH-4: id1 holds the token");
+
+  // cancel a non-existent id → no-op (id1, id2, and token all unchanged).
+  q.cancel("does-not-exist");
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 2 && st.token.id === id1,
+    "COV-HIGH-4: cancel non-existent id is a no-op");
+
+  // cancel a non-head waiter (id2) → removes from queue, does NOT release token.
+  q.cancel(id2);
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!st.waiters.some((w: { id: string }) => w.id === id2) && st.waiters.length === 1,
+    "COV-HIGH-4: cancel non-head waiter removes it from the queue");
+  assert(st.token !== null && st.token.id === id1,
+    "COV-HIGH-4: cancel non-head waiter does NOT release the token");
+
+  // cancel the token-holder (id1) → releases token + removes waiter.
+  q.cancel(id1);
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.token === null, "COV-HIGH-4: cancel token-holder releases the token");
+  assert(st.waiters.length === 0, "COV-HIGH-4: cancel token-holder removes its waiter");
+  assert(q.holdsToken() === false, "COV-HIGH-4: holdsToken false after cancel");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- isPidDead: our own pid is alive; pid -1 / 999999 are dead ---
 assert(isPidDead(process.pid) === false, "isPidDead: own pid alive");
 assert(isPidDead(-1) === true, "isPidDead: invalid pid dead");
