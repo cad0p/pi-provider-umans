@@ -120,7 +120,7 @@ function defaultNow(): number { return Date.now(); }
 function defaultPid(): number { return process.pid; }
 
 /** Conservative default backoff when /v1/usage reports priority.low with a null boxed_until. */
-const PRIORITY_BACKOFF_MS = 30_000;
+export const PRIORITY_BACKOFF_MS = 30_000;
 
 /**
  * Maximum allowed pause duration (5h), matching the Umans 5h-account-pause

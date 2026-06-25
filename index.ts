@@ -42,6 +42,7 @@ import {
   clampPauseUntil,
   isCapacityFree,
   parseConcurrencyLimit,
+  PRIORITY_BACKOFF_MS,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -95,9 +96,8 @@ const VISION_ANALYSIS_PROMPT =
 const SEARCH_TIMEOUT_MS = 30_000;
 const SEARCH_MAX_TOKENS = 2048;
 
-// Concurrency gate tuning. When the server reports priority.low or a 429 is
-// received, new acquisitions are paused until boxedUntil (or this floor).
-const PRIORITY_BACKOFF_MS = 30_000; // conservative default; server may report a boxed_until
+// CLN2-L3: PRIORITY_BACKOFF_MS is imported from concurrency-queue.ts (the single
+// source of truth — it's also the parsePriority fallback for a null boxed_until).
 // ADV-3: max time the head-waiter capacity poll will wait for a free slot
 // before failing open (launching anyway). Bounds the queue against a
 // hostile/misbehaving /usage that always reports full.
@@ -356,8 +356,11 @@ export function hashImageId(data: string): string {
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
-// Re-export the shared types for tests and external consumers.
-export type { ConcurrencyQueue, QueueState, WaiterEntry, TokenState } from "./concurrency-queue.ts";
+// CLN2-L2: ConcurrencyQueue is imported directly (line 45) and used at the
+// factory call site. QueueState/WaiterEntry/TokenState have no in-repo
+// consumer (selfcheck imports the pure helpers + types directly from
+// concurrency-queue.ts). External consumers should import from
+// concurrency-queue.ts directly. Drop the speculative re-export.
 // Local type alias for the release function returned by acquireSlot.
 type Release = () => void;
 
