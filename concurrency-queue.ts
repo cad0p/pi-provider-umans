@@ -16,11 +16,17 @@
  *   is left to the server + its ~2× headroom + the shared priority.low signal.
  *
  * - Launch token: the head waiter claims a token, polls /usage until a slot is
- *   free (and not deprioritized), then sends. The token stays held until
- *   after_provider_response (headers arrived = the server has registered the
- *   request as in-flight). Only then is the token released and the next head
- *   allowed to poll. This makes launches race-free within a single machine:
- *   the next poll sees a /usage that already reflects the in-flight request.
+ *   free (and not deprioritized), then sends. The token stays held across the
+ *   send until turn_end (the full response is done = the server has
+ *   decremented concurrent_sessions). Only then is the token released and the
+ *   next head allowed to poll. This makes launches race-free within a single
+ *   machine: the next poll sees a /usage that already reflects the completed
+ *   request. (Releasing earlier — at after_provider_response headers — is too
+ *   early: the request is still in-flight on the server until the body streams,
+ *   so the next poll would see stale capacity.) The watchdog (reapStale, 30s
+ *   token cap) reclaims a crashed/aborted holder; the AbortSignal plumbed
+ *   through waitForLaunch/acquireSlot cancels an aborted turn's waiter entry
+ *   so it doesn't block siblings for staleWaiterMs (5 min).
  *
  * - Watchdog: a crashed process would stall the queue at the token. The token
  *   entry carries a PID + birth timestamp; the next acquirer reclaims it if the
@@ -157,8 +163,7 @@ export function parsePriority(raw: unknown): PriorityState {
   return { low, until, reason: p.reason ?? null };
 }
 
-// Re-export under the alias index.ts imports as.
-export { parsePriority as parsePriorityShared };
+
 
 /** Generate a unique waiter/token id. */
 export function newId(): string {
@@ -321,17 +326,8 @@ export interface ConcurrencyQueue {
   /**
    * Block until this process is at the head of the queue AND has claimed the
    * launch token. Resolves with a release function that must be called when
-   * the request completes (after_provider_response, or turn_end/agent_end as
-   * safety nets). Returns undefined if the queue is disabled.
-   *
-   * Capacity check is NOT performed here — the caller polls /usage itself
-   * after claiming the token, so the decision uses the freshest server data.
-   */
-  /**
-   * Block until this process is at the head of the queue AND has claimed the
-   * launch token. Resolves with a release function that must be called when
-   * the request completes (after_provider_response, or turn_end/agent_end as
-   * safety nets). Returns undefined if the queue is disabled.
+   * the request completes (turn_end is the primary release path; agent_end is
+   * the drain safety net). Returns undefined if the queue is disabled.
    *
    * Capacity check is NOT performed here — the caller polls /usage itself
    * after claiming the token, so the decision uses the freshest server data.

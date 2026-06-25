@@ -38,7 +38,7 @@
 import { createHash } from "node:crypto";
 import {
   createConcurrencyQueue,
-  parsePriority as parsePriorityShared,
+  parsePriority,
   clampPauseUntil,
   type ConcurrencyQueue,
   type PriorityState,
@@ -352,14 +352,12 @@ export function hashImageId(data: string): string {
 
 /*
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
- * across pi processes via ~/.pi/agent/umans-concurrency.json). parsePriority is
- * re-exported here for backwards compatibility with selfcheck/external imports.
+ * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
-export { parsePriorityShared as parsePriority } from "./concurrency-queue.ts";
-// Re-export the shared types too, for tests and external consumers.
+// Re-export the shared types for tests and external consumers.
 export type { ConcurrencyQueue, QueueState, WaiterEntry, TokenState } from "./concurrency-queue.ts";
-// Legacy alias kept for any external importer; the in-process gate is gone.
-export type Release = () => void;
+// Local type alias for the release function returned by acquireSlot.
+type Release = () => void;
 
 // Session-scoped cache of image bytes keyed by a content hash. Lets the
 // `umans_vision` tool re-query an image for targeted follow-ups without
@@ -771,7 +769,7 @@ export default async function (pi: ExtensionAPI) {
       // priority.low is account-wide, so any pi process seeing it pauses all of
       // them via the shared queue file; clearing it when low===false lets the
       // queue drain as soon as the server says traffic is healthy again.
-      priorityState = parsePriorityShared(data.usage?.priority);
+      priorityState = parsePriority(data.usage?.priority);
       if (priorityState.low) {
         concurrencyQueue.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
       } else {
@@ -812,7 +810,7 @@ export default async function (pi: ExtensionAPI) {
       return {
         concurrentSessions: data.usage?.concurrent_sessions,
         limit: data.limits?.concurrency?.limit ?? undefined,
-        priority: parsePriorityShared(data.usage?.priority),
+        priority: parsePriority(data.usage?.priority),
       };
     } catch {
       return null;
