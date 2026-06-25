@@ -25,14 +25,17 @@ set -u
 LIMIT="${1:-2}"
 JOBS="${2:-4}"
 RUNS=1
-# Parse --runs N from the remaining args.
-shift $# 2>/dev/null || true
-set -- "$LIMIT" "$JOBS"
+# Parse --runs N from args 3+ (preserves the positional LIMIT/JOBS above).
+shift 2 2>/dev/null || shift $# 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --runs)
       RUNS="$2"
       shift 2
+      ;;
+    --runs=*)
+      RUNS="${1#--runs=}"
+      shift
       ;;
     *)
       shift
