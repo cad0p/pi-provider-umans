@@ -73,7 +73,7 @@ type UmansModelInfo = {
 
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
-const USER_AGENT = "pi-umans-provider/1.2.5";
+const USER_AGENT = "pi-umans-provider/1.4.0";
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
 // Client-side vision handoff env + tuning. See header doc for the design.
