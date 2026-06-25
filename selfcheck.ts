@@ -909,4 +909,120 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV2-H2: side-call gating pattern (D6) acquires + releases a slot ---
+// searchWeb (umans_web_search tool), analyzeImage (vision handoff + umans_vision
+// tool) each call acquireSlot(apiKey, signal) before their side-request,
+// releasing in a finally. acquireSlot is a closure (not exported), so we test
+// the queue interaction the side-calls rely on: join -> waitForLaunch -> work
+// -> release, asserting the token is claimed during the side-call and freed
+// after (so a sibling side-call or main turn can proceed). This is the same
+// acquire pattern the side-calls use; a regression dropping acquireSlot would
+// skip the join/waitForLaunch and the token would never be held.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Simulate a side-call: acquire a slot, do "work", release in finally.
+  async function sideCall(signal?: AbortSignal) {
+    const id = q.join()!;
+    try {
+      const release = await q.waitForLaunch(id, signal);
+      // While the side-call is in-flight, THIS process holds the token.
+      assert(q.holdsToken() === true, "COV2-H2: side-call holds the token during work");
+      // Simulate the side-request body (no actual HTTP).
+      await new Promise((r) => setTimeout(r, 10));
+      release();
+    } finally {
+      // Belt-and-suspenders: cancel our waiter if still present (matches the
+      // release fn shape returned by acquireSlot).
+      q.cancel(id);
+    }
+  }
+  await sideCall();
+  // After the side-call, the token is free and no waiters remain.
+  assert(q.holdsToken() === false, "COV2-H2: token released after side-call completes");
+  assert(q.snapshot().queued === 0, "COV2-H2: no leaked waiter after side-call");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV2-H1: message_end release pattern frees the slot during tool exec ---
+// The primary release path (assistant message_end) frees the slot as soon as
+// the response stream completes, letting siblings run during this turn's tool
+// execution. We simulate the before_provider_request acquire + message_end
+// release: acquire, assert held, release (message_end), assert freed — then a
+// sibling acquires immediately (no tool-exec wait). turn_end/agent_end are
+// safety nets and are no-ops after message_end already released.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Main turn acquires (before_provider_request).
+  const id1 = q.join()!;
+  const r1 = await q.waitForLaunch(id1);
+  assert(q.holdsToken() === true, "COV2-H1: main turn holds token after acquire");
+
+  // message_end fires (stream complete): release the slot.
+  r1();
+  assert(q.holdsToken() === false, "COV2-H1: token freed at message_end");
+
+  // A sibling turn can now acquire immediately (the slot was freed during
+  // this turn's tool execution, not held to turn_end).
+  const id2 = q.join()!;
+  const r2 = await q.waitForLaunch(id2);
+  assert(q.holdsToken() === true, "COV2-H1: sibling acquires immediately after message_end release");
+
+  // turn_end safety net on the first turn is a no-op (already released).
+  // r1 was already called; calling its underlying cancel is a no-op.
+  q.cancel(id1);
+  assert(q.holdsToken() === true, "COV2-H1: turn_end safety net after message_end is a no-op (token held by sibling)");
+
+  r2();
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV2-M4: reset() while a waiter is mid-waitForLaunch ---
+// reset() clears ourTokenId's entry. A concurrent waitForLaunch poller on the
+// same queue instance re-inserts its waiter (ADV-4) before claiming. Verify
+// reset() mid-wait doesn't corrupt the state file or strand the poller: the
+// poller either re-inserts + eventually claims, or aborts cleanly.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Turn 1 holds the token.
+  const id1 = q.join()!;
+  await q.waitForLaunch(id1);
+
+  // Turn 2 joins and blocks in waitForLaunch (token held).
+  const id2 = q.join()!;
+  const ctrl = new AbortController();
+  const p2 = q.waitForLaunch(id2, ctrl.signal).catch(() => { /* aborted */ });
+  await new Promise((r) => setTimeout(r, 60)); // let the 50ms poll fire
+
+  // reset() mid-wait (e.g. session_shutdown on a sibling queue path). reset()
+  // clears ourTokenId (id1's token) + id1's waiter entry; id2's entry remains.
+  q.reset();
+
+  // The state file must still be valid JSON (reset must not corrupt it).
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(Array.isArray(st.waiters), "COV2-M4: state file valid JSON after reset mid-wait");
+
+  // Abort the blocked waiter cleanly (cancel + reject). Its entry must be gone.
+  ctrl.abort();
+  await p2;
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!after.waiters.some((w: { id: string }) => w.id === id2),
+    "COV2-M4: aborted waiter entry removed after reset mid-wait");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");
