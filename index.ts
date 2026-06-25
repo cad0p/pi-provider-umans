@@ -619,7 +619,6 @@ export default async function (pi: ExtensionAPI) {
   let currentConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
-  let priorityState: PriorityState = { low: false, until: 0, reason: null };
 
   // Cross-process FIFO queue over outbound Umans requests, backed by
   // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
@@ -735,9 +734,17 @@ export default async function (pi: ExtensionAPI) {
     setWidget(ctx, statusText(lastMetrics));
   }
 
-  async function refreshUsage(apiKey: string) {
+  // Shared /v1/usage fetch skeleton (CLN2-M2). refreshUsage and
+  // fetchUsageSnapshot both build the identical AbortController + fetch +
+  // JSON-parse skeleton; this helper dedupes ~15 lines. Returns the parsed
+  // { limits, usage } on a 2xx, or null on any failure (caller decides how to
+  // handle — refreshUsage leaves cached values, fetchUsageSnapshot retries).
+  async function fetchUsage(apiKey: string, timeoutMs: number): Promise<{
+    limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
+    usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
+  } | null> {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
       const res = await fetch(`${baseUrl}/v1/usage`, {
         signal: ctrl.signal,
@@ -747,38 +754,39 @@ export default async function (pi: ExtensionAPI) {
           "User-Agent": USER_AGENT,
         },
       });
-      if (!res.ok) return;
-      const data = await res.json() as {
-        limits?: {
-          concurrency?: { limit?: number };
-          requests?: { limit?: number };
-        };
-        usage?: {
-          requests_in_window?: number;
-          concurrent_sessions?: number;
-          priority?: unknown;
-        };
+      if (!res.ok) return null;
+      return await res.json() as {
+        limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
+        usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
       };
-      // null ?? undefined normalizes unlimited (null) limits so the display
-      // guards below hide them instead of rendering "x/null".
-      guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined;
-      currentConcurrency = data.usage?.concurrent_sessions;
-      requestLimit = data.limits?.requests?.limit ?? undefined;
-      requestsUsed = data.usage?.requests_in_window;
-      // Reconcile the shared pause window with the server's priority state.
-      // priority.low is account-wide, so any pi process seeing it pauses all of
-      // them via the shared queue file; clearing it when low===false lets the
-      // queue drain as soon as the server says traffic is healthy again.
-      priorityState = parsePriority(data.usage?.priority);
-      if (priorityState.low) {
-        concurrencyQueue.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
-      } else {
-        concurrencyQueue.clearPause();
-      }
     } catch {
-      // Leave as undefined; status bar will show "?".
+      return null;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  async function refreshUsage(apiKey: string) {
+    const data = await fetchUsage(apiKey, 5000);
+    if (!data) return; // leave cached values; status bar will show "?"
+    // null ?? undefined normalizes unlimited (null) limits so the display
+    // guards below hide them instead of rendering "x/null".
+    guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined;
+    currentConcurrency = data.usage?.concurrent_sessions;
+    requestLimit = data.limits?.requests?.limit ?? undefined;
+    requestsUsed = data.usage?.requests_in_window;
+    // Reconcile the shared pause window with the server's priority state.
+    // priority.low is account-wide, so any pi process seeing it pauses all of
+    // them via the shared queue file; clearing it when low===false lets the
+    // queue drain as soon as the server says traffic is healthy again.
+    // CLN2-L1: priorityState is a local const here (it was a module-level let
+    // read only by this writer — no other handler or the status bar reads it;
+    // the status bar reads concurrencyQueue.snapshot() for paused state).
+    const priority = parsePriority(data.usage?.priority);
+    if (priority.low) {
+      concurrencyQueue.pauseUntil(priority.until, priority.reason ?? undefined);
+    } else {
+      concurrencyQueue.clearPause();
     }
   }
 
@@ -792,33 +800,14 @@ export default async function (pi: ExtensionAPI) {
     hardCap: number | undefined;
     priority: PriorityState;
   } | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3000);
-    try {
-      const res = await fetch(`${baseUrl}/v1/usage`, {
-        signal: ctrl.signal,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-          "User-Agent": USER_AGENT,
-        },
-      });
-      if (!res.ok) return null;
-      const data = await res.json() as {
-        limits?: { concurrency?: { limit?: number; hard_cap?: number } };
-        usage?: { concurrent_sessions?: number; priority?: unknown };
-      };
-      return {
-        concurrentSessions: data.usage?.concurrent_sessions,
-        limit: data.limits?.concurrency?.limit ?? undefined,
-        hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
-        priority: parsePriority(data.usage?.priority),
-      };
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
+    const data = await fetchUsage(apiKey, 3000);
+    if (!data) return null;
+    return {
+      concurrentSessions: data.usage?.concurrent_sessions,
+      limit: data.limits?.concurrency?.limit ?? undefined,
+      hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
+      priority: parsePriority(data.usage?.priority),
+    };
   }
 
   // Acquire a concurrency slot for an outbound Umans request (main turn or a
