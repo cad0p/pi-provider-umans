@@ -1201,9 +1201,20 @@ export default async function (pi: ExtensionAPI) {
     if (concurrencyDisabled) return;
     const apiKey = await resolveApiKey(ctx);
     if (!apiKey) return; // no key — let the request fail naturally
+    // acquireSlot joins the FIFO, waits for the token, polls /usage until the
+    // server reports a free slot, then returns a release fn. We release the
+    // token IMMEDIATELY (before pi sends) rather than waiting for
+    // after_provider_response: the token's job is to serialize the *launch
+    // decision* (the /usage poll), not to gate the whole turn. Holding it
+    // until headers wedges the queue on slow-header models (e.g. GLM 5.2,
+    // whose TTFT can be 100s+), blocking sibling processes that the server
+    // has capacity for. The server-side concurrent_sessions counter is the
+    // real authority; if two launches overlap in the brief window before the
+    // server registers the first, the ~2× headroom absorbs it and priority.low
+    // catches any overshoot.
     const release = await acquireSlot(apiKey);
     if (release) {
-      inflightSlots.add(release);
+      release();
       updateStatus(ctx);
     }
   });
@@ -1211,14 +1222,11 @@ export default async function (pi: ExtensionAPI) {
   pi.on("after_provider_response", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     if (concurrencyDisabled) return;
-    // Release the launch token once the response headers arrive — the server
-    // has registered this request as in-flight, so the next head waiter's
-    // /usage poll will see it and wait its turn.
-    //
-    // On a 429, extend the shared pause window (visible to all pi processes
-    // via the queue file) so siblings back off instead of immediately
-    // re-launching. Per Umans docs, each 429 deprioritizes the account for
-    // ~30 min, so we use that floor (Retry-After overrides if larger).
+    // The launch token was already released in before_provider_request (right
+    // after the /usage poll decided to go), so there's nothing to release here.
+    // We only intercept 429s to extend the shared pause window so sibling
+    // processes back off instead of immediately re-launching. Per Umans docs,
+    // each 429 deprioritizes the account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
       const retryAfter = event.headers?.["retry-after"];
       let until = Date.now() + PRIORITY_BACKOFF_MS;
@@ -1233,11 +1241,6 @@ export default async function (pi: ExtensionAPI) {
         "warning",
       );
     }
-    // Release one slot per provider response. before_provider_request acquires
-    // exactly one slot per turn and responses arrive one-per-turn, so draining
-    // the oldest held release is the correct release.
-    const oldest = inflightSlots.values().next().value;
-    releaseSlot(oldest);
   });
 
   pi.on("session_start", async (_event, ctx) => {
