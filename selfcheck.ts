@@ -187,4 +187,43 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(q.snapshot().queued === 0 && q.holdsToken() === false, "disabled: snapshot empty");
 }
 
+// --- reset() does not wipe a sibling's queue state (S1) ---
+// reset() must only clear THIS process's own entries; it must not unlink the
+// shared state file (which would drop a sibling pi process's waiters/token).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync, writeFileSync } = await import("node:fs");
+
+  // Seed the shared file with a sibling pi process's waiter entry + token.
+  // These represent state written by another queue instance on the same file.
+  const siblingTs = Date.now();
+  const siblingState = {
+    waiters: [{ id: "sibling-w1", pid: process.pid, ts: siblingTs }],
+    token: { id: "sibling-t1", pid: process.pid, ts: siblingTs },
+    pausedUntil: 0,
+    pausedReason: null,
+  };
+  writeFileSync(stateFile, JSON.stringify(siblingState));
+
+  // A second process B joins, then resets. reset() must NOT remove sibling-w1
+  // or sibling-t1, and must NOT unlink the state file.
+  const qB = createConcurrencyQueue({ stateFile });
+  qB.join();
+  qB.reset();
+
+  // The state file must still exist (reset must not unlink it).
+  let fileExists = true;
+  try { readFileSync(stateFile, "utf8"); } catch { fileExists = false; }
+  assert(fileExists, "reset() does not unlink the shared state file");
+
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(after.waiters.some((w: { id: string }) => w.id === "sibling-w1"),
+    "reset() does not remove a sibling's waiter entry");
+  assert(after.token !== null && after.token.id === "sibling-t1",
+    "reset() does not remove a sibling's token");
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");

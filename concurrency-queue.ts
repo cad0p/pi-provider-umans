@@ -409,8 +409,23 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     reset(): void {
-      try { unlinkSync(cfg.stateFile); } catch { /* ignore */ }
-      try { unlinkSync(lockFile); } catch { /* ignore */ }
+      // Clear only OUR OWN entries: our waiter entry and the launch token if
+      // we hold it. Do NOT unlink the shared state file or the lockfile — that
+      // would race concurrent writers (breaking the O_EXCL invariant) and wipe
+      // sibling pi processes' queue state. Leave both files for natural expiry
+      // (the watchdog reaps stale token/waiter entries) and stale-lockfile
+      // recovery. Matches the scope of `cancel`.
+      try {
+        mutate((_now, state) => {
+          if (ourTokenId) {
+            const idx = state.waiters.findIndex((w) => w.id === ourTokenId);
+            if (idx >= 0) state.waiters.splice(idx, 1);
+            if (state.token && state.token.id === ourTokenId) {
+              state.token = null;
+            }
+          }
+        });
+      } catch { /* ignore: lock unavailable on shutdown; watchdog will clean up */ }
       holdsToken = false;
       ourTokenId = null;
     },
