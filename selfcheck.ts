@@ -361,6 +361,43 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- ADV-1: stale .tmp files are reaped by writeStateAtomic; fresh ones are not ---
+// A crashed writer (killed between writeFileSync and renameSync) leaves a
+// <path>.<pid>.tmp that would accumulate forever. writeStateAtomic now
+// best-effort unlinks any <path>.*.tmp older than 60s. A fresh .tmp (just
+// written by another process) has a current mtime and must be left alone.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync, statSync, utimesSync } = await import("node:fs");
+
+  // Pre-create a stale .tmp (old mtime) simulating a crashed writer.
+  const staleTmp = `${stateFile}.99999.tmp`;
+  writeFileSync(staleTmp, "{}", { mode: 0o600 });
+  const oldTime = (Date.now() / 1000) - 120; // 120s ago — past the 60s threshold
+  utimesSync(staleTmp, oldTime, oldTime);
+
+  // Pre-create a fresh .tmp (current mtime) simulating a live writer mid-write.
+  const freshTmp = `${stateFile}.88888.tmp`;
+  writeFileSync(freshTmp, "{}", { mode: 0o600 });
+
+  // Trigger a writeStateAtomic via a mutate (pause).
+  const q = createConcurrencyQueue({ stateFile });
+  q.pauseUntil(Date.now() + 1000, "ADV-1 probe");
+
+  // The stale .tmp must be reaped; the fresh one must survive.
+  let staleGone = false;
+  try { statSync(staleTmp); } catch { staleGone = true; }
+  assert(staleGone, "ADV-1: stale .tmp (old mtime) reaped by writeStateAtomic");
+
+  let freshExists = false;
+  try { statSync(freshTmp); freshExists = true; } catch { /* gone */ }
+  assert(freshExists, "ADV-1: fresh .tmp (current mtime) left untouched");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- createConcurrencyQueue: disabled mode is a no-op ---
 {
   const q = createConcurrencyQueue({ disabled: true });

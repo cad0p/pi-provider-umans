@@ -35,8 +35,8 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync } from "node:fs";
+import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
 export interface WaiterEntry {
@@ -277,9 +277,35 @@ function withLock<T>(cfg: Required<QueueConfig>, lockFile: string, fn: (now: num
 function writeStateAtomic(path: string, state: QueueState): void {
   const dir = dirname(path);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
+  // ADV-1: best-effort reap of stale .tmp files left by a crashed writer (a
+  // process killed between writeFileSync and renameSync). We unlink any
+  // <path>.*.tmp older than STALE_TMP_MS (60s). A fresh .tmp just written by
+  // another live process has a current mtime and is left alone. Mirrors the
+  // lockfile mtime-recovery pattern. Best-effort: errors are swallowed.
+  reapStaleTmps(path);
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
+}
+
+/** Max age of a .tmp file before it's considered a crashed writer's leftover. */
+const STALE_TMP_MS = 60_000;
+
+/** Best-effort unlink of stale <path>.*.tmp files older than STALE_TMP_MS. */
+function reapStaleTmps(path: string): void {
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.`;
+  let entries: string[];
+  try { entries = readdirSync(dir); } catch { return; /* dir missing/unreadable */ }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+    const full = `${dir}/${name}`;
+    try {
+      const st = statSync(full);
+      if (now - st.mtimeMs > STALE_TMP_MS) unlinkSync(full);
+    } catch { /* race: gone or unreadable — ignore */ }
+  }
 }
 
 /**
