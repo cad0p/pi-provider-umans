@@ -84,6 +84,37 @@ export UMANS_VISION_MODEL="umans-kimi-k2.7"   # vision model id
 export UMANS_VISION_DISABLE="1"               # start with handoff off
 ```
 
+## Concurrency & rate-limit safety
+
+Umans enforces a **concurrency soft cap** on in-flight requests per account (e.g. 3–4 on paid plans, with ~2× headroom before hard 429 enforcement). Per the [Umans docs](https://app.umans.ai/offers/code/docs), each 429 **deprioritizes the whole account for ~30 minutes** (requests still go through, just slower), and **>10 concurrency 429s in a day triggers a 5-hour pause**. Because all keys under an account share the counter, a burst of parallel subagents can trip this easily.
+
+This provider ships a **client-side FIFO concurrency gate** to keep you under the soft cap and avoid deprioritization:
+
+- **`before_provider_request`** holds each outbound turn in a FIFO queue until a slot is free, so requests are serialized at the soft cap rather than fired-and-retried.
+- The gate's cap is pushed live from **`/v1/usage`** (`limits.concurrency.limit`) every 5 s.
+- When `/v1/usage` reports **`usage.priority.low === true`**, or the gateway returns a **429**, new acquisitions are **paused** until `boxed_until` (or a 30 s floor) elapses — so you stop generating new 429s while the account recovers.
+- Vision handoff and web-search side-calls go through the **same gate**, so a multi-image handoff or a search burst can't push the main turn over the cap.
+- The status bar shows live state: `gate <inFlight>+<queued>q` when there's traffic, and `PAUSED <Ns>` while backing off.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the gate entirely (fire-and-forget; not recommended — you lose 429 protection). |
+| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the soft cap (handy for testing the queue with a low number). |
+
+## Configuration
+
+| Env var | Default | Effect |
+|---|---|---|
+| `UMANS_API_KEY` | — | API key for inference (or use `/login umans`). |
+| `UMANS_BASE_URL` | `https://api.code.umans.ai` | Override the gateway base URL. |
+| `UMANS_BUDGET_THINKING` | `0` | `1` opts out of adaptive (effort-level) thinking into legacy budget-based thinking. |
+| `UMANS_DISABLE` | `0` | `1` disables the extension entirely. |
+| `UMANS_VISION_DISABLE` | `0` | `1` starts vision handoff off (toggle live with `/umans-vision`). |
+| `UMANS_VISION_MODEL` | `umans-kimi-k2.7` | Seed the vision model id. |
+| `UMANS_SEARCH_DISABLE` | `0` | `1` disables the `umans_web_search` tool (e.g. when you use your own MCP web-search tool). Vision handoff is unaffected. |
+| `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the FIFO concurrency gate. |
+| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the concurrency soft cap. |
+
 ## Getting an API Key
 
 1. Log in to [app.umans.ai/billing](https://app.umans.ai/billing)
