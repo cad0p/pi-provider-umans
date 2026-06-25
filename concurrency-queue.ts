@@ -65,6 +65,13 @@ export interface QueueState {
    */
   pausedUntil: number;
   pausedReason: string | null;
+  /**
+   * Epoch-ms when the current pause was set. Used by reapStale to clear a
+   * pause older than MAX_PAUSE_MS (defense-in-depth, in case the clamp in
+   * pauseUntil is bypassed by a compromised sibling or a hand-edited file).
+   * 0 when no pause has ever been set.
+   */
+  pausedTs: number;
 }
 
 export interface QueueConfig {
@@ -95,6 +102,26 @@ function defaultPid(): number { return process.pid; }
 
 /** Conservative default backoff when /v1/usage reports priority.low with a null boxed_until. */
 const PRIORITY_BACKOFF_MS = 30_000;
+
+/**
+ * Maximum allowed pause duration (5h), matching the Umans 5h-account-pause
+ * ceiling cited in design.md. pauseUntil() clamps any requested `until` to
+ * now + MAX_PAUSE_MS, and reapStale() clears a pause whose pausedTs is older
+ * than this — so a poisoned Retry-After header (e.g. 1e10) or a hand-edited
+ * file cannot permanently wedge every local pi process sharing the file.
+ */
+export const MAX_PAUSE_MS = 5 * 60 * 60 * 1000; // 18,000,000 ms
+
+/**
+ * Clamp a candidate pause deadline to now + MAX_PAUSE_MS so a poisoned or
+ * over-large Retry-After/boxed_until cannot wedge the queue for centuries.
+ * Exported so the provider (index.ts) can clamp its Retry-After parse to the
+ * same ceiling.
+ */
+export function clampPauseUntil(until: number, now: number = Date.now()): number {
+  const ceiling = now + MAX_PAUSE_MS;
+  return until > ceiling ? ceiling : until;
+}
 
 /** Normalized priority state derived from /v1/usage `usage.priority` (or a 429). */
 export interface PriorityState {
@@ -148,9 +175,10 @@ export function readState(path: string, now: number): QueueState {
       token: parsed.token ?? null,
       pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
       pausedReason: parsed.pausedReason ?? null,
+      pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
     };
   } catch {
-    return { waiters: [], token: null, pausedUntil: 0, pausedReason: null };
+    return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
   }
 }
 
@@ -169,6 +197,8 @@ export function isPidDead(pid: number): boolean {
 
 /**
  * Reap a stale launch token and stale waiters from a state snapshot.
+ * Also reaps a stale pause: if pausedTs is older than MAX_PAUSE_MS, the pause
+ * is cleared (defense-in-depth, in case the clamp in pauseUntil is bypassed).
  * Returns the cleaned state; does not write to disk.
  */
 export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: number): QueueState {
@@ -179,7 +209,16 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
   const waiters = state.waiters.filter((w) =>
     !isPidDead(w.pid) && (now - w.ts) <= cfg.staleWaiterMs
   );
-  return { ...state, token, waiters };
+  // Reap a pause older than MAX_PAUSE_MS. We check pausedTs (when the pause
+  // was set) rather than pausedUntil so a clamp-bypassed poisoned value still
+  // gets reaped once it has aged past the ceiling.
+  let { pausedUntil, pausedReason, pausedTs } = state;
+  if (pausedTs > 0 && (now - pausedTs) > MAX_PAUSE_MS) {
+    pausedUntil = 0;
+    pausedReason = null;
+    pausedTs = 0;
+  }
+  return { ...state, token, waiters, pausedUntil, pausedReason, pausedTs };
 }
 
 /**
@@ -370,9 +409,11 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     pauseUntil(until: number, reason?: string | null): void {
       mutate((now, state) => {
-        if (until > state.pausedUntil) {
-          state.pausedUntil = until;
+        const clamped = clampPauseUntil(until, now);
+        if (clamped > state.pausedUntil) {
+          state.pausedUntil = clamped;
           state.pausedReason = reason ?? state.pausedReason ?? null;
+          state.pausedTs = now;
         }
       });
     },
@@ -381,6 +422,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       mutate((_now, state) => {
         state.pausedUntil = 0;
         state.pausedReason = null;
+        state.pausedTs = 0;
       });
     },
 

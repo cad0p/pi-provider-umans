@@ -15,6 +15,8 @@ import {
   reapStale,
   createConcurrencyQueue,
   isPidDead,
+  clampPauseUntil,
+  MAX_PAUSE_MS,
 } from "./concurrency-queue.ts";
 
 function vision(name: string, v: boolean | "via-handoff" = true, deprecation?: unknown) {
@@ -115,12 +117,52 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       { id: "w3", pid: process.pid, ts: now - 999_999 }, // stale ts -> reap
     ],
     token: { id: "t1", pid: dead, ts: now - 1000 }, // dead pid -> reap
-    pausedUntil: 0, pausedReason: null,
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
   };
   const reaped = reapStale(state, cfg as any, now);
   assert(reaped.token === null, "reapStale: dead-pid token reclaimed");
   assert(reaped.waiters.length === 1 && reaped.waiters[0].id === "w1",
     "reapStale: dead-pid and stale waiters removed, fresh kept");
+}
+
+// --- S2: clampPauseUntil caps an over-large pause to now + MAX_PAUSE_MS ---
+{
+  const now = 1_700_000_000_000;
+  const huge = now + 1e13; // ~317,000 years (the Number("1e10") wedge)
+  const clamped = clampPauseUntil(huge, now);
+  assert(clamped === now + MAX_PAUSE_MS,
+    "clampPauseUntil: 1e13s pause clamped to now + MAX_PAUSE_MS (5h)");
+  const small = now + 60_000;
+  assert(clampPauseUntil(small, now) === small,
+    "clampPauseUntil: sub-ceiling pause unchanged");
+}
+
+// --- S2: reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---
+{
+  const now = 1_700_000_000_000;
+  const cfg = {
+    stateFile: "/dev/null", staleTokenMs: 30_000, staleWaiterMs: 300_000,
+    lockRetryMs: 5, lockTimeoutMs: 2_000, now: () => now, pid: () => process.pid,
+  } as const;
+  // A poisoned pause set far in the past beyond MAX_PAUSE_MS (simulating a
+  // clamp-bypassed or hand-edited pausedUntil with an old pausedTs).
+  const state = {
+    waiters: [],
+    token: null,
+    pausedUntil: now + 1e13, // absurd future deadline
+    pausedReason: "poisoned",
+    pausedTs: now - MAX_PAUSE_MS - 1, // set just past the ceiling ago
+  };
+  const reaped = reapStale(state, cfg as any, now);
+  assert(reaped.pausedUntil === 0 && reaped.pausedReason === null && reaped.pausedTs === 0,
+    "reapStale: pause older than MAX_PAUSE_MS is reaped (defense-in-depth)");
+
+  // A fresh pause (pausedTs within ceiling) is left intact even if pausedUntil
+  // is far in the future — the clamp in pauseUntil is the primary guard.
+  const fresh = { ...state, pausedTs: now - 1000 };
+  const reapedFresh = reapStale(fresh, cfg as any, now);
+  assert(reapedFresh.pausedUntil === state.pausedUntil,
+    "reapStale: fresh pause (pausedTs within ceiling) is not reaped");
 }
 
 // --- createConcurrencyQueue: FIFO + launch token (file-backed, temp dir) ---
