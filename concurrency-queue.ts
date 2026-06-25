@@ -35,7 +35,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { existsSync, mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -186,6 +186,11 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
  * Open an exclusive lockfile (O_EXCL), spinning until acquired or timeout.
  * Returns a release function. Used to guard the read-modify-write critical
  * section on the state file.
+ *
+ * Stale-lockfile recovery: if the lockfile exists but is older than the lock
+ * timeout, a crashed holder left it behind — unlink it and retry. This keeps
+ * a crashed process from permanently wedging the queue. (The critical section
+ * is milliseconds, so an old lockfile is definitively stale.)
  */
 function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   const deadline = cfg.now() + cfg.lockTimeoutMs;
@@ -195,7 +200,18 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       fd = openSync(lockFile, "wx");
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
-      // Lock is held by another process. Bail if the deadline passed.
+      // Lock is held by another process — or stale from a crash. If the
+      // lockfile is older than the lock timeout, reclaim it.
+      try {
+        const st = statSync(lockFile);
+        if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
+          unlinkSync(lockFile);
+          continue; // retry the O_EXCL immediately
+        }
+      } catch {
+        // stat failed (race: holder just released) — fall through to spin
+      }
+      // Bail if the deadline passed.
       if (cfg.now() >= deadline) {
         throw new Error(`concurrency-queue: timed out acquiring lock ${lockFile}`);
       }

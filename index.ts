@@ -822,6 +822,11 @@ export default async function (pi: ExtensionAPI) {
   // the token + our waiter entry; call it on after_provider_response (or
   // turn_end/agent_end as a safety net). Returns undefined when the queue is
   // disabled (fire-and-forget). The `apiKey` is used for the head-waiter poll.
+  //
+  // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
+  // any token held >30s (or whose PID died) is reclaimed by the next acquirer,
+  // so a crashed/aborted turn can stall the queue for at most 30s — no signal
+  // plumbing needed, and no exception thrown into pi's request path.
   async function acquireSlot(apiKey: string): Promise<Release | undefined> {
     const ourId = concurrencyQueue.join();
     if (!ourId) return undefined; // queue disabled
@@ -846,9 +851,10 @@ export default async function (pi: ExtensionAPI) {
       }
       return true;
     };
-    // Poll at 300ms while full/deprioritized. Abort-aware: returns early if the
-    // caller's signal aborts (the token is released by the safety net on
-    // turn_end/agent_end).
+    // Poll at 300ms while full/deprioritized. If this turn is aborted mid-poll,
+    // the token stays held until the watchdog reaps it (>30s) or the pi
+    // process exits (session_shutdown → reset). Acceptable for a dev tool and
+    // far simpler than abort-aware signal plumbing.
     while (!(await capacityFree())) {
       await new Promise((r) => setTimeout(r, 300));
     }
