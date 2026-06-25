@@ -1309,7 +1309,6 @@ export default async function (pi: ExtensionAPI) {
         }
       }
       concurrencyQueue.pauseUntil(until, "HTTP 429 from gateway");
-      priorityState = { low: true, until, reason: "HTTP 429 from gateway" };
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
         "warning",
