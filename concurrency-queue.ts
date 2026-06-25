@@ -291,9 +291,11 @@ export function isPidDead(pid: number): boolean {
 
 /**
  * Reap a stale launch token and stale waiters from a state snapshot.
- * Also reaps a stale pause: if pausedTs is older than MAX_PAUSE_MS, the pause
- * is cleared (defense-in-depth, in case the clamp in pauseUntil is bypassed).
- * Returns the cleaned state; does not write to disk.
+ * Also reaps a stale pause: if pausedTs is older than MAX_PAUSE_MS, OR the
+ * pause DURATION (pausedUntil - now) itself exceeds MAX_PAUSE_MS, the pause is
+ * cleared (defense-in-depth, in case the clamp in pauseUntil is bypassed by a
+ * compromised sibling or a hand-edited file — SEC2-MED-1). Returns the cleaned
+ * state; does not write to disk.
  */
 export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: number): QueueState {
   const staleToken = state.token && (
@@ -303,14 +305,22 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
   const waiters = state.waiters.filter((w) =>
     !isPidDead(w.pid) && (now - w.ts) <= cfg.staleWaiterMs
   );
-  // Reap a pause older than MAX_PAUSE_MS. We check pausedTs (when the pause
-  // was set) rather than pausedUntil so a clamp-bypassed poisoned value still
-  // gets reaped once it has aged past the ceiling.
+  // Reap a pause that violates the MAX_PAUSE_MS ceiling. Two conditions
+  // (SEC2-MED-1): (1) pausedTs is older than the ceiling (the original
+  // defense — a clamp-bypassed poisoned value ages out); (2) the pause
+  // DURATION (pausedUntil - now) itself exceeds the ceiling from the current
+  // vantage, regardless of pausedTs — this catches a forward-dated pausedTs
+  // (a hand-edited file setting pausedTs to the future makes `now - pausedTs`
+  // negative, bypassing condition 1) paired with an oversized pausedUntil.
   let { pausedUntil, pausedReason, pausedTs } = state;
-  if (pausedTs > 0 && (now - pausedTs) > MAX_PAUSE_MS) {
-    pausedUntil = 0;
-    pausedReason = null;
-    pausedTs = 0;
+  if (pausedUntil > 0) {
+    const ageTooOld = pausedTs > 0 && (now - pausedTs) > MAX_PAUSE_MS;
+    const durationTooLong = (pausedUntil - now) > MAX_PAUSE_MS;
+    if (ageTooOld || durationTooLong) {
+      pausedUntil = 0;
+      pausedReason = null;
+      pausedTs = 0;
+    }
   }
   return { ...state, token, waiters, pausedUntil, pausedReason, pausedTs };
 }

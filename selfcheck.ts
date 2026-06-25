@@ -380,12 +380,47 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(reaped.pausedUntil === 0 && reaped.pausedReason === null && reaped.pausedTs === 0,
     "reapStale: pause older than MAX_PAUSE_MS is reaped (defense-in-depth)");
 
-  // A fresh pause (pausedTs within ceiling) is left intact even if pausedUntil
-  // is far in the future — the clamp in pauseUntil is the primary guard.
-  const fresh = { ...state, pausedTs: now - 1000 };
+  // A fresh pause (pausedTs within ceiling) with a within-ceiling pausedUntil
+  // is left intact — the clamp in pauseUntil is the primary guard against
+  // oversized values, and reapStale only clears age/duration violations.
+  const fresh = { ...state, pausedUntil: now + 60_000, pausedTs: now - 1000 };
   const reapedFresh = reapStale(fresh, cfg as any, now);
-  assert(reapedFresh.pausedUntil === state.pausedUntil,
-    "reapStale: fresh pause (pausedTs within ceiling) is not reaped");
+  assert(reapedFresh.pausedUntil === now + 60_000,
+    "reapStale: fresh pause (pausedTs within ceiling, duration within ceiling) is not reaped");
+}
+
+// --- SEC2-MED-1: reapStale reaps a forward-dated pausedTs + oversized pausedUntil ---
+// A hand-edited/compromised file can set pausedTs to a FUTURE timestamp so
+// `now - pausedTs` is negative (bypassing the age check). When paired with an
+// oversized pausedUntil, the pause would never be reaped, keeping
+// snapshot().paused true for far beyond the 5h ceiling. The duration check
+// (pausedUntil - now > MAX_PAUSE_MS) catches this regardless of pausedTs.
+{
+  const now = 1_700_000_000_000;
+  const cfg = {
+    stateFile: "/dev/null", staleTokenMs: 30_000, staleWaiterMs: 300_000,
+    lockRetryMs: 5, lockTimeoutMs: 2_000, now: () => now, pid: () => process.pid,
+  } as const;
+  // Forward-dated pausedTs (future) + oversized pausedUntil (100h out).
+  // `now - pausedTs` is negative -> age check false; duration check catches it.
+  const state = {
+    waiters: [],
+    token: null,
+    pausedUntil: now + 100 * 60 * 60 * 1000, // 100h — exceeds MAX_PAUSE_MS (5h)
+    pausedReason: "poisoned-forward-dated",
+    pausedTs: now + 100 * 60 * 60 * 1000, // also forward-dated (future)
+  };
+  const reaped = reapStale(state, cfg as any, now);
+  assert(reaped.pausedUntil === 0 && reaped.pausedReason === null && reaped.pausedTs === 0,
+    "SEC2-MED-1: forward-dated pausedTs + oversized pausedUntil is reaped (duration check)");
+
+  // A legitimately short pause with a forward-dated pausedTs (edge case) is
+  // left intact — duration is within ceiling, and the age check is negative
+  // but the pause is short so no reap is warranted.
+  const shortState = { ...state, pausedUntil: now + 30_000, pausedTs: now + 1000 };
+  const shortReaped = reapStale(shortState, cfg as any, now);
+  assert(shortReaped.pausedUntil === now + 30_000,
+    "SEC2-MED-1: short pause with forward-dated pausedTs is not reaped (duration within ceiling)");
 }
 
 // --- createConcurrencyQueue: FIFO + launch token (file-backed, temp dir) ---
