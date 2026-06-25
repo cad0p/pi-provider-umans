@@ -1240,15 +1240,21 @@ export default async function (pi: ExtensionAPI) {
   // main turn blocks (queued) rather than hitting the server and risking a 429.
   //
   // Token-release contract (D2): the token is held ACROSS the send and released
-  // at turn_end — when the full response is done and the server has decremented
-  // concurrent_sessions. Releasing earlier (at after_provider_response headers)
-  // is NOT sufficient: headers arrive ~1s in, but the server only registers the
-  // request as in-flight once the body is streaming, and the next waiter's
-  // /usage poll would see stale capacity and launch too → peak 4 vs limit 2
-  // (empirically reproduced). turn_end is the first point where the server's
-  // concurrent_sessions counter reflects our completed request, so the next
-  // head polls an accurate count. The turn_end release is the PRIMARY path;
-  // agent_end is the final drain safety net for aborted turns.
+  // at assistant message_end (the response stream has completed). Releasing at
+  // after_provider_response headers is too early (headers arrive ~1s in, but
+  // the server only registers the request as in-flight once the body streams);
+  // releasing at turn_end holds the token through tool execution, collapsing
+  // throughput. message_end frees the slot as soon as the stream completes AND
+  // during this turn's tool execution (tools don't consume a server concurrency
+  // slot). NOTE: message_end fires at CLIENT-side stream completion, which
+  // precedes the server's concurrent_sessions decrement by a network RTT +
+  // cleanup lag, so the next waiter's /usage poll can transiently see stale
+  // (too-low) capacity and launch 1-2 over `limit`. That overshoot stays within
+  // the documented burst headroom (hard_cap) -> no 429, no deprioritization
+  // (CORR2-1; see isCapacityFree). The launch token serializes the /usage poll
+  // (no thundering-herd). The message_end release is the PRIMARY path;
+  // turn_end and agent_end are safety nets for turns that error before
+  // message_end fires.
   const inflightSlots = new Set<Release>();
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
@@ -1264,15 +1270,16 @@ export default async function (pi: ExtensionAPI) {
     if (!apiKey) return; // no key — let the request fail naturally
     // acquireSlot joins the FIFO, waits for the token, polls /usage until the
     // server reports a free slot, then returns a release fn. Per D2 we hold the
-    // token ACROSS the send (added to inflightSlots) and release it at turn_end
-    // (full response done = server decrements concurrent_sessions) — NOT at
-    // after_provider_response headers. Releasing inline before the send (the
-    // prior ac4ad4b design) defeated serialization: sibling processes all polled
+    // token ACROSS the send (added to inflightSlots) and release it at
+    // assistant message_end (stream completed) — NOT inline before the send
+    // (the prior ac4ad4b design defeated serialization: siblings all polled
     // /usage, all saw capacity, all released, and all sent simultaneously —
-    // empirically peak 4 vs limit 2 (C1). Releasing at headers is also too
-    // early: the server hasn't registered the request as in-flight until the
-    // body streams, so the next waiter's /usage poll sees stale capacity. Only
-    // turn_end guarantees the next poll sees an accurate count.
+    // empirically peak 4 vs limit 2 (C1)), and NOT at after_provider_response
+    // headers (the server hasn't registered the request as in-flight until the
+    // body streams). message_end frees the slot during tool execution too; the
+    // release race (message_end precedes the server decrement) is absorbed by
+    // the hard_cap burst headroom (CORR2-1). turn_end and agent_end are safety
+    // nets for turns that never reach message_end.
     const release = await acquireSlot(apiKey, ctx.signal);
     if (release) {
       inflightSlots.add(release);
@@ -1287,10 +1294,11 @@ export default async function (pi: ExtensionAPI) {
     // HTTP headers (~1s in), but the request stays in-flight on the server
     // until the body stream completes — so the next waiter's /usage poll would
     // see stale capacity and launch too (peak 4 vs limit 2). The token is held
-    // until turn_end (the primary release path) or agent_end (the drain safety
-    // net). Here we only intercept 429s to extend the shared pause window so
-    // sibling processes back off instead of immediately re-launching. Per Umans
-    // docs, each 429 deprioritizes the account for ~30 min (Retry-After overrides).
+    // until assistant message_end (the primary release path) or turn_end /
+    // agent_end (the drain safety nets). Here we only intercept 429s to extend
+    // the shared pause window so sibling processes back off instead of
+    // immediately re-launching. Per Umans docs, each 429 deprioritizes the
+    // account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
       const retryAfter = event.headers?.["retry-after"];
       let until = Date.now() + PRIORITY_BACKOFF_MS;
