@@ -39,6 +39,7 @@ import { createHash } from "node:crypto";
 import {
   createConcurrencyQueue,
   parsePriority as parsePriorityShared,
+  clampPauseUntil,
   type ConcurrencyQueue,
 } from "./concurrency-queue.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -1231,8 +1232,16 @@ export default async function (pi: ExtensionAPI) {
       const retryAfter = event.headers?.["retry-after"];
       let until = Date.now() + PRIORITY_BACKOFF_MS;
       if (retryAfter) {
-        const secs = Number(retryAfter);
-        if (Number.isFinite(secs) && secs > 0) until = Date.now() + secs * 1000;
+        // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or
+        // an HTTP-date. We only accept the integer form: Number() accepts
+        // hex ("0x10"=16), scientific notation ("1e10"=1e10), and other
+        // misparses that can wedge the queue (S2/S4). Parse strictly and cap
+        // the resulting deadline at now + MAX_PAUSE_MS via clampPauseUntil.
+        const trimmed = String(retryAfter).trim();
+        if (/^\d+$/.test(trimmed)) {
+          const secs = parseInt(trimmed, 10);
+          if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000);
+        }
       }
       concurrencyQueue.pauseUntil(until, "HTTP 429 from gateway");
       priorityState = { low: true, until, reason: "HTTP 429 from gateway" };

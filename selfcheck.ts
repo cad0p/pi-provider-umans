@@ -137,6 +137,29 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "clampPauseUntil: sub-ceiling pause unchanged");
 }
 
+// --- S4: strict Retry-After parse rejects hex/sci-notation; valid ints clamp (S4) ---
+// Mirrors the inline parse in index.ts after_provider_response 429 branch:
+// /^\d+$/.test(trim) then parseInt + clampPauseUntil. Number() accepted
+// "0x10"=16 and "1e10"=1e10; the strict regex rejects both.
+{
+  const now = 1_700_000_000_000;
+  function parseRetryAfter(raw: unknown, base = now): number {
+    const floor = base + 30_000;
+    if (!raw) return floor;
+    const trimmed = String(raw).trim();
+    if (!/^\d+$/.test(trimmed)) return floor;
+    const secs = parseInt(trimmed, 10);
+    return secs > 0 ? clampPauseUntil(base + secs * 1000, base) : floor;
+  }
+  assert(parseRetryAfter("60") === now + 60_000, "Retry-After 60s honored");
+  assert(parseRetryAfter("0") === now + 30_000, "Retry-After 0 falls back to 30s floor");
+  assert(parseRetryAfter("0x10") === now + 30_000, "Retry-After hex rejected -> 30s floor");
+  assert(parseRetryAfter("1e10") === now + 30_000, "Retry-After sci-notation rejected -> 30s floor (S2 wedge prevented)");
+  assert(parseRetryAfter(" -5 ") === now + 30_000, "Retry-After negative-with-spaces rejected -> 30s floor");
+  assert(parseRetryAfter("") === now + 30_000, "Retry-After empty -> 30s floor");
+  assert(parseRetryAfter("99999999") === now + MAX_PAUSE_MS, "Retry-After huge int clamped to now + MAX_PAUSE_MS");
+}
+
 // --- S2: reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---
 {
   const now = 1_700_000_000_000;
