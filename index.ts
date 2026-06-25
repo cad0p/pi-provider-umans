@@ -41,6 +41,7 @@ import {
   parsePriority,
   clampPauseUntil,
   isCapacityFree,
+  parseConcurrencyLimit,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -631,9 +632,7 @@ export default async function (pi: ExtensionAPI) {
   const concurrencyDisabled = process.env[CONCURRENCY_DISABLE_ENV] === "1";
   const concurrencyQueue: ConcurrencyQueue = createConcurrencyQueue({ disabled: concurrencyDisabled });
   function concurrencyLimit(): number | undefined {
-    const envOverride = process.env[CONCURRENCY_LIMIT_ENV]?.trim();
-    const n = envOverride ? Number(envOverride) : NaN;
-    return Number.isFinite(n) && n > 0 ? n : guaranteedConcurrency;
+    return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
   }
 
   type LiveRequest = {

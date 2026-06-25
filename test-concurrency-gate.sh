@@ -113,6 +113,15 @@ if [ "$FAIL" -gt 0 ]; then
   echo "FAIL: $FAIL/$JOBS jobs failed"
   PASS=0
 fi
+# COV-MED-1: guard against a vacuous pass. If peak stayed 0 and at least 2 jobs
+# ran, the poller never observed a non-zero sample (e.g. all jobs finished
+# before the first poll landed, or /usage was unreachable) — peak 0 <= limit
+# would pass trivially without proving the gate serialized anything. Require
+# either a non-zero peak OR fewer than 2 jobs completed.
+if [ "$PEAK" -eq 0 ] 2>/dev/null && [ "$JOBS" -ge 2 ] && [ "$FAIL" -lt "$JOBS" ]; then
+  echo "FAIL: peak 0 with $JOBS jobs — vacuous pass (no non-zero sample observed)"
+  PASS=0
+fi
 
 if [ "$PASS" = 1 ]; then
   echo "PASS: peak concurrent_sessions ($PEAK) stayed within limit ($LIMIT)"

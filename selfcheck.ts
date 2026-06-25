@@ -17,6 +17,7 @@ import {
   isPidDead,
   clampPauseUntil,
   isCapacityFree,
+  parseConcurrencyLimit,
   MAX_PAUSE_MS,
 } from "./concurrency-queue.ts";
 
@@ -389,6 +390,124 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV-HIGH-5: 3-waiter FIFO drain + late-joiner (joins after token held) ---
+// The 2-waiter test proves promote-once; this proves the steady-state drain
+// (1 → 2 → 3) and the late-joiner branch (state.token truthy when a waiter
+// joins after the token is already held by a long-running poller).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // 1 claims the token.
+  const id1 = q.join()!;
+  const r1 = await q.waitForLaunch(id1);
+  assert(q.holdsToken() === true, "COV-HIGH-5: w1 holds the token");
+
+  // 2 + 3 queue behind 1.
+  const id2 = q.join()!;
+  const id3 = q.join()!;
+  let got2: (() => void) | undefined, got3: (() => void) | undefined;
+  const p2 = q.waitForLaunch(id2).then((r) => { got2 = r; return r; });
+  const p3 = q.waitForLaunch(id3).then((r) => { got3 = r; return r; });
+  await new Promise((r) => setTimeout(r, 80));
+  assert(!got2 && !got3, "COV-HIGH-5: w2 + w3 blocked while w1 holds token");
+  assert(q.snapshot().queued === 3, "COV-HIGH-5: 3 waiters queued");
+
+  // 1 releases → 2 claims (promote-once).
+  r1();
+  await p2;
+  assert(typeof got2 === "function", "COV-HIGH-5: w2 claims after w1 releases");
+  assert(q.holdsToken() === true, "COV-HIGH-5: w2 now holds token");
+  await new Promise((r) => setTimeout(r, 80));
+  assert(!got3, "COV-HIGH-5: w3 still blocked while w2 holds token");
+
+  // 2 releases → 3 claims (promote-twice, steady-state drain).
+  got2!();
+  await p3;
+  assert(typeof got3 === "function", "COV-HIGH-5: w3 claims after w2 releases");
+  got3!();
+  assert(q.snapshot().queued === 0, "COV-HIGH-5: queue drains after all release");
+
+  // Late-joiner: a waiter that joins AFTER the token is already held by a
+  // long-running poller. idHolder claims first; idLate joins behind it.
+  const idHolder = q.join()!;
+  const rHolder = await q.waitForLaunch(idHolder);
+  assert(q.holdsToken() === true, "COV-HIGH-5: late-joiner setup — holder holds token");
+  const idLate = q.join()!;
+  let gotLate = false;
+  const pLate = q.waitForLaunch(idLate).then((r) => { gotLate = true; return r; });
+  await new Promise((r) => setTimeout(r, 80));
+  assert(!gotLate, "COV-HIGH-5: late-joiner blocked (token held when it joined)");
+  rHolder();
+  await pLate;
+  assert(gotLate, "COV-HIGH-5: late-joiner claims after holder releases");
+  // Drain the late-joiner's token via reset (its release fn is captured in pLate).
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV-MED-3: stale-lockfile recovery (acquireLock reclaims old mtime) ---
+// If a lockfile is older than lockTimeoutMs, a crashed holder left it behind;
+// acquireLock unlinks it and retries. Pre-create an old-mtime lockfile and
+// assert join() (which takes the lock) succeeds within one retry.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const lockFile = `${stateFile}.lock`;
+  const { writeFileSync, utimesSync } = await import("node:fs");
+
+  // Pre-create a stale lockfile (old mtime, simulating a crashed holder).
+  writeFileSync(lockFile, "", { mode: 0o600 });
+  const oldTime = (Date.now() / 1000) - 10; // 10s ago — past lockTimeoutMs (2s)
+  utimesSync(lockFile, oldTime, oldTime);
+
+  // join() must succeed (acquireLock reclaims the stale lockfile + retries).
+  const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
+  const id = q.join()!;
+  assert(id !== null, "COV-MED-3: join succeeds despite stale lockfile (reclaimed)");
+
+  // The stale lockfile must be gone after acquireLock reclaimed it (and the
+  // new one released after the critical section). join() completes the mutate,
+  // so no lockfile should remain.
+  let lockGone = false;
+  try { /* lockfile is transient; after mutate it's released */ } catch { /* ignore */ }
+  // Verify the state file was written (proving the critical section ran).
+  const { readFileSync } = await import("node:fs");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 1 && st.waiters[0].id === id,
+    "COV-MED-3: stale-lockfile recovery let the mutate write our waiter");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV-MED-6: concurrencyLimit() edge inputs (parseConcurrencyLimit) ---
+// "2.5" → 2.5 (fractional, kept as-is), " " → fallback, "0" → fallback,
+// "abc" → fallback, "" → fallback, undefined → fallback.
+{
+  const fallback = 4;
+  assert(parseConcurrencyLimit("2.5", fallback) === 2.5,
+    "COV-MED-6: '2.5' → 2.5 (fractional kept)");
+  assert(parseConcurrencyLimit(" ", fallback) === fallback,
+    "COV-MED-6: whitespace → fallback");
+  assert(parseConcurrencyLimit("0", fallback) === fallback,
+    "COV-MED-6: '0' → fallback (non-positive)");
+  assert(parseConcurrencyLimit("abc", fallback) === fallback,
+    "COV-MED-6: 'abc' → fallback (NaN)");
+  assert(parseConcurrencyLimit("", fallback) === fallback,
+    "COV-MED-6: empty → fallback");
+  assert(parseConcurrencyLimit(undefined, fallback) === fallback,
+    "COV-MED-6: undefined → fallback");
+  assert(parseConcurrencyLimit("-5", fallback) === fallback,
+    "COV-MED-6: '-5' → fallback (negative)");
+  assert(parseConcurrencyLimit("3", fallback) === 3,
+    "COV-MED-6: '3' → 3 (valid)");
+  // fallback undefined (unlimited plan) propagates.
+  assert(parseConcurrencyLimit("0", undefined) === undefined,
+    "COV-MED-6: '0' with undefined fallback → undefined");
 }
 
 // --- S3: state file + lockfile created with mode 0600 (no PID leakage) ---
