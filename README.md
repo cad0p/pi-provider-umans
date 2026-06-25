@@ -86,20 +86,23 @@ export UMANS_VISION_DISABLE="1"               # start with handoff off
 
 ## Concurrency & rate-limit safety
 
-Umans enforces a **concurrency soft cap** on in-flight requests per account (e.g. 3–4 on paid plans, with ~2× headroom before hard 429 enforcement). Per the [Umans docs](https://app.umans.ai/offers/code/docs), each 429 **deprioritizes the whole account for ~30 minutes** (requests still go through, just slower), and **>10 concurrency 429s in a day triggers a 5-hour pause**. Because all keys under an account share the counter, a burst of parallel subagents can trip this easily.
+Umans enforces a **concurrency soft cap** on in-flight requests per account (e.g. 3–4 on paid plans, with ~2× headroom before hard 429 enforcement). Per the [Umans docs](https://app.umans.ai/offers/code/docs), each 429 **deprioritizes the whole account for ~30 minutes** (requests still go through, just slower), and **>10 concurrency 429s in a day triggers a 5-hour pause**. Because all keys under an account share the counter, a burst of parallel subagents — or several `pi` processes on the same machine — can trip this easily.
 
-This provider ships a **client-side FIFO concurrency gate** to keep you under the soft cap and avoid deprioritization:
+This provider ships a **cross-process FIFO queue** to keep you under the soft cap and avoid deprioritization:
 
-- **`before_provider_request`** holds each outbound turn in a FIFO queue until a slot is free, so requests are serialized at the soft cap rather than fired-and-retried.
-- The gate's cap is pushed live from **`/v1/usage`** (`limits.concurrency.limit`) every 5 s.
-- When `/v1/usage` reports **`usage.priority.low === true`**, or the gateway returns a **429**, new acquisitions are **paused** until `boxed_until` (or a 30 s floor) elapses — so you stop generating new 429s while the account recovers.
-- Vision handoff and web-search side-calls go through the **same gate**, so a multi-image handoff or a search burst can't push the main turn over the cap.
-- The status bar shows live state: `gate <inFlight>+<queued>q` when there's traffic, and `PAUSED <Ns>` while backing off.
+- A single file at **`~/.pi/agent/umans-concurrency.json`** (guarded by an `O_EXCL` lockfile + atomic rename) holds a **pure waiter queue + launch token**. No in-flight count lives in the file.
+- **Capacity is decided solely by the live `/v1/usage` response** (`concurrent_sessions` vs `limits.concurrency.limit`, and `usage.priority.low`), polled by the head waiter at ~300 ms. The file never tries to count slots it can't see — so multiple machines using the same key each run their own local queue and coordinate through the server + its headroom, not a local counter.
+- The **launch token** is held from send until `after_provider_response` (headers arrived = the server registered the request as in-flight), so the next head's `/usage` poll sees it and waits its turn. Launches are race-free within a machine; turns still stream concurrently.
+- When `/v1/usage` reports **`priority.low === true`**, or the gateway returns a **429**, the shared `pausedUntil` is written to the file — **all** local `pi` processes back off together until it elapses (Retry-After aware). `priority.low` is account-wide, so cross-machine processes also see it via `/usage`.
+- A **watchdog** reclaims the token if the holding process dies (PID check) or holds it >30 s, so a crashed turn never stalls the queue.
+- Vision handoff and web-search side-calls go through the **same queue**.
+- The status bar shows live state: `q <queued>*` (the `*` marks this process holding the token / launching) and `PAUSED <Ns>` while backing off.
+- **Unlimited plans** (Code Max, `limit === undefined`): the queue still serializes launches + honors `priority.low`, but skips the capacity check.
 
 | Env var | Default | Effect |
 |---|---|---|
-| `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the gate entirely (fire-and-forget; not recommended — you lose 429 protection). |
-| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the soft cap (handy for testing the queue with a low number). |
+| `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the queue entirely (fire-and-forget; not recommended — you lose 429 protection). |
+| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the capacity check value (handy for testing the queue with a low number). |
 
 ## Configuration
 

@@ -16,8 +16,10 @@
  *                           your own MCP web-search tool). Vision handoff is unaffected.
  *   UMANS_CONCURRENCY_DISABLE - "1" disables client-side FIFO concurrency gating
  *                           (falls back to fire-and-forget; not recommended).
- *   UMANS_CONCURRENCY_LIMIT - override the concurrency soft cap used by the gate
+ *   UMANS_CONCURRENCY_LIMIT - override the capacity check value used by the queue
  *                           (default: live value from /v1/usage). Useful for testing.
+ *                           The queue itself lives at ~/.pi/agent/umans-concurrency.json
+ *                           and coordinates across all local pi processes.
  *
  * Client-side vision handoff: text-only ("via-handoff") Umans models can't see
  * images, so attached images are analyzed with a native-vision Umans model and
@@ -34,6 +36,11 @@
  *   # then /model umans/umans-coder
  */
 import { createHash } from "node:crypto";
+import {
+  createConcurrencyQueue,
+  parsePriority as parsePriorityShared,
+  type ConcurrencyQueue,
+} from "./concurrency-queue.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -84,12 +91,8 @@ const VISION_ANALYSIS_PROMPT =
 const SEARCH_TIMEOUT_MS = 30_000;
 const SEARCH_MAX_TOKENS = 2048;
 
-// Concurrency gate tuning. The gate keeps in-flight Umans requests at or below
-// the plan's soft cap so the account never draws rate-limit 429s (which, per
-// the Umans docs, deprioritize the whole account for ~30 min and can trigger a
-// 5-hour pause after 10 in a day). When the server reports priority.low or a
-// 429 is received, new acquisitions are paused until boxedUntil.
-const CONCURRENCY_POLL_INTERVAL_MS = 5_000;
+// Concurrency gate tuning. When the server reports priority.low or a 429 is
+// received, new acquisitions are paused until boxedUntil (or this floor).
 const PRIORITY_BACKOFF_MS = 30_000; // conservative default; server may report a boxed_until
 
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
@@ -341,180 +344,16 @@ export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
 
-/**
- * Normalized priority state derived from /v1/usage `usage.priority` (or a 429).
- * `until` is an epoch-ms deadline; 0 means "no active deprioritization".
+/*
+ * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
+ * across pi processes via ~/.pi/agent/umans-concurrency.json). parsePriority is
+ * re-exported here for backwards compatibility with selfcheck/external imports.
  */
-export interface PriorityState {
-  low: boolean;
-  until: number; // epoch-ms; 0 when not low
-  reason: string | null;
-}
-
-export function parsePriority(raw: unknown): PriorityState {
-  const p = (raw ?? {}) as {
-    low?: boolean | null;
-    boxed_until?: string | number | null;
-    reason?: string | null;
-  };
-  const low = p.low === true;
-  let until = 0;
-  if (low) {
-    // boxed_until may be an ISO string, epoch seconds, or null. When null but
-    // low===true, fall back to the conservative PRIORITY_BACKOFF_MS window.
-    const b = p.boxed_until;
-    let ms = 0;
-    if (typeof b === "number" && b > 0) ms = b * 1000;
-    else if (typeof b === "string" && b) {
-      const t = Date.parse(b);
-      if (!Number.isNaN(t)) ms = t;
-    }
-    until = ms > 0 ? ms : Date.now() + PRIORITY_BACKOFF_MS;
-  }
-  return { low, until, reason: p.reason ?? null };
-}
-
-/**
- * Snapshot of the concurrency gate's state, surfaced in the status bar.
- * `inFlight` counts held slots; `queued` counts waiters in the FIFO.
- */
-export interface ConcurrencySnapshot {
-  inFlight: number;
-  queued: number;
-  limit: number | undefined;
-  paused: boolean;
-  pausedUntil: number; // epoch-ms; 0 when not paused
-}
-
-/**
- * A FIFO concurrency gate. acquire() returns a `Release` that must be called
- * exactly once when the protected request completes (success, error, or
- * abort). Waiters are served strictly in arrival order. When the account is
- * deprioritized (priority.low or a received 429), acquire() blocks until the
- * pause deadline passes, then re-enters the FIFO.
- *
- * Exported so the queue logic is unit-testable without a live provider.
- * createConcurrencyGate itself has no side effects.
- */
-export interface ConcurrencyGate {
-  acquire(): Promise<Release>;
-  snapshot(): ConcurrencySnapshot;
-  /** Mark the account as deprioritized until `until` (epoch-ms). Idempotent; extends the deadline. */
-  pauseUntil(until: number, reason?: string | null): void;
-  /** Clear deprioritization early (e.g. when /v1/usage reports priority.low===false again). */
-  clearPause(): void;
-  /** Replace the soft cap (push live /v1/usage values here). undefined = unlimited. */
-  setLimit(limit: number | undefined): void;
-  /** Hard-reset all state (used on session shutdown). */
-  reset(): void;
-}
+export { parsePriorityShared as parsePriority } from "./concurrency-queue.ts";
+// Re-export the shared types too, for tests and external consumers.
+export type { ConcurrencyQueue, QueueState, WaiterEntry, TokenState } from "./concurrency-queue.ts";
+// Legacy alias kept for any external importer; the in-process gate is gone.
 export type Release = () => void;
-
-export function createConcurrencyGate(opts?: {
-  limit?: number;
-  now?: () => number;
-}): ConcurrencyGate {
-  const now = opts?.now ?? Date.now;
-  let limit = opts?.limit;
-  let inFlight = 0;
-  let paused = false;
-  let pausedUntil = 0;
-  let pausedReason: string | null = null;
-  // FIFO of waiters. Each entry's `resolve` is called once a slot is free AND
-  // any active pause has elapsed.
-  const waiters: Array<() => void> = [];
-
-  function isPausedAt(t: number): boolean {
-    return paused && t < pausedUntil;
-  }
-
-  function pump(): void {
-    // Grant slots to as many waiters as capacity + un-paused state allows.
-    while (waiters.length > 0) {
-      const t = now();
-      if (isPausedAt(t)) break; // waiters stay queued until the pause elapses
-      if (limit !== undefined && inFlight >= limit) break;
-      const next = waiters.shift()!;
-      inFlight++;
-      next();
-    }
-  }
-
-  function schedulePumpForPause(): void {
-    // If paused with waiters, wake pump() when the pause should elapse.
-    if (paused && pausedUntil > 0 && waiters.length > 0) {
-      const delay = Math.max(100, pausedUntil - now());
-      setTimeout(() => pump(), delay);
-    }
-  }
-
-  return {
-    acquire(): Promise<Release> {
-      const t = now();
-      // Fast path: a free slot, no pause, and (no limit OR under limit).
-      if (!isPausedAt(t) && (limit === undefined || inFlight < limit)) {
-        inFlight++;
-        return Promise.resolve(() => {
-          inFlight = Math.max(0, inFlight - 1);
-          pump();
-        });
-      }
-      // Slow path: enqueue and wait. pump() grants the slot later.
-      return new Promise<Release>((resolve) => {
-        waiters.push(() => resolve(() => {
-          inFlight = Math.max(0, inFlight - 1);
-          pump();
-        }));
-        // If paused, ensure pump() is rescheduled when the pause elapses;
-        // otherwise pump() runs on the next release.
-        if (isPausedAt(now())) schedulePumpForPause();
-      });
-    },
-    snapshot(): ConcurrencySnapshot {
-      const t = now();
-      return {
-        inFlight,
-        queued: waiters.length,
-        limit,
-        paused: isPausedAt(t),
-        pausedUntil: paused && pausedUntil > 0 ? pausedUntil : 0,
-      };
-    },
-    pauseUntil(until: number, reason?: string | null): void {
-      paused = true;
-      pausedUntil = Math.max(pausedUntil, until);
-      if (reason) pausedReason = reason;
-      schedulePumpForPause();
-    },
-    clearPause(): void {
-      paused = false;
-      pausedUntil = 0;
-      pausedReason = null;
-      pump();
-    },
-    setLimit(newLimit: number | undefined): void {
-      limit = newLimit;
-      pump();
-    },
-    reset(): void {
-      paused = false;
-      pausedUntil = 0;
-      pausedReason = null;
-      // Drain waiters with no-ops so their promises never settle (process is
-      // shutting down); inFlight is reset implicitly by the pending releases.
-      while (waiters.length) waiters.shift()!();
-      inFlight = 0;
-    },
-  };
-}
-
-/**
- * Set/replace a gate's soft cap after it is created. Exposed for the provider to
- * push live /v1/usage values into an existing gate without recreating it.
- */
-export function setGateLimit(gate: ConcurrencyGate, limit: number | undefined): void {
-  gate.setLimit(limit);
-}
 
 // Session-scoped cache of image bytes keyed by a content hash. Lets the
 // `umans_vision` tool re-query an image for targeted follow-ups without
@@ -776,17 +615,20 @@ export default async function (pi: ExtensionAPI) {
   let requestsUsed: number | undefined;
   let priorityState: PriorityState = { low: false, until: 0, reason: null };
 
-  // Client-side FIFO gate over outbound Umans requests (main turns + vision /
-  // search side-calls). Kept in sync with /v1/usage's concurrency.limit and
-  // paused when the account is deprioritized. UMANS_CONCURRENCY_DISABLE opts
-  // out entirely (fire-and-forget); UMANS_CONCURRENCY_LIMIT overrides the cap.
+  // Cross-process FIFO queue over outbound Umans requests, backed by
+  // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
+  // file is a PURE WAITER QUEUE + launch token; capacity is decided solely by
+  // the live /v1/usage response polled by the head waiter, so multiple pi
+  // processes (and multiple machines) coordinate through the server, not a
+  // local count. UMANS_CONCURRENCY_DISABLE opts out (fire-and-forget).
+  // UMANS_CONCURRENCY_LIMIT is now only a display/testing hint: when set, the
+  // capacity check uses it instead of the server's limits.concurrency.limit.
   const concurrencyDisabled = process.env[CONCURRENCY_DISABLE_ENV] === "1";
-  const concurrencyGate = concurrencyDisabled ? undefined : createConcurrencyGate();
-  function applyConcurrencyLimit(): void {
-    if (!concurrencyGate) return;
+  const concurrencyQueue: ConcurrencyQueue = createConcurrencyQueue({ disabled: concurrencyDisabled });
+  function concurrencyLimit(): number | undefined {
     const envOverride = process.env[CONCURRENCY_LIMIT_ENV]?.trim();
     const n = envOverride ? Number(envOverride) : NaN;
-    setGateLimit(concurrencyGate, Number.isFinite(n) && n > 0 ? n : guaranteedConcurrency);
+    return Number.isFinite(n) && n > 0 ? n : guaranteedConcurrency;
   }
 
   type LiveRequest = {
@@ -835,26 +677,25 @@ export default async function (pi: ExtensionAPI) {
     const parts: string[] = [];
     if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
     if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
-    // The gate's effective cap honors UMANS_CONCURRENCY_LIMIT over the live
-    // server value, so the bar reflects what the gate actually enforces.
-    const gateSnap = concurrencyGate?.snapshot();
-    const effectiveLimit = gateSnap?.limit ?? guaranteedConcurrency;
+    // The effective cap honors UMANS_CONCURRENCY_LIMIT over the live server
+    // value, so the bar reflects what the queue capacity check uses.
+    const effectiveLimit = concurrencyLimit();
     const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
-    // Real account-wide conc from /v1/usage (includes other clients, not just
-    // this pi instance). Refreshed only by the 5s poll; shows "?" until first
-    // poll lands — never locally synthesized from sent-message turn counts.
+    // Real account-wide conc from /v1/usage (includes other clients/machines).
+    // Refreshed only by the 5s poll; shows "?" until first poll lands.
     const current = currentConcurrency !== undefined ? String(currentConcurrency) : "?";
     parts.push(`Conc ${current}/${guaranteed}`);
     // Only show request usage when the plan has a hard limit (e.g. the $20 tier).
     if (requestsUsed !== undefined && requestLimit !== undefined) {
       parts.push(`Req ${requestsUsed}/${requestLimit}`);
     }
-    // Client-side gate: in-flight/queued across this pi instance, plus a pause
-    // indicator when the account is deprioritized (priority.low or a 429).
-    if (concurrencyGate) {
-      const snap = concurrencyGate.snapshot();
-      if (snap.queued > 0 || snap.inFlight > 0) {
-        parts.push(`gate ${snap.inFlight}${snap.queued > 0 ? `+${snap.queued}q` : ""}`);
+    // Cross-process queue: queued waiters across all local pi processes, plus
+    // a launch/PAUSED indicator. `tokenHeld` means this process is polling
+    // /usage or mid-send; `queued` is the FIFO depth in the shared file.
+    if (!concurrencyDisabled) {
+      const snap = concurrencyQueue.snapshot();
+      if (snap.queued > 0 || snap.tokenHeld) {
+        parts.push(`q ${snap.queued}${snap.tokenHeld ? "*" : ""}`);
       }
       if (snap.paused) {
         const secs = Math.max(0, Math.round((snap.pausedUntil - Date.now()) / 1000));
@@ -920,16 +761,15 @@ export default async function (pi: ExtensionAPI) {
       currentConcurrency = data.usage?.concurrent_sessions;
       requestLimit = data.limits?.requests?.limit ?? undefined;
       requestsUsed = data.usage?.requests_in_window;
-      // Push the live soft cap into the gate (unless overridden by env) and
-      // reconcile the pause window with the server's priority state.
-      applyConcurrencyLimit();
+      // Reconcile the shared pause window with the server's priority state.
+      // priority.low is account-wide, so any pi process seeing it pauses all of
+      // them via the shared queue file; clearing it when low===false lets the
+      // queue drain as soon as the server says traffic is healthy again.
       priorityState = parsePriority(data.usage?.priority);
-      if (concurrencyGate) {
-        if (priorityState.low) {
-          concurrencyGate.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
-        } else {
-          concurrencyGate.clearPause();
-        }
+      if (priorityState.low) {
+        concurrencyQueue.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
+      } else {
+        concurrencyQueue.clearPause();
       }
     } catch {
       // Leave as undefined; status bar will show "?".
@@ -938,16 +778,84 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  // Acquire a concurrency slot for an outbound Umans request (main turn or a
-  // vision/search side-call). Resolves once a slot is free AND the account is
-  // not deprioritized. Returns a release fn (no-op when the gate is disabled).
-  async function acquireSlot(): Promise<Release | undefined> {
-    // If the server just reported priority.low, proactively extend the pause
-    // window so a fresh burst of turns doesn't immediately re-trigger a 429.
-    if (priorityState.low && priorityState.until > Date.now() && concurrencyGate) {
-      concurrencyGate.pauseUntil(priorityState.until, priorityState.reason ?? undefined);
+  // Lightweight one-shot /v1/usage fetch used by the head waiter to decide
+  // whether to launch. Cheaper than refreshUsage: it only needs
+  // concurrent_sessions + priority, and it must be fast so the queue doesn't
+  // stall. Returns null on any failure (caller retries).
+  async function fetchUsageSnapshot(apiKey: string): Promise<{
+    concurrentSessions: number | undefined;
+    limit: number | undefined;
+    priority: PriorityState;
+  } | null> {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3000);
+    try {
+      const res = await fetch(`${baseUrl}/v1/usage`, {
+        signal: ctrl.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+          "User-Agent": USER_AGENT,
+        },
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as {
+        limits?: { concurrency?: { limit?: number } };
+        usage?: { concurrent_sessions?: number; priority?: unknown };
+      };
+      return {
+        concurrentSessions: data.usage?.concurrent_sessions,
+        limit: data.limits?.concurrency?.limit ?? undefined,
+        priority: parsePriority(data.usage?.priority),
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
     }
-    return concurrencyGate ? concurrencyGate.acquire() : undefined;
+  }
+
+  // Acquire a concurrency slot for an outbound Umans request (main turn or a
+  // vision/search side-call). Joins the cross-process FIFO, waits until we are
+  // head + have claimed the launch token, then polls /v1/usage until the server
+  // reports a free slot (and no priority.low). Returns a release fn that drops
+  // the token + our waiter entry; call it on after_provider_response (or
+  // turn_end/agent_end as a safety net). Returns undefined when the queue is
+  // disabled (fire-and-forget). The `apiKey` is used for the head-waiter poll.
+  async function acquireSlot(apiKey: string): Promise<Release | undefined> {
+    const ourId = concurrencyQueue.join();
+    if (!ourId) return undefined; // queue disabled
+    const releaseToken = await concurrencyQueue.waitForLaunch(ourId);
+    // We are head + hold the launch token. Poll /usage until the server reports
+    // a free slot (or the plan is unlimited) and the account isn't deprioritized.
+    // The token stays held during the poll + the subsequent send so the next
+    // head polls a /usage that already reflects our in-flight request.
+    const limit = concurrencyLimit();
+    // Unlimited plan: skip the capacity check (still honor priority.low).
+    const capacityFree = async (): Promise<boolean> => {
+      if (limit === undefined) return true; // Code Max / unlimited
+      const snap = await fetchUsageSnapshot(apiKey);
+      if (!snap) return true; // /usage unreachable → don't block forever; trust headroom
+      const cur = snap.concurrentSessions ?? 0;
+      const cap = snap.limit ?? limit;
+      if (cap !== undefined && cur >= cap) return false;
+      if (snap.priority.low) {
+        // Refresh the shared pause so sibling processes back off too.
+        concurrencyQueue.pauseUntil(snap.priority.until, snap.priority.reason ?? undefined);
+        return false;
+      }
+      return true;
+    };
+    // Poll at 300ms while full/deprioritized. Abort-aware: returns early if the
+    // caller's signal aborts (the token is released by the safety net on
+    // turn_end/agent_end).
+    while (!(await capacityFree())) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return () => {
+      releaseToken();
+      concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
+    };
   }
 
   function isActiveUmans(ctx: any, msg?: any) {
@@ -1002,9 +910,9 @@ export default async function (pi: ExtensionAPI) {
         };
       }
       // The side-call consumes a concurrency slot on the account; gate it
-      // through the same FIFO so a burst of searches can't push the main
-      // turn past the soft cap.
-      const release = await acquireSlot();
+      // through the same cross-process FIFO so a burst of searches can't push
+      // the main turn past the soft cap.
+      const release = await acquireSlot(apiKey);
       try {
         const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
         return { content: [{ type: "text", text: results }], details: {} };
@@ -1074,9 +982,9 @@ export default async function (pi: ExtensionAPI) {
         const id = hashImageId(img.data);
         imageStore.set(id, { data: img.data, mimeType: img.mimeType });
         let analysis: string;
-        // Gate the vision side-call through the same concurrency FIFO so a
+        // Gate the vision side-call through the same cross-process FIFO so a
         // multi-image handoff can't push the main turn past the soft cap.
-        const release = await acquireSlot();
+        const release = await acquireSlot(apiKey);
         try {
           analysis = await analyzeImage(
             apiKey,
@@ -1157,7 +1065,7 @@ export default async function (pi: ExtensionAPI) {
           };
         }
         const model = visionModelId;
-        const release = await acquireSlot();
+        const release = await acquireSlot(apiKey);
         try {
           const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
           return { content: [{ type: "text", text: answer }], details: {} };
@@ -1268,11 +1176,12 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 
-  // === Concurrency gate: hold the outbound request until a slot is free ===
+  // === Concurrency queue: hold the outbound request until a slot is free ===
   // before_provider_request fires after the payload is built, right before the
-  // HTTP send, and is awaited by pi. We acquire a FIFO slot here so the main
-  // turn blocks (queued) rather than hitting the server and risking a 429. The
-  // release is wired to after_provider_response + turn_end (safety net).
+  // HTTP send, and is awaited by pi. We join the cross-process FIFO here so the
+  // main turn blocks (queued) rather than hitting the server and risking a 429.
+  // The release is wired to after_provider_response + turn_end/agent_end (safety
+  // nets) so a crashed/aborted turn never stalls the shared queue.
   const inflightSlots = new Set<Release>();
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
@@ -1283,8 +1192,10 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    if (!concurrencyGate) return;
-    const release = await acquireSlot();
+    if (concurrencyDisabled) return;
+    const apiKey = await resolveApiKey(ctx);
+    if (!apiKey) return; // no key — let the request fail naturally
+    const release = await acquireSlot(apiKey);
     if (release) {
       inflightSlots.add(release);
       updateStatus(ctx);
@@ -1293,14 +1204,15 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("after_provider_response", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    if (!concurrencyGate) return;
-    // Release the slot once the response headers arrive — the in-flight
-    // request is no longer consuming a concurrency slot on the server at this
-    // point (streaming drains the body afterwards).
+    if (concurrencyDisabled) return;
+    // Release the launch token once the response headers arrive — the server
+    // has registered this request as in-flight, so the next head waiter's
+    // /usage poll will see it and wait its turn.
     //
-    // On a 429, extend the pause window so subsequent turns back off instead
-    // of immediately re-queuing and re-triggering the limit. Per Umans docs,
-    // each 429 deprioritizes the account for ~30 min, so we use that floor.
+    // On a 429, extend the shared pause window (visible to all pi processes
+    // via the queue file) so siblings back off instead of immediately
+    // re-launching. Per Umans docs, each 429 deprioritizes the account for
+    // ~30 min, so we use that floor (Retry-After overrides if larger).
     if (event.status === 429) {
       const retryAfter = event.headers?.["retry-after"];
       let until = Date.now() + PRIORITY_BACKOFF_MS;
@@ -1308,16 +1220,16 @@ export default async function (pi: ExtensionAPI) {
         const secs = Number(retryAfter);
         if (Number.isFinite(secs) && secs > 0) until = Date.now() + secs * 1000;
       }
-      concurrencyGate.pauseUntil(until, "HTTP 429 from gateway");
+      concurrencyQueue.pauseUntil(until, "HTTP 429 from gateway");
       priorityState = { low: true, until, reason: "HTTP 429 from gateway" };
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
         "warning",
       );
     }
-    // Release one slot per provider response. Because before_provider_request
-    // acquires exactly one slot per turn and responses arrive one-per-turn,
-    // draining the oldest held release is the correct FIFO release.
+    // Release one slot per provider response. before_provider_request acquires
+    // exactly one slot per turn and responses arrive one-per-turn, so draining
+    // the oldest held release is the correct release.
     const oldest = inflightSlots.values().next().value;
     releaseSlot(oldest);
   });
@@ -1423,7 +1335,7 @@ export default async function (pi: ExtensionAPI) {
     lastMetrics = {};
     imageStore.clear();
     inflightSlots.clear();
-    concurrencyGate?.reset();
+    concurrencyQueue.reset();
     setWidget(ctx, undefined);
   });
 
