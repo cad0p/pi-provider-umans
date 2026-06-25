@@ -338,4 +338,81 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- C4/ADV-2: waitForLaunch(ourId, signal) rejects + cancels on abort ---
+// An aborted turn must not leave a waiter entry at the head of the shared file
+// (which would block sibling pi processes for staleWaiterMs = 5 min) and must
+// not later claim the token and resolve a release fn nobody holds (leak).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // First waiter holds the token so the second one blocks in waitForLaunch.
+  const id1 = q.join()!;
+  const r1 = await q.waitForLaunch(id1);
+  assert(q.holdsToken() === true, "abort test: first waiter holds the token");
+
+  // Second waiter joins and blocks — its entry is now queued in the file.
+  const id2 = q.join()!;
+  const ctrl = new AbortController();
+  let rejected = false;
+  const p2 = q.waitForLaunch(id2, ctrl.signal).catch(() => { rejected = true; });
+  await new Promise((r) => setTimeout(r, 80)); // let the 50ms poll fire
+  assert(!rejected, "abort test: second waiter blocks while token held");
+  assert(q.snapshot().queued === 2, "abort test: both waiters queued before abort");
+
+  // Abort mid-wait. waitForLaunch must reject, stop the setTimeout chain, and
+  // cancel our waiter entry (so it's not left at the head blocking siblings).
+  ctrl.abort();
+  await p2;
+  assert(rejected, "abort test: waitForLaunch rejects on signal abort");
+
+  // The waiter entry for id2 must be gone from the shared file (cancel ran).
+  const { readFileSync } = await import("node:fs");
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!after.waiters.some((w: { id: string }) => w.id === id2),
+    "abort test: aborted waiter entry removed from shared file (cancel ran)");
+
+  // Releasing the first waiter must not then hand the token to the orphaned id2
+  // (its promise already rejected; this proves no token leak).
+  r1();
+  await new Promise((r) => setTimeout(r, 80));
+  assert(q.holdsToken() === false, "abort test: no orphan claimed the token");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- ADV-5: acquireSlot throw path cancels the waiter (no 5-min leak) ---
+// If waitForLaunch throws after join() (lock timeout, EACCES, ENOSPC), the
+// waiter entry added by join() must be cancelled, not left in the file for
+// staleWaiterMs. We simulate by aborting the signal before the first poll —
+// waitForLaunch cancels + rejects on an already-aborted signal.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Hold the token so the second joiner would block.
+  const id1 = q.join()!;
+  await q.waitForLaunch(id1);
+
+  // Joiner 2 with an already-aborted signal: waitForLaunch must cancel + reject
+  // immediately without leaving the waiter entry.
+  const id2 = q.join()!;
+  const ctrl = new AbortController();
+  ctrl.abort();
+  let rejected = false;
+  await q.waitForLaunch(id2, ctrl.signal).catch(() => { rejected = true; });
+  assert(rejected, "ADV-5: already-aborted signal rejects waitForLaunch");
+
+  const { readFileSync } = await import("node:fs");
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!after.waiters.some((w: { id: string }) => w.id === id2),
+    "ADV-5: pre-aborted waiter entry is cancelled (no leaked waiter)");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");

@@ -827,43 +827,68 @@ export default async function (pi: ExtensionAPI) {
   //
   // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
   // any token held >30s (or whose PID died) is reclaimed by the next acquirer,
-  // so a crashed/aborted turn can stall the queue for at most 30s — no signal
-  // plumbing needed, and no exception thrown into pi's request path.
-  async function acquireSlot(apiKey: string): Promise<Release | undefined> {
+  // so a crashed/aborted turn can stall the queue for at most 30s. For an
+  // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
+  // waitForLaunch cancels the waiter entry and rejects immediately (C4/ADV-2).
+  async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
     const ourId = concurrencyQueue.join();
     if (!ourId) return undefined; // queue disabled
-    const releaseToken = await concurrencyQueue.waitForLaunch(ourId);
-    // We are head + hold the launch token. Poll /usage until the server reports
-    // a free slot (or the plan is unlimited) and the account isn't deprioritized.
-    // The token stays held during the poll + the subsequent send so the next
-    // head polls a /usage that already reflects our in-flight request.
-    const limit = concurrencyLimit();
-    // Unlimited plan: skip the capacity check (still honor priority.low).
-    const capacityFree = async (): Promise<boolean> => {
-      if (limit === undefined) return true; // Code Max / unlimited
-      const snap = await fetchUsageSnapshot(apiKey);
-      if (!snap) return true; // /usage unreachable → don't block forever; trust headroom
-      const cur = snap.concurrentSessions ?? 0;
-      const cap = snap.limit ?? limit;
-      if (cap !== undefined && cur >= cap) return false;
-      if (snap.priority.low) {
-        // Refresh the shared pause so sibling processes back off too.
-        concurrencyQueue.pauseUntil(snap.priority.until, snap.priority.reason ?? undefined);
-        return false;
+    // Track whether we have already released our waiter entry so a throw
+    // between join() and the return of a release fn cannot leak the waiter
+    // for staleWaiterMs (5 min) (ADV-5). waitForLaunch itself cancels on
+    // signal abort; this finally covers the non-abort throw paths (lock
+    // timeout, EACCES, ENOSPC).
+    let released = false;
+    try {
+      const releaseToken = await concurrencyQueue.waitForLaunch(ourId, signal);
+      // We are head + hold the launch token. Poll /usage until the server reports
+      // a free slot (or the plan is unlimited) and the account isn't deprioritized.
+      // The token stays held during the poll + the subsequent send so the next
+      // head polls a /usage that already reflects our in-flight request.
+      const limit = concurrencyLimit();
+      // Unlimited plan: skip the capacity check (still honor priority.low).
+      const capacityFree = async (): Promise<boolean> => {
+        if (limit === undefined) return true; // Code Max / unlimited
+        const snap = await fetchUsageSnapshot(apiKey);
+        if (!snap) return true; // /usage unreachable → don't block forever; trust headroom
+        const cur = snap.concurrentSessions ?? 0;
+        const cap = snap.limit ?? limit;
+        if (cap !== undefined && cur >= cap) return false;
+        if (snap.priority.low) {
+          // Refresh the shared pause so sibling processes back off too.
+          concurrencyQueue.pauseUntil(snap.priority.until, snap.priority.reason ?? undefined);
+          return false;
+        }
+        return true;
+      };
+      // Poll at 300ms while full/deprioritized. If the turn is aborted
+      // mid-poll, `signal` (checked here via acquireSlot's caller, and again
+      // in waitForLaunch before/after the poll) cancels the waiter; otherwise
+      // the watchdog reaps the token after >30s and session_shutdown clears the
+      // waiter on process exit.
+      while (!(await capacityFree())) {
+        if (signal?.aborted) {
+          concurrencyQueue.cancel(ourId);
+          released = true;
+          throw new Error("concurrency-queue: acquireSlot aborted mid-poll");
+        }
+        await new Promise((r) => setTimeout(r, 300));
       }
-      return true;
-    };
-    // Poll at 300ms while full/deprioritized. If this turn is aborted mid-poll,
-    // the token stays held until the watchdog reaps it (>30s) or the pi
-    // process exits (session_shutdown → reset). Acceptable for a dev tool and
-    // far simpler than abort-aware signal plumbing.
-    while (!(await capacityFree())) {
-      await new Promise((r) => setTimeout(r, 300));
+      released = true;
+      return () => {
+        releaseToken();
+        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
+      };
+    } finally {
+      // If we exited without returning a release fn (throw, abort, or a path
+      // that didn't set `released`), cancel our waiter entry so it doesn't
+      // pollute the FIFO for staleWaiterMs (ADV-5). On the happy path the
+      // returned release fn owns the cancellation, so `released` is true
+      // and this is a no-op.
+      if (!released) {
+        try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
+      }
     }
-    return () => {
-      releaseToken();
-      concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
-    };
   }
 
   function isActiveUmans(ctx: any, msg?: any) {
@@ -920,7 +945,7 @@ export default async function (pi: ExtensionAPI) {
       // The side-call consumes a concurrency slot on the account; gate it
       // through the same cross-process FIFO so a burst of searches can't push
       // the main turn past the soft cap.
-      const release = await acquireSlot(apiKey);
+      const release = await acquireSlot(apiKey, signal);
       try {
         const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
         return { content: [{ type: "text", text: results }], details: {} };
@@ -992,7 +1017,7 @@ export default async function (pi: ExtensionAPI) {
         let analysis: string;
         // Gate the vision side-call through the same cross-process FIFO so a
         // multi-image handoff can't push the main turn past the soft cap.
-        const release = await acquireSlot(apiKey);
+        const release = await acquireSlot(apiKey, ctx?.signal);
         try {
           analysis = await analyzeImage(
             apiKey,
@@ -1073,7 +1098,7 @@ export default async function (pi: ExtensionAPI) {
           };
         }
         const model = visionModelId;
-        const release = await acquireSlot(apiKey);
+        const release = await acquireSlot(apiKey, signal);
         try {
           const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
           return { content: [{ type: "text", text: answer }], details: {} };
@@ -1223,7 +1248,7 @@ export default async function (pi: ExtensionAPI) {
     // early: the server hasn't registered the request as in-flight until the
     // body streams, so the next waiter's /usage poll sees stale capacity. Only
     // turn_end guarantees the next poll sees an accurate count.
-    const release = await acquireSlot(apiKey);
+    const release = await acquireSlot(apiKey, ctx.signal);
     if (release) {
       inflightSlots.add(release);
       updateStatus(ctx);

@@ -301,7 +301,22 @@ export interface ConcurrencyQueue {
    * Capacity check is NOT performed here — the caller polls /usage itself
    * after claiming the token, so the decision uses the freshest server data.
    */
-  waitForLaunch(ourId: string): Promise<() => void>;
+  /**
+   * Block until this process is at the head of the queue AND has claimed the
+   * launch token. Resolves with a release function that must be called when
+   * the request completes (after_provider_response, or turn_end/agent_end as
+   * safety nets). Returns undefined if the queue is disabled.
+   *
+   * Capacity check is NOT performed here — the caller polls /usage itself
+   * after claiming the token, so the decision uses the freshest server data.
+   *
+   * If `signal` aborts mid-wait, the poll loop stops, our waiter entry is
+   * cancelled via `cancel(ourId)`, and the promise rejects with an
+   * AbortError — so an aborted turn cannot wedge the local queue for
+   * `staleWaiterMs` (5 min) or leak the token if it is later freed
+   * (C4/ADV-2).
+   */
+  waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void>;
   /**
    * Mark the account as deprioritized until `until` (epoch-ms). Shared across
    * all processes via the state file; idempotent (extends the deadline).
@@ -368,9 +383,26 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       return id;
     },
 
-    waitForLaunch(ourId: string): Promise<() => void> {
-      return new Promise((resolve) => {
+    waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void> {
+      return new Promise((resolve, reject) => {
+        // If the signal is already aborted, cancel + reject immediately.
+        if (signal?.aborted) {
+          try { this.cancel(ourId); } catch { /* best-effort */ }
+          reject(new Error("concurrency-queue: waitForLaunch aborted"));
+          return;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const onAbort = () => {
+          if (timer) clearTimeout(timer);
+          try { this.cancel(ourId); } catch { /* best-effort */ }
+          reject(new Error("concurrency-queue: waitForLaunch aborted"));
+        };
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
         const poll = () => {
+          // Stop polling the moment the turn is aborted; otherwise the orphaned
+          // promise would claim the token when freed and resolve a release fn
+          // nobody holds (ADV-2 token leak).
+          if (signal?.aborted) return;
           const got = mutate((now, state) => {
             // Are we the head and is the token free?
             const head = state.waiters[0];
@@ -383,6 +415,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
             return true;
           });
           if (got) {
+            if (signal) signal.removeEventListener("abort", onAbort);
             resolve(() => {
               // Release: remove our token and our waiter entry.
               mutate((_now, state) => {
@@ -401,7 +434,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           }
           // Not our turn yet; retry shortly. 50ms keeps the queue responsive
           // without hammering the lockfile or the disk.
-          setTimeout(poll, 50);
+          timer = setTimeout(poll, 50);
         };
         poll();
       });
