@@ -163,6 +163,56 @@ export function parsePriority(raw: unknown): PriorityState {
   return { low, until, reason: p.reason ?? null };
 }
 
+/**
+ * A lightweight /v1/usage snapshot used for the capacity decision. Mirrors the
+ * shape fetchUsageSnapshot returns (concurrentSessions + limit + priority).
+ */
+export interface CapacitySnapshot {
+  concurrentSessions: number | undefined;
+  limit: number | undefined;
+  priority: PriorityState;
+}
+
+/**
+ * Inputs to the capacity decision: the effective concurrency cap (env override
+ * or the live /usage value) and whether the shared pausedUntil is active.
+ */
+export interface CapacityInputs {
+  limit: number | undefined;
+  queuePaused: boolean;
+}
+
+/**
+ * Pure decision: may this process launch given a /usage snapshot + inputs?
+ * Returns { free, repause? } where `repause` is set when priority.low is
+ * observed and the caller should push the pause to the shared file.
+ *
+ * - If the shared pause is active → not free (C2: a 429 observed by any local
+ *   process backs off all siblings before /usage propagates priority.low).
+ * - If the plan is unlimited (limit === undefined) → free (D5; priority.low
+ *   still honored via the repause path below when snap is present).
+ * - If /usage is unreachable (snap === null) → free (trust headroom rather
+ *   than block forever; the queue still serializes launches via the token).
+ * - If concurrent_sessions >= limit → not free.
+ * - If priority.low → not free + repause so siblings back off too.
+ * - Otherwise → free.
+ */
+export function isCapacityFree(
+  snap: CapacitySnapshot | null,
+  inputs: CapacityInputs,
+): { free: boolean; repause?: { until: number; reason: string | null } } {
+  if (inputs.queuePaused) return { free: false };
+  if (inputs.limit === undefined) return { free: true }; // Code Max / unlimited
+  if (!snap) return { free: true }; // /usage unreachable → trust headroom
+  const cur = snap.concurrentSessions ?? 0;
+  const cap = snap.limit ?? inputs.limit;
+  if (cap !== undefined && cur >= cap) return { free: false };
+  if (snap.priority.low) {
+    return { free: false, repause: { until: snap.priority.until, reason: snap.priority.reason } };
+  }
+  return { free: true };
+}
+
 
 
 /** Generate a unique waiter/token id. */

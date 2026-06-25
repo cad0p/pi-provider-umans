@@ -16,6 +16,7 @@ import {
   createConcurrencyQueue,
   isPidDead,
   clampPauseUntil,
+  isCapacityFree,
   MAX_PAUSE_MS,
 } from "./concurrency-queue.ts";
 
@@ -83,6 +84,65 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   const epoch = Math.floor((Date.now() + 60000) / 1000);
   const pNum = parsePriority({ low: true, boxed_until: epoch });
   assert(pNum.until === epoch * 1000, "parsePriority: numeric boxed_until (seconds) -> ms");
+}
+
+// --- COV-HIGH-1: isCapacityFree decision logic (extracted from acquireSlot) ---
+// Covers: unlimited-plan short-circuit, /usage-unreachable fallback, shared
+// pause (C2), at-cap, under-cap, and priority.low → repause.
+{
+  const lowState = { low: true, until: 1_000_000, reason: "burst" };
+  const okState = { low: false, until: 0, reason: null };
+
+  // Unlimited plan (limit === undefined): always free regardless of snap
+  // (D5 — capacity check skipped; priority.low still honored via repause when
+  // snap is present, but free stays true because there's no cap to exceed).
+  assert(isCapacityFree(null, { limit: undefined, queuePaused: false }).free === true,
+    "isCapacityFree: unlimited plan + /usage unreachable → free");
+  const unlim = isCapacityFree(
+    { concurrentSessions: 999, limit: undefined, priority: okState },
+    { limit: undefined, queuePaused: false },
+  );
+  assert(unlim.free === true, "isCapacityFree: unlimited plan → free even at high conc");
+
+  // /usage unreachable (snap === null) with a finite limit → free (trust headroom)
+  assert(isCapacityFree(null, { limit: 2, queuePaused: false }).free === true,
+    "isCapacityFree: /usage unreachable → free (trust headroom)");
+
+  // Shared pause active (queuePaused) → not free (C2)
+  assert(isCapacityFree(
+    { concurrentSessions: 0, limit: 2, priority: okState },
+    { limit: 2, queuePaused: true },
+  ).free === false, "isCapacityFree: shared pause active → not free");
+
+  // At cap (cur >= cap) → not free
+  assert(isCapacityFree(
+    { concurrentSessions: 2, limit: 2, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "isCapacityFree: at cap (cur === cap) → not free");
+  assert(isCapacityFree(
+    { concurrentSessions: 3, limit: 2, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "isCapacityFree: over cap → not free");
+
+  // Under cap → free
+  assert(isCapacityFree(
+    { concurrentSessions: 1, limit: 2, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === true, "isCapacityFree: under cap → free");
+
+  // priority.low → not free + repause (so the caller pushes the pause to siblings)
+  const low = isCapacityFree(
+    { concurrentSessions: 0, limit: 2, priority: lowState },
+    { limit: 2, queuePaused: false },
+  );
+  assert(low.free === false && low.repause?.until === 1_000_000 && low.repause?.reason === "burst",
+    "isCapacityFree: priority.low → not free + repause with until/reason");
+
+  // Server-reported limit overrides the local limit when smaller (cap = snap.limit ?? limit)
+  assert(isCapacityFree(
+    { concurrentSessions: 1, limit: 1, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "isCapacityFree: server limit (1) < local limit (2) → at cap");
 }
 
 // --- readState: absent/corrupt file -> empty ---

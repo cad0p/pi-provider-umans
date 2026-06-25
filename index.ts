@@ -40,6 +40,7 @@ import {
   createConcurrencyQueue,
   parsePriority,
   clampPauseUntil,
+  isCapacityFree,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -856,19 +857,16 @@ export default async function (pi: ExtensionAPI) {
         // propagates priority.low (5s refresh lag, or a transient gateway-side
         // blip not yet reflected in /usage). Without this, process B would see
         // priority.low === false and launch right into the 429 that A just hit.
-        if (concurrencyQueue.snapshot().paused) return false;
-        if (limit === undefined) return true; // Code Max / unlimited
         const snap = await fetchUsageSnapshot(apiKey);
-        if (!snap) return true; // /usage unreachable → don't block forever; trust headroom
-        const cur = snap.concurrentSessions ?? 0;
-        const cap = snap.limit ?? limit;
-        if (cap !== undefined && cur >= cap) return false;
-        if (snap.priority.low) {
+        const decision = isCapacityFree(snap, {
+          limit,
+          queuePaused: concurrencyQueue.snapshot().paused,
+        });
+        if (decision.repause) {
           // Refresh the shared pause so sibling processes back off too.
-          concurrencyQueue.pauseUntil(snap.priority.until, snap.priority.reason ?? undefined);
-          return false;
+          concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
         }
-        return true;
+        return decision.free;
       };
       // Poll at 300ms while full/deprioritized. If the turn is aborted
       // mid-poll, `signal` cancels the waiter; otherwise the watchdog reaps
