@@ -1188,8 +1188,17 @@ export default async function (pi: ExtensionAPI) {
   // before_provider_request fires after the payload is built, right before the
   // HTTP send, and is awaited by pi. We join the cross-process FIFO here so the
   // main turn blocks (queued) rather than hitting the server and risking a 429.
-  // The release is wired to after_provider_response + turn_end/agent_end (safety
-  // nets) so a crashed/aborted turn never stalls the shared queue.
+  //
+  // Token-release contract (D2): the token is held ACROSS the send and released
+  // at turn_end — when the full response is done and the server has decremented
+  // concurrent_sessions. Releasing earlier (at after_provider_response headers)
+  // is NOT sufficient: headers arrive ~1s in, but the server only registers the
+  // request as in-flight once the body is streaming, and the next waiter's
+  // /usage poll would see stale capacity and launch too → peak 4 vs limit 2
+  // (empirically reproduced). turn_end is the first point where the server's
+  // concurrent_sessions counter reflects our completed request, so the next
+  // head polls an accurate count. The turn_end release is the PRIMARY path;
+  // agent_end is the final drain safety net for aborted turns.
   const inflightSlots = new Set<Release>();
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
@@ -1204,19 +1213,19 @@ export default async function (pi: ExtensionAPI) {
     const apiKey = await resolveApiKey(ctx);
     if (!apiKey) return; // no key — let the request fail naturally
     // acquireSlot joins the FIFO, waits for the token, polls /usage until the
-    // server reports a free slot, then returns a release fn. We release the
-    // token IMMEDIATELY (before pi sends) rather than waiting for
-    // after_provider_response: the token's job is to serialize the *launch
-    // decision* (the /usage poll), not to gate the whole turn. Holding it
-    // until headers wedges the queue on slow-header models (e.g. GLM 5.2,
-    // whose TTFT can be 100s+), blocking sibling processes that the server
-    // has capacity for. The server-side concurrent_sessions counter is the
-    // real authority; if two launches overlap in the brief window before the
-    // server registers the first, the ~2× headroom absorbs it and priority.low
-    // catches any overshoot.
+    // server reports a free slot, then returns a release fn. Per D2 we hold the
+    // token ACROSS the send (added to inflightSlots) and release it at turn_end
+    // (full response done = server decrements concurrent_sessions) — NOT at
+    // after_provider_response headers. Releasing inline before the send (the
+    // prior ac4ad4b design) defeated serialization: sibling processes all polled
+    // /usage, all saw capacity, all released, and all sent simultaneously —
+    // empirically peak 4 vs limit 2 (C1). Releasing at headers is also too
+    // early: the server hasn't registered the request as in-flight until the
+    // body streams, so the next waiter's /usage poll sees stale capacity. Only
+    // turn_end guarantees the next poll sees an accurate count.
     const release = await acquireSlot(apiKey);
     if (release) {
-      release();
+      inflightSlots.add(release);
       updateStatus(ctx);
     }
   });
@@ -1224,11 +1233,14 @@ export default async function (pi: ExtensionAPI) {
   pi.on("after_provider_response", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     if (concurrencyDisabled) return;
-    // The launch token was already released in before_provider_request (right
-    // after the /usage poll decided to go), so there's nothing to release here.
-    // We only intercept 429s to extend the shared pause window so sibling
-    // processes back off instead of immediately re-launching. Per Umans docs,
-    // each 429 deprioritizes the account for ~30 min (Retry-After overrides).
+    // The launch token is NOT released here. after_provider_response fires at
+    // HTTP headers (~1s in), but the request stays in-flight on the server
+    // until the body stream completes — so the next waiter's /usage poll would
+    // see stale capacity and launch too (peak 4 vs limit 2). The token is held
+    // until turn_end (the primary release path) or agent_end (the drain safety
+    // net). Here we only intercept 429s to extend the shared pause window so
+    // sibling processes back off instead of immediately re-launching. Per Umans
+    // docs, each 429 deprioritizes the account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
       const retryAfter = event.headers?.["retry-after"];
       let until = Date.now() + PRIORITY_BACKOFF_MS;
@@ -1288,9 +1300,11 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
-    // Safety net: if after_provider_response never fired (e.g. the request
-    // errored before headers), release any slot still held for this turn.
-    // In normal flow the slot is already released and this is a no-op.
+    // Primary release path (D2): the full response is done, so the server has
+    // decremented concurrent_sessions. Releasing here (not at
+    // after_provider_response headers) is what makes the next waiter's /usage
+    // poll see an accurate count and serialize correctly. agent_end is the
+    // final drain safety net for aborted turns that never reach turn_end.
     const oldest = inflightSlots.values().next().value;
     releaseSlot(oldest);
     updateStatus(ctx);
