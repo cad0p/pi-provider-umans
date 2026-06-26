@@ -108,6 +108,7 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 |---|---|---|
 | `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the queue entirely (fire-and-forget; not recommended — you lose 429 protection). |
 | `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the capacity check value (handy for testing the queue with a low number). |
+| `UMANS_CONCURRENCY_STATE_FILE` | `~/.pi/agent/umans-concurrency.json` | Override the queue state file path (handy for multi-process isolation experiments). |
 
 ## Configuration
 
@@ -120,7 +121,7 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 | `UMANS_VISION_DISABLE` | `0` | `1` starts vision handoff off (toggle live with `/umans-vision`). |
 | `UMANS_VISION_MODEL` | `umans-kimi-k2.7` | Seed the vision model id. |
 | `UMANS_SEARCH_DISABLE` | `0` | `1` disables the `umans_web_search` tool (e.g. when you use your own MCP web-search tool). Vision handoff is unaffected. |
-| `UMANS_CONCURRENCY_*` | — | See [Concurrency & rate-limit safety](#concurrency--rate-limit-safety) for `UMANS_CONCURRENCY_DISABLE` and `UMANS_CONCURRENCY_LIMIT`. |
+| `UMANS_CONCURRENCY_*` | — | See [Concurrency & rate-limit safety](#concurrency--rate-limit-safety) for `UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`, and `UMANS_CONCURRENCY_STATE_FILE`. |
 
 ## Development & testing
 
