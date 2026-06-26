@@ -337,10 +337,17 @@ export function isCapacityFree(
  * fallback), "abc" (NaN → fallback), "" (empty → fallback). CLN4-3:
  * tightened from Number.isFinite to Number.isInteger so a fractional typo
  * falls back to the server value (a strict improvement for a slot-count knob).
+ * CORR8-3 / ADV8-1: tightened further to a strict /^\d+$/ regex test BEFORE
+ * Number(trimmed) so hex ("0x10" === 16) and scientific notation ("1e3" ===
+ * 1000) — which Number() accepts + Number.isInteger() happily passes — are
+ * rejected to fallback. A "0x10" typo would silently set the gate to 16,
+ * defeating the cap. Mirrors the 429 Retry-After parse (which already used
+ * /^\d+$/). The existing `n > 0` check still rejects 0.
  */
 export function parseConcurrencyLimit(envValue: string | undefined, fallback: number | undefined): number | undefined {
   const trimmed = envValue?.trim();
-  const n = trimmed ? Number(trimmed) : NaN;
+  if (!trimmed || !/^\d+$/.test(trimmed)) return fallback;
+  const n = Number(trimmed);
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 

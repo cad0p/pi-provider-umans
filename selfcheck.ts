@@ -1250,6 +1250,28 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // fallback undefined (unlimited plan) propagates.
   assert(parseConcurrencyLimit("0", undefined) === undefined,
     "COV-MED-6: '0' with undefined fallback → undefined");
+  // CORR8-3 / ADV8-1: hex / scientific notation / fractional are rejected by
+  // the strict /^\d+$/ regex BEFORE Number(trimmed) — Number() accepts them
+  // (Number("0x10")===16, Number("1e3")===1000, Number("2.0")===2) and
+  // Number.isInteger() passes, so a "0x10" typo would silently set the gate to
+  // 16, defeating the cap. Mirrors the 429 Retry-After parse.
+  assert(parseConcurrencyLimit("0x10", fallback) === fallback,
+    "CORR8-3/ADV8-1: '0x10' (hex) → fallback (strict regex rejects, not 16)");
+  assert(parseConcurrencyLimit("1e3", fallback) === fallback,
+    "CORR8-3/ADV8-1: '1e3' (sci-notation) → fallback (strict regex rejects, not 1000)");
+  assert(parseConcurrencyLimit("2.0", fallback) === fallback,
+    "CORR8-3/ADV8-1: '2.0' (fractional) → fallback (strict regex rejects)");
+  assert(parseConcurrencyLimit("0X10", fallback) === fallback,
+    "CORR8-3/ADV8-1: '0X10' (hex upper) → fallback");
+  assert(parseConcurrencyLimit("1E3", fallback) === fallback,
+    "CORR8-3/ADV8-1: '1E3' (sci-notation upper) → fallback");
+  assert(parseConcurrencyLimit("+3", fallback) === fallback,
+    "CORR8-3/ADV8-1: '+3' → fallback (strict regex rejects the sign)");
+  // Valid positive decimal integers still pass.
+  assert(parseConcurrencyLimit("8", fallback) === 8,
+    "CORR8-3/ADV8-1: '8' → 8 (valid positive decimal)");
+  assert(parseConcurrencyLimit(" 12 ", fallback) === 12,
+    "CORR8-3/ADV8-1: ' 12 ' → 12 (whitespace trimmed, valid)");
 }
 
 // --- S3: state file + lockfile created with mode 0600 (no PID leakage) ---
