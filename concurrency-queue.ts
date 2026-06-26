@@ -171,6 +171,30 @@ export function clampPauseUntil(until: number, now: number = Date.now(), ceiling
   return until > ceiling ? ceiling : until;
 }
 
+/**
+ * Cap + sanitize a pause reason before it is stored or rendered. SEC5-1 /
+ * ADV5-5: a compromised or misconfigured gateway can push a crafted
+ * `priority.reason` that flows unescaped into the status bar (PAUSED <Ns>
+ * (<reason>)). Cap to ~64 chars and strip non-printable / control / ANSI-escape
+ * characters so a crafted string cannot mangle the bar or inject control
+ * sequences. The reason is operator-facing metadata only (the source is already
+ * distinguishable via PAUSE_REASON_429); a 64-char printable-only cap removes
+ * the injection surface without losing signal.
+ */
+const PAUSE_REASON_MAX_CHARS = 64;
+function sanitizeReason(reason: string | null | undefined): string | null {
+  if (typeof reason !== "string") return null;
+  // Strip control chars (incl. DEL), the ESC byte (0x1b, the ANSI escape
+  // introducer), and other non-printable bytes. Keep printable ASCII + common
+  // printable Unicode (letters/digits/punctuation/space). This also neutralizes
+  // ANSI CSI sequences (ESC [ ... m) by removing the ESC byte.
+  const cleaned = reason.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (!cleaned) return null;
+  return cleaned.length > PAUSE_REASON_MAX_CHARS
+    ? cleaned.slice(0, PAUSE_REASON_MAX_CHARS)
+    : cleaned;
+}
+
 /** Normalized priority state derived from /v1/usage `usage.priority` (or a 429). */
 export interface PriorityState {
   low: boolean;
@@ -202,7 +226,7 @@ export function parsePriority(raw: unknown): PriorityState {
     }
     until = ms > 0 ? ms : Date.now() + PRIORITY_BACKOFF_MS;
   }
-  return { low, until, reason: p.reason ?? null };
+  return { low, until, reason: sanitizeReason(p.reason) };
 }
 
 /**
@@ -737,7 +761,11 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         const clamped = clampPauseUntil(until, now, ceilingMs);
         if (clamped > state.pausedUntil) {
           state.pausedUntil = clamped;
-          state.pausedReason = reason ?? state.pausedReason ?? null;
+          // SEC5-1 / ADV5-5: sanitize at the write boundary too (defense-in-
+          // depth) so a poisoned reason never reaches the shared file,
+          // regardless of caller. parsePriority already sanitizes the
+          // server-sourced reason; this catches any future caller.
+          state.pausedReason = sanitizeReason(reason) ?? state.pausedReason ?? null;
           state.pausedTs = now;
         }
       });

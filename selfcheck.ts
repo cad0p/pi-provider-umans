@@ -217,6 +217,57 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     "COV-HIGH-2: parsePriority low=false ignores boxed_until");
 }
 
+// --- SEC5-1 / ADV5-5: pausedReason is capped + sanitized (no ANSI/control injection) ---
+// A compromised or misconfigured gateway can push a crafted `priority.reason`
+// that flows unescaped into the status bar (PAUSED <Ns> (<reason>)). parsePriority
+// now caps to ~64 chars and strips non-printable / control / ANSI-escape
+// characters, and pauseUntil re-sanitizes at the write boundary (defense-in-
+// depth). A crafted 200-char reason with ANSI escapes must be capped + stripped
+// before it reaches the shared file or the status bar.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync, readFileSync } = await import("node:fs");
+
+  // Crafted reason: 200 chars + ANSI escape sequences + control chars.
+  const ansiEscape = "\x1b[31mred\x1b[0m";
+  const controlChars = "\x00\x07\x08";
+  const longReason = "A".repeat(200);
+  const crafted = `${ansiEscape}${controlChars}${longReason}`;
+
+  // parsePriority must cap + strip.
+  const p = parsePriority({ low: true, boxed_until: null, reason: crafted });
+  assert(p.reason !== null && p.reason!.length <= 64,
+    "SEC5-1: parsePriority caps reason to <= 64 chars");
+  assert(!/[\x00-\x1f\x7f]/.test(p.reason ?? ""),
+    "SEC5-1: parsePriority strips control/ANSI-escape chars from reason");
+  assert(!p.reason!.includes("\x1b"), "SEC5-1: ESC byte (ANSI introducer) removed");
+  // After stripping control/ANSI-escape chars, the printable portion is
+  // "[31mred[0m" (9 chars, the ESC bytes removed but the printable CSI params
+  // remain) + 200 A's = 209 chars; truncated to the 64-char cap. The exact
+  // prefix doesn't matter — what matters is the cap + the trailing A's survive.
+  assert(p.reason!.length === 64 && p.reason!.endsWith("A"),
+    "SEC5-1: parsePriority keeps printable chars, truncated to 64-char cap");
+
+  // pauseUntil (the write boundary) must also sanitize — defense-in-depth so a
+  // future caller that bypasses parsePriority cannot poison the file.
+  const q = createConcurrencyQueue({ stateFile });
+  q.pauseUntil(Date.now() + 10_000, crafted);
+  const raw = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(typeof raw.pausedReason === "string" && raw.pausedReason.length <= 64,
+    "ADV5-5: pauseUntil writes a capped reason to the shared file");
+  assert(!/[\x00-\x1f\x7f]/.test(raw.pausedReason ?? ""),
+    "ADV5-5: pauseUntil writes no control/ANSI-escape chars");
+  // snapshot().pausedReason is the rendered value — must be clean too.
+  const snap = q.snapshot();
+  assert(snap.pausedReason !== null && snap.pausedReason.length <= 64,
+    "SEC5-1: snapshot().pausedReason is capped");
+  assert(!/[\x00-\x1f\x7f]/.test(snap.pausedReason ?? ""),
+    "SEC5-1: snapshot().pausedReason has no control/ANSI-escape chars");
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV-HIGH-3: readState corrupt-input fixtures ---
 // readState guards waiters (Array.isArray + per-entry shape), pausedUntil/pausedTs
 // (typeof number), token (shape), and falls back to empty on JSON throw.
