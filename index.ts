@@ -1003,11 +1003,11 @@ export default async function (pi: ExtensionAPI) {
       }
       // The side-call consumes a concurrency slot on the account; gate it
       // through the same cross-process FIFO so a burst of searches can't push
-      // the main turn past the soft cap. ADV4-3: do NOT add `release` to
-      // inflightSlots — side-calls manage their own release via releaseSlot in
-      // the finally below. inflightSlots is main-turn-only (releaseOldest at
-      // message_end releases the oldest by insertion order; a side-call added
-      // there could be released instead of the main turn's slot).
+      // the main turn past the soft cap. ADV4-3 / CORR5-3: do NOT assign to
+      // mainTurnRelease — side-calls manage their own release via releaseSlot
+      // in the finally below. mainTurnRelease is main-turn-only (message_end
+      // releases it); a side-call assigned there could be released instead of
+      // the main turn's slot.
       const release = await acquireSlot(apiKey, signal);
       try {
         const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
@@ -1080,8 +1080,8 @@ export default async function (pi: ExtensionAPI) {
         let analysis: string;
         // Gate the vision side-call through the same cross-process FIFO so a
         // multi-image handoff can't push the main turn past the soft cap.
-        // ADV4-3: do NOT add `release` to inflightSlots — side-calls manage
-        // their own release via releaseSlot in the finally below.
+        // ADV4-3 / CORR5-3: do NOT assign to mainTurnRelease — side-calls
+        // manage their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, ctx?.signal);
         try {
           // ADV4-4: pass ctx?.signal so an aborted turn aborts the vision HTTP
@@ -1169,8 +1169,8 @@ export default async function (pi: ExtensionAPI) {
           };
         }
         const model = visionModelId;
-        // ADV4-3: do NOT add `release` to inflightSlots — side-calls manage
-        // their own release via releaseSlot in the finally below.
+        // ADV4-3 / CORR5-3: do NOT assign to mainTurnRelease — side-calls
+        // manage their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, signal);
         try {
           const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
@@ -1303,16 +1303,26 @@ export default async function (pi: ExtensionAPI) {
   // (no thundering-herd). The message_end release is the PRIMARY path;
   // turn_end and agent_end are safety nets for turns that error before
   // message_end fires.
-  const inflightSlots = new Set<Release>();
+  //
+  // CORR5-3: the main-turn release is tracked in a SINGLE slot
+  // (mainTurnRelease), not a Set. The design guarantees at most one main-turn
+  // slot is outstanding (side-calls manage their own release in a finally and
+  // never register here), so a Set + FIFO-by-insertion releaseOldest was a
+  // latent footgun: if a future change ever added a second entry, message_end
+  // would release the oldest (possibly a side-call acquired before the main
+  // turn) instead of the main turn's slot, leaking the token until the safety
+  // nets. A single tracked slot makes the invariant structural — there is no
+  // ordering to get wrong.
+  let mainTurnRelease: Release | undefined;
   // ADV3-1: release() calls mutate() -> withLock -> acquireLock, which can
   // throw (e.g. O_EXCL lock timeout after 2s per CMP-MED-2, EACCES, ENOSPC).
-  // A throw propagating out of releaseSlot would abort the while(inflightSlots.size)
-  // drains in agent_end / session_shutdown mid-loop, leaking the remaining slots'
-  // tokens/waiters (bounded only by the 120s watchdog). Wrap release() in a
-  // try/catch: on throw, warn (the lock-timeout is transient; the watchdog will
-  // reap the stale token/waiter) and swallow so the drain continues. Keep the
-  // Set.delete + updateStatus in a finally so the slot is removed from the set
-  // even on throw — otherwise a repeatedly-throwing slot would loop forever.
+  // A throw propagating out of releaseSlot would abort the drains in
+  // agent_end / session_shutdown mid-loop, leaking the token until the 120s
+  // watchdog. Wrap release() in a try/catch: on throw, warn (the lock-timeout
+  // is transient; the watchdog will reap the stale token/waiter) and swallow
+  // so the drain continues. Keep the slot clear + updateStatus in a finally so
+  // the slot is released even on throw — otherwise a repeatedly-throwing slot
+  // would loop forever.
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
     try {
@@ -1324,27 +1334,16 @@ export default async function (pi: ExtensionAPI) {
         console.warn("umans: concurrency release threw (drain continues):", err instanceof Error ? err.message : err);
       }
     } finally {
-      inflightSlots.delete(release);
+      if (mainTurnRelease === release) mainTurnRelease = undefined;
       updateStatus(undefined as any);
     }
   }
-  // CLN2-L5: message_end and turn_end both release the oldest inflight slot
-  // (one-per-turn, FIFO order). Dedupe the two-line body into a helper. The
-  // agent_end and session_shutdown drains (while size) also use it.
-  // ADV4-3: inflightSlots is FIFO-by-insertion; releaseOldest releases the
-  // oldest entry. This is safe today because side-calls (searchWeb,
-  // analyzeImage, umans_vision) manage their own release via releaseSlot in a
-  // finally and NEVER add to inflightSlots — so the set holds at most one
-  // main-turn slot. But the invariant is structural, not enforced: if a future
-  // change adds a side-call's release to the set, releaseOldest at message_end
-  // could release the side-call's slot (acquired before the main turn) instead
-  // of the main turn's. Warn if size > 1 to catch such a regression.
-  function releaseOldest(): void {
-    if (inflightSlots.size > 1) {
-      console.warn(`umans: inflightSlots has ${inflightSlots.size} entries (expected <= 1); a side-call may have been added to the set — check acquireSlot callers`);
-    }
-    const oldest = inflightSlots.values().next().value;
-    releaseSlot(oldest);
+  // Release the main-turn slot if held. Called at assistant message_end
+  // (primary), turn_end / agent_end (safety nets), and session_shutdown
+  // (drain). At most one main-turn slot is ever outstanding (CORR5-3), so a
+  // single release is sufficient.
+  function releaseMainTurn(): void {
+    releaseSlot(mainTurnRelease);
   }
 
   pi.on("before_provider_request", async (_event, ctx) => {
@@ -1354,7 +1353,7 @@ export default async function (pi: ExtensionAPI) {
     if (!apiKey) return; // no key — let the request fail naturally
     // acquireSlot joins the FIFO, waits for the token, polls /usage until the
     // server reports a free slot, then returns a release fn. Per D2 we hold the
-    // token ACROSS the send (added to inflightSlots) and release it at
+    // token ACROSS the send (stored in mainTurnRelease) and release it at
     // assistant message_end (stream completed) — NOT inline before the send
     // (the prior ac4ad4b design defeated serialization: siblings all polled
     // /usage, all saw capacity, all released, and all sent simultaneously —
@@ -1370,12 +1369,12 @@ export default async function (pi: ExtensionAPI) {
       // acquireSlot resolving and the safety-net registration (message_end /
       // turn_end / agent_end / session_shutdown) doesn't leak the token until
       // the 120s watchdog. On the happy path the release fn is owned by
-      // inflightSlots and released at message_end; a throw here releases it
+      // mainTurnRelease and released at message_end; a throw here releases it
       // immediately. (updateStatus swallows internally, but this guards any
       // future throw in the registration path.)
       let registered = false;
       try {
-        inflightSlots.add(release);
+        mainTurnRelease = release;
         registered = true;
         updateStatus(ctx);
       } finally {
@@ -1469,7 +1468,7 @@ export default async function (pi: ExtensionAPI) {
     // the assistant message_end fired). The primary release is at assistant
     // message_end (below) so the slot frees as soon as the response stream
     // completes, letting siblings run during this turn's tool execution.
-    releaseOldest();
+    releaseMainTurn();
     updateStatus(ctx);
   });
   pi.on("message_update", async (event, ctx) => {
@@ -1507,7 +1506,7 @@ export default async function (pi: ExtensionAPI) {
     // stays within the documented burst headroom (hard_cap) -> no 429, no
     // deprioritization (CORR2-1; see isCapacityFree). turn_end and agent_end
     // remain as safety nets for turns that never reach here.
-    releaseOldest();
+    releaseMainTurn();
     const req = liveRequest;
     let ttft: number | undefined;
     let tps: number | undefined;
@@ -1526,11 +1525,10 @@ export default async function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     liveRequest = undefined;
-    // Drain any slots still held (e.g. aborted turns that never reached
-    // message_end / turn_end) so the gate never deadlocks.
-    while (inflightSlots.size) {
-      releaseOldest();
-    }
+    // Drain any slot still held (e.g. aborted turns that never reached
+    // message_end / turn_end) so the gate never deadlocks. CORR5-3: at most one
+    // main-turn slot is outstanding, so a single release is sufficient.
+    releaseMainTurn();
     updateStatus(ctx);
   });
 
@@ -1539,16 +1537,12 @@ export default async function (pi: ExtensionAPI) {
     liveRequest = undefined;
     lastMetrics = {};
     imageStore.clear();
-    // ADV2-F1: drain inflightSlots by invoking each release fn (like agent_end),
-    // not clear() which drops the closures without calling them. Currently
-    // inflightSlots holds at most one main-turn slot (side-calls manage their
-    // own release via releaseSlot in a finally), but a future change (e.g. a
-    // streaming side-call that adds to the set) would silently leak via clear().
-    // reset() only clears ourTokenId's entry, so draining here ensures every
-    // held slot's token/waiter is released.
-    while (inflightSlots.size) {
-      releaseOldest();
-    }
+    // ADV2-F1: release the main-turn slot by invoking its release fn (not just
+    // dropping the reference), so the token/waiter entry is cleaned up. CORR5-3:
+    // at most one main-turn slot is outstanding (side-calls manage their own
+    // release in a finally). reset() only clears ourTokenId's entry, so
+    // releasing here ensures the held slot's token/waiter is released.
+    releaseMainTurn();
     concurrencyQueue.reset();
     setWidget(ctx, undefined);
   });
