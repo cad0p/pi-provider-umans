@@ -2383,6 +2383,88 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV9-1/COV8-1: after_provider_response 429 wiring drives the shared pause through the real factory ---
+// handle429 is unit-tested directly (CORR8-2), but the wiring that calls it
+// from after_provider_response was never driven through the real factory. Drive
+// a 429 + retry-after: 60 header through the real handler + assert the shared
+// pause lands in the state file (pausedUntil > now, pausedReason === 429 tag).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov9-1-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+
+    const before = Date.now();
+    await dispatch("after_provider_response", { type: "after_provider_response", status: 429, headers: { "retry-after": "60" } });
+
+    // The shared pause must have landed in the state file.
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedUntil > before, "COV9-1: after_provider_response 429 set pausedUntil > now");
+    assert(parsed.pausedReason === PAUSE_REASON_429, "COV9-1: pause tagged PAUSE_REASON_429");
+    // Retry-After 60s honored (pause is ~60s out, within the 429 ceiling).
+    const pauseSec = Math.round((parsed.pausedUntil - Date.now()) / 1000);
+    assert(pauseSec >= 50 && pauseSec <= 60, `COV9-1: Retry-After 60s honored through wiring (pause ~${pauseSec}s)`);
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- CORR7-2: reset() aborts an in-flight waitForLaunch poll loop ---
 // reset() clears ourWaiterIds/ourTokenId + splices entries from the file, but a
 // concurrently-running waitForLaunch poll loop on the same queue instance
