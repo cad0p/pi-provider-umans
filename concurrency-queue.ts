@@ -283,15 +283,19 @@ export function isCapacityFree(
 }
 
 /**
- * Parse a UMANS_CONCURRENCY_LIMIT env value into a positive number, falling
- * back to the live /v1/usage value when unset, empty, or non-positive. Handles
- * edge inputs: "2.5" (fractional, kept as-is), " " (whitespace → 0 → fallback),
- * "0" (non-positive → fallback), "abc" (NaN → fallback), "" (empty → fallback).
+ * Parse a UMANS_CONCURRENCY_LIMIT env value into a positive integer, falling
+ * back to the live /v1/usage value when unset, empty, non-positive, or
+ * fractional. Handles edge inputs: "2.5" (fractional → fallback, almost
+ * certainly a typo — a float threshold on an integer counter silently floors
+ * to 2 usable slots), " " (whitespace → 0 → fallback), "0" (non-positive →
+ * fallback), "abc" (NaN → fallback), "" (empty → fallback). CLN4-3:
+ * tightened from Number.isFinite to Number.isInteger so a fractional typo
+ * falls back to the server value (a strict improvement for a slot-count knob).
  */
 export function parseConcurrencyLimit(envValue: string | undefined, fallback: number | undefined): number | undefined {
   const trimmed = envValue?.trim();
   const n = trimmed ? Number(trimmed) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
 /** Generate a unique waiter/token id. */

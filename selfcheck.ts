@@ -705,12 +705,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 }
 
 // --- COV-MED-6: concurrencyLimit() edge inputs (parseConcurrencyLimit) ---
-// "2.5" → 2.5 (fractional, kept as-is), " " → fallback, "0" → fallback,
-// "abc" → fallback, "" → fallback, undefined → fallback.
+// CLN4-3: "2.5" → fallback (fractional rejected, was kept as-is), " " → fallback,
+// "0" → fallback, "abc" → fallback, "" → fallback, undefined → fallback.
 {
   const fallback = 4;
-  assert(parseConcurrencyLimit("2.5", fallback) === 2.5,
-    "COV-MED-6: '2.5' → 2.5 (fractional kept)");
+  assert(parseConcurrencyLimit("2.5", fallback) === fallback,
+    "CLN4-3: '2.5' → fallback (fractional rejected, was kept as-is)");
   assert(parseConcurrencyLimit(" ", fallback) === fallback,
     "COV-MED-6: whitespace → fallback");
   assert(parseConcurrencyLimit("0", fallback) === fallback,
