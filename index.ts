@@ -1406,13 +1406,15 @@ export default async function (pi: ExtensionAPI) {
     const msg = event.message as any;
     if (!isActiveUmans(ctx, msg)) return;
     if (msg?.role !== "assistant") return;
-    // Primary release path (D2): the assistant response stream just completed,
-    // so the server has decremented concurrent_sessions. Releasing here (not at
-    // after_provider_response headers, which fire ~1s in, nor at turn_end,
-    // which fires after tool execution) is what makes the next waiter's /usage
-    // poll see an accurate count AND frees the slot during this turn's tool
-    // execution (tools don't consume a server concurrency slot). turn_end and
-    // agent_end remain as safety nets for turns that never reach here.
+    // Primary release path (D2): the assistant response stream completed, freeing
+    // the slot for this turn's tool execution (tools don't consume a server
+    // concurrency slot). NOTE: message_end fires at CLIENT-side stream
+    // completion, which PRECEDES the server's concurrent_sessions decrement by a
+    // network RTT + cleanup lag, so the next waiter's /usage poll can
+    // transiently see stale capacity and launch 1-2 over `limit`; that overshoot
+    // stays within the documented burst headroom (hard_cap) -> no 429, no
+    // deprioritization (CORR2-1; see isCapacityFree). turn_end and agent_end
+    // remain as safety nets for turns that never reach here.
     releaseOldest();
     const req = liveRequest;
     let ttft: number | undefined;
