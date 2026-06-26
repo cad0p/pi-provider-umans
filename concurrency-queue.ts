@@ -589,7 +589,7 @@ export interface ConcurrencyQueue {
   snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   /** Remove our waiter entry if still present (best-effort, used on abort). */
   cancel(ourId: string): void;
-  /** Hard-reset: clear the state file (used on session shutdown by the last owner). */
+  /** Best-effort shutdown cleanup: clear this process's own waiter/token entry. Does NOT unlink the shared state file (siblings may still be queued). */
   reset(): void;
   /** True if this process currently holds the launch token. */
   holdsToken(): boolean;
