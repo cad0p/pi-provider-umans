@@ -23,3 +23,6 @@ jobs:
 
       - name: Type check
         run: npm run check
+
+      - name: Selfcheck
+        run: npm test

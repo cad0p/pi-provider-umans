@@ -19,13 +19,16 @@
 # the max peak (flake-tolerant mode).
 #
 # Usage:
-#   UMANS_API_KEY=uk-... ./test-concurrency-gate.sh [limit] [jobs] [--runs N]
+#   UMANS_API_KEY=uk-... ./test-concurrency-gate.sh [limit] [jobs] [--runs N] [--min-peak N]
+#   --min-peak N: fail if observed peak < N when all jobs succeeded (catches a
+#   slow poller that misses the burst and vacuously passes <= hard_cap).
 set -u
 
 LIMIT="${1:-2}"
 JOBS="${2:-4}"
 RUNS=1
-# Parse --runs N from args 3+ (preserves the positional LIMIT/JOBS above).
+MIN_PEAK=""
+# Parse --runs N and --min-peak N from args 3+ (preserves the positional LIMIT/JOBS above).
 shift 2 2>/dev/null || shift $# 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -35,6 +38,14 @@ while [ $# -gt 0 ]; do
       ;;
     --runs=*)
       RUNS="${1#--runs=}"
+      shift
+      ;;
+    --min-peak)
+      MIN_PEAK="$2"
+      shift 2
+      ;;
+    --min-peak=*)
+      MIN_PEAK="${1#--min-peak=}"
       shift
       ;;
     *)
@@ -75,7 +86,7 @@ usage_snapshot() {
   usage_meta | cut -d, -f1
 }
 
-echo "umans concurrency gate test: limit=$LIMIT, jobs=$JOBS, runs=$RUNS"
+echo "umans concurrency gate test: limit=$LIMIT, jobs=$JOBS, runs=$RUNS${MIN_PEAK:+, min-peak=$MIN_PEAK}"
 BASELINE=$(usage_meta)
 BASE_CONC=$(echo "$BASELINE" | cut -d, -f1)
 BASE_HARD=$(echo "$BASELINE" | cut -d, -f3)
@@ -189,6 +200,17 @@ fi
 # either a non-zero peak OR fewer than 2 jobs completed.
 if [ "$MAX_PEAK" -eq 0 ] 2>/dev/null && [ "$JOBS" -ge 2 ] && [ "$TOTAL_FAIL" -lt "$JOBS" ]; then
   echo "FAIL: max peak 0 with $JOBS jobs — vacuous pass (no non-zero sample observed)"
+  PASS=0
+fi
+# COV5-3: --min-peak N floor. A poller that samples too slowly (e.g. all 4 jobs
+# finish within the first 100ms poll interval) can catch only the tail and
+# observe peak 1 while the real peak was 4 — passing <= hard_cap vacuously
+# without proving serialization. When --min-peak N is set and all jobs succeeded,
+# fail if the observed peak is below N (the gate didn't serialize enough
+# concurrent turns to prove itself). Skipped when jobs failed (a failing run
+# doesn't owe a peak) or when MIN_PEAK is unset.
+if [ -n "$MIN_PEAK" ] && [ "$TOTAL_FAIL" -eq 0 ] && [ "$MAX_PEAK" -lt "$MIN_PEAK" ] 2>/dev/null; then
+  echo "FAIL: max peak $MAX_PEAK below --min-peak $MIN_PEAK floor (poller missed the burst; gate did not prove serialization)"
   PASS=0
 fi
 
