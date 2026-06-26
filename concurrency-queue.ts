@@ -526,7 +526,22 @@ function writeStateAtomic(path: string, state: QueueState): void {
   // lockfile mtime-recovery pattern. Best-effort: errors are swallowed.
   reapStaleTmps(path);
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+  // SEC6-2: open with O_EXCL ("wx") + 0o600 so a planted symlink at the per-pid
+  // temp name throws EEXIST instead of being followed. writeFileSync(symlink,
+  // ...) follows the symlink and writes into its target (probe-confirmed);
+  // openSync("wx") creates the file ONLY if it does not already exist (no
+  // follow on creation), so a planted symlink/name is rejected. On EEXIST,
+  // treat as a write conflict: the per-pid temp name is already in use (a
+  // concurrent writer sharing our pid — impossible under the O_EXCL lockfile —
+  // or a planted symlink/name). Throw so the caller's mutate surfaces it; the
+  // lockfile + reapStaleTmps keep the temp namespace clean. Close the fd after
+  // writing (writeFileSync(fd, ...) does not close it).
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(state), { encoding: "utf8" });
+  } finally {
+    try { closeSync(fd); } catch { /* best-effort */ }
+  }
   renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
 }
 

@@ -550,7 +550,70 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- isPidDead: our own pid is alive; pid -1 / 999999 are dead ---
+// --- SEC6-2: writeStateAtomic uses O_EXCL ("wx"), does not follow a planted symlink ---
+// The per-pid temp name `${path}.${process.pid}.tmp` + writeFileSync (no O_EXCL)
+// follows a planted symlink → write-redirect to an arbitrary file (probe-
+// confirmed). openSync("wx", 0o600) creates the file ONLY if it does not exist
+// (no follow on creation), so a planted symlink/name throws EEXIST instead.
+// We plant a symlink at the exact temp name our pid will use and assert the
+// next mutate (join) throws EEXIST rather than writing through the symlink.
+{
+  if (process.platform !== "win32") {
+    const dir = mkdtempSync(join(tmpdir(), "umans-q-sec6-2-"));
+    const stateFile = join(dir, "state.json");
+    const { symlinkSync, writeFileSync, readFileSync, existsSync } = await import("node:fs");
+
+    // Plant a symlink at the exact temp name writeStateAtomic will use. The
+    // target is a canary file outside the state path — if writeStateAtomic
+    // followed the symlink, the canary would be overwritten.
+    const canary = join(dir, "canary.txt");
+    writeFileSync(canary, "ORIGINAL", { mode: 0o600 });
+    const tmpName = `${stateFile}.${process.pid}.tmp`;
+    symlinkSync(canary, tmpName);
+
+    // join() -> mutate -> writeStateAtomic must throw EEXIST (not follow the
+    // symlink). createConcurrencyQueue throws on construct-time dir create? No —
+    // dir already exists. The throw surfaces from join()'s mutate.
+    const q = createConcurrencyQueue({ stateFile });
+    let threw = false;
+    let code: string | undefined;
+    try {
+      q.join();
+    } catch (e) {
+      threw = true;
+      code = (e as NodeJS.ErrnoException).code;
+    }
+    assert(threw, "SEC6-2: writeStateAtomic rejects a planted symlink at the temp name");
+    assert(code === "EEXIST", "SEC6-2: planted-symlink write throws EEXIST (not followed)");
+    // The canary must be untouched (symlink was not followed).
+    assert(readFileSync(canary, "utf8") === "ORIGINAL",
+      "SEC6-2: symlink target not written through (canary intact)");
+    assert(!existsSync(stateFile),
+      "SEC6-2: state file not created when temp name was a planted symlink");
+    q.reset();
+    rmSync(dir, { recursive: true, force: true });
+  } else {
+    // Windows: symlinks require elevated privileges; skip the planted-symlink
+    // fixture but assert the O_EXCL code path is present by checking that a
+    // pre-existing regular file at the temp name also throws EEXIST.
+    const dir = mkdtempSync(join(tmpdir(), "umans-q-sec6-2-"));
+    const stateFile = join(dir, "state.json");
+    const { writeFileSync } = await import("node:fs");
+    const tmpName = `${stateFile}.${process.pid}.tmp`;
+    writeFileSync(tmpName, "pre-existing", { mode: 0o600 });
+    const q = createConcurrencyQueue({ stateFile });
+    let threw = false;
+    let code: string | undefined;
+    try { q.join(); } catch (e) {
+      threw = true;
+      code = (e as NodeJS.ErrnoException).code;
+    }
+    assert(threw, "SEC6-2: writeStateAtomic rejects a pre-existing temp name");
+    assert(code === "EEXIST", "SEC6-2: pre-existing temp name throws EEXIST");
+    q.reset();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 assert(isPidDead(process.pid) === false, "isPidDead: own pid alive");
 assert(isPidDead(-1) === true, "isPidDead: invalid pid dead");
 assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
