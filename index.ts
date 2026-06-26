@@ -966,8 +966,9 @@ export default async function (pi: ExtensionAPI) {
   // reports a free slot (and no priority.low). Returns a release fn that drops
   // the token + our waiter entry; call it on assistant message_end (the
   // primary release path) or turn_end/agent_end as a safety net. Returns
-  // undefined when the queue is disabled (fire-and-forget). The `apiKey` is
-  // used for the head-waiter poll.
+  // undefined when the queue is disabled (fire-and-forget) or when the turn's
+  // AbortSignal fires mid-poll (clean cancellation, not a throw — CLN7-2). The
+  // `apiKey` is used for the head-waiter poll.
   //
   // CLN4-4: this function BLOCKS until the slot is acquired — it is NOT a fast
   // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
@@ -1149,13 +1150,12 @@ export default async function (pi: ExtensionAPI) {
         // CMP6-3: back off the next poll interval (grows 1.5×, caps at 2000ms).
         pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
       }
-      if (stalled) {
-        // ADV-3: fail-open after the cap. The turn proceeds ungated; the
-        // watchdog still bounds the token hold. We deliberately do not throw —
-        // a wedged /usage should not break the user's turn, only the gate.
-        // The status bar's `q <queued>*` already reflects the wait; the
-        // launch itself is silent so as not to spam notifies on every poll.
-      }
+      // ADV-3: fail-open after the cap (CLN7-4: the `if (stalled)` wrapper was
+      // empty — dropped). The turn proceeds ungated; the watchdog still bounds
+      // the token hold. We deliberately do not throw — a wedged /usage should
+      // not break the user's turn, only the gate. The status bar's `q <queued>*`
+      // already reflects the wait; the launch itself is silent so as not to
+      // spam notifies on every poll.
       released = true;
       return () => {
         releaseToken();
@@ -1631,7 +1631,7 @@ export default async function (pi: ExtensionAPI) {
     // server reports a free slot, then returns a release fn. Per D2 we hold the
     // token ACROSS the send (stored in mainTurnRelease) and release it at
     // assistant message_end (stream completed) — NOT inline before the send
-    // (the prior ac4ad4b design defeated serialization: siblings all polled
+    // (the prior release-token-immediately-after-launch design defeated serialization: siblings all polled
     // /usage, all saw capacity, all released, and all sent simultaneously —
     // empirically peak 4 vs limit 2 (C1)), and NOT at after_provider_response
     // headers (the server hasn't registered the request as in-flight until the

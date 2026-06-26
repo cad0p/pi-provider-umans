@@ -617,7 +617,11 @@ function writeStateAtomic(path: string, state: QueueState): void {
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
   // C4: stale-.tmp reaping moved out to mutate's withLock block so it uses the
   // injected cfg.now() (testability — a frozen clock now exercises the reaper).
-  const tmp = `${path}.${process.pid}.tmp`;
+  // ADV7-1: include a short random suffix in the temp name so a recycled pid
+  // never collides with a stale leftover from a prior (crashed) run sharing
+  // the same pid. The reaper's prefix match (`${basename(path)}.` + suffix
+  // `.tmp`) still matches; the random middle distinguishes concurrent runs.
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   // SEC6-2: open with O_EXCL ("wx") + 0o600 so a planted symlink at the per-pid
   // temp name throws EEXIST instead of being followed. writeFileSync(symlink,
   // ...) follows the symlink and writes into its target (probe-confirmed);
@@ -652,12 +656,20 @@ const STALE_TMP_MS = 10_000;
 // C4: now is threaded in from mutate's caller (cfg.now()) so a frozen clock
 // exercises the reaper — a regression inverting the comparison would not be
 // caught otherwise.
+// ADV7-2: cap the number of .tmp files unlinked per mutate (REAP_TMP_MAX) to
+// bound the critical section under pathological .tmp accumulation. The reaper
+// runs inside the O_EXCL lock, so unlinking thousands of stale leftovers would
+// extend the critical section past the 2s lockTimeoutMs ceiling (CMP-MED-2),
+// racing two writers. Leave the rest for the next mutate.
+const REAP_TMP_MAX = 100;
 function reapStaleTmps(path: string, now: number): void {
   const dir = dirname(path);
   const prefix = `${basename(path)}.`;
   let entries: string[];
   try { entries = readdirSync(dir); } catch { return; /* dir missing/unreadable */ }
+  let unlinked = 0;
   for (const name of entries) {
+    if (unlinked >= REAP_TMP_MAX) break; // ADV7-2: bound the critical section
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
     try {
@@ -668,9 +680,13 @@ function reapStaleTmps(path: string, now: number): void {
       // (best-effort) + skip; a non-empty dir is left for the operator.
       if (st.isDirectory()) {
         try { rmdirSync(full); } catch { /* non-empty or gone — skip */ }
+        unlinked++;
         continue;
       }
-      if (now - st.mtimeMs > STALE_TMP_MS) unlinkSync(full);
+      if (now - st.mtimeMs > STALE_TMP_MS) {
+        unlinkSync(full);
+        unlinked++;
+      }
     } catch { /* race: gone or unreadable — ignore */ }
   }
 }
@@ -690,7 +706,9 @@ export interface ConcurrencyQueue {
    * launch token. Resolves with a release function that must be called when
    * the request completes (assistant message_end is the primary release path;
    * turn_end and agent_end are safety nets for turns that error before
-   * message_end fires). Returns undefined if the queue is disabled.
+   * message_end fires). Resolves with a no-op release function if the queue is
+   * disabled (CLN7-3; unreachable from the provider path, which bails on
+   * join() === null before reaching waitForLaunch).
    *
    * Capacity check is NOT performed here — the caller polls /usage itself
    * after claiming the token, so the decision uses the freshest server data.

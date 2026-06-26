@@ -626,51 +626,72 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     // Plant a symlink at the exact temp name writeStateAtomic will use. The
     // target is a canary file outside the state path — if writeStateAtomic
     // followed the symlink, the canary would be overwritten.
+    // ADV7-1: the temp name now includes a random suffix, so stub Math.random
+    // to make the suffix predictable + plant the symlink at the exact name.
     const canary = join(dir, "canary.txt");
     writeFileSync(canary, "ORIGINAL", { mode: 0o600 });
-    const tmpName = `${stateFile}.${process.pid}.tmp`;
+    const randStub = "abc123";
+    const realRandom = Math.random;
+    Math.random = () => {
+      // Return a value whose toString(36).slice(2,8) === randStub.
+      return parseInt(randStub, 36) / Math.pow(36, randStub.length);
+    };
+    const tmpName = `${stateFile}.${process.pid}.${randStub}.tmp`;
     symlinkSync(canary, tmpName);
 
-    // join() -> mutate -> writeStateAtomic must throw EEXIST (not follow the
-    // symlink). createConcurrencyQueue throws on construct-time dir create? No —
-    // dir already exists. The throw surfaces from join()'s mutate.
-    const q = createConcurrencyQueue({ stateFile });
-    let threw = false;
-    let code: string | undefined;
     try {
-      q.join();
-    } catch (e) {
-      threw = true;
-      code = (e as NodeJS.ErrnoException).code;
+      // join() -> mutate -> writeStateAtomic must throw EEXIST (not follow the
+      // symlink). createConcurrencyQueue throws on construct-time dir create? No —
+      // dir already exists. The throw surfaces from join()'s mutate.
+      const q = createConcurrencyQueue({ stateFile });
+      let threw = false;
+      let code: string | undefined;
+      try {
+        q.join();
+      } catch (e) {
+        threw = true;
+        code = (e as NodeJS.ErrnoException).code;
+      }
+      assert(threw, "SEC6-2: writeStateAtomic rejects a planted symlink at the temp name");
+      assert(code === "EEXIST", "SEC6-2: planted-symlink write throws EEXIST (not followed)");
+      // The canary must be untouched (symlink was not followed).
+      assert(readFileSync(canary, "utf8") === "ORIGINAL",
+        "SEC6-2: symlink target not written through (canary intact)");
+      assert(!existsSync(stateFile),
+        "SEC6-2: state file not created when temp name was a planted symlink");
+      q.reset();
+    } finally {
+      Math.random = realRandom;
     }
-    assert(threw, "SEC6-2: writeStateAtomic rejects a planted symlink at the temp name");
-    assert(code === "EEXIST", "SEC6-2: planted-symlink write throws EEXIST (not followed)");
-    // The canary must be untouched (symlink was not followed).
-    assert(readFileSync(canary, "utf8") === "ORIGINAL",
-      "SEC6-2: symlink target not written through (canary intact)");
-    assert(!existsSync(stateFile),
-      "SEC6-2: state file not created when temp name was a planted symlink");
-    q.reset();
     rmSync(dir, { recursive: true, force: true });
   } else {
     // Windows: symlinks require elevated privileges; skip the planted-symlink
     // fixture but assert the O_EXCL code path is present by checking that a
     // pre-existing regular file at the temp name also throws EEXIST.
+    // ADV7-1: the temp name now includes a random suffix; stub Math.random to
+    // make it predictable so we can plant the pre-existing file at the exact name.
     const dir = mkdtempSync(join(tmpdir(), "umans-q-sec6-2-"));
     const stateFile = join(dir, "state.json");
     const { writeFileSync } = await import("node:fs");
-    const tmpName = `${stateFile}.${process.pid}.tmp`;
+    const randStub = "abc123";
+    const realRandom = Math.random;
+    Math.random = () => parseInt(randStub, 36) / Math.pow(36, randStub.length);
+    const tmpName = `${stateFile}.${process.pid}.${randStub}.tmp`;
     writeFileSync(tmpName, "pre-existing", { mode: 0o600 });
-    const q = createConcurrencyQueue({ stateFile });
-    let threw = false;
-    let code: string | undefined;
-    try { q.join(); } catch (e) {
-      threw = true;
-      code = (e as NodeJS.ErrnoException).code;
+    try {
+      const q = createConcurrencyQueue({ stateFile });
+      let threw = false;
+      let code: string | undefined;
+      try { q.join(); } catch (e) {
+        threw = true;
+        code = (e as NodeJS.ErrnoException).code;
+      }
+      assert(threw, "SEC6-2: writeStateAtomic rejects a pre-existing temp name");
+      assert(code === "EEXIST", "SEC6-2: pre-existing temp name throws EEXIST");
+      q.reset();
+    } finally {
+      Math.random = realRandom;
     }
-    assert(threw, "SEC6-2: writeStateAtomic rejects a pre-existing temp name");
-    assert(code === "EEXIST", "SEC6-2: pre-existing temp name throws EEXIST");
-    q.reset();
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -2933,6 +2954,78 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   release();
   const stateMode = statSync(stateFile).mode & 0o777;
   assert(stateMode === 0o600, `SEC7-5: state file mode is 0600 (got 0o${stateMode.toString(8)})`);
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- ADV7-1: random temp suffix prevents pid-recycle collision ---
+// A recycled pid would collide with a stale leftover at the per-pid temp name
+// `${path}.${pid}.tmp`, wedging writeStateAtomic (EEXIST). The temp name now
+// includes a random suffix so concurrent/recycled runs never collide. Plant a
+// fresh .tmp at the OLD per-pid name (no random suffix) + assert writeStateAtomic
+// succeeds (uses a different name).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-adv7-1-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync, statSync } = await import("node:fs");
+
+  // Plant a fresh .tmp at the OLD per-pid name (no random suffix).
+  const oldPidTmp = `${stateFile}.${process.pid}.tmp`;
+  writeFileSync(oldPidTmp, "leftover", { mode: 0o600 });
+
+  // writeStateAtomic must succeed — it uses a DIFFERENT name (with random suffix).
+  const q = createConcurrencyQueue({ stateFile });
+  let threw = false;
+  try { q.pauseUntil(Date.now() + 1_000, "ADV7-1 probe"); } catch { threw = true; }
+  assert(!threw, "ADV7-1: writeStateAtomic succeeds despite a leftover at the old per-pid name (random suffix)");
+
+  // The leftover at the old name must be untouched (writeStateAtomic used a
+  // different name — it's not reaped because its mtime is fresh).
+  let leftExists = false;
+  try { statSync(oldPidTmp); leftExists = true; } catch { /* gone */ }
+  assert(leftExists, "ADV7-1: leftover at old per-pid name untouched (writeStateAtomic used a different name)");
+
+  // The state file must have been written (proving writeStateAtomic completed).
+  let stateWritten = false;
+  try { statSync(stateFile); stateWritten = true; } catch { /* not written */ }
+  assert(stateWritten, "ADV7-1: state file written (writeStateAtomic completed with a random-suffixed name)");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- ADV7-2: reapStaleTmps caps unlinks per mutate (bounds the critical section) ---
+// The reaper runs inside the O_EXCL lock; unlinking thousands of stale .tmp
+// files would extend the critical section past the 2s lockTimeoutMs ceiling,
+// racing two writers. Cap at REAP_TMP_MAX (100) per mutate; leave the rest.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-adv7-2-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync, utimesSync, readdirSync } = await import("node:fs");
+
+  // Create 200 stale .tmp files (old mtime, past STALE_TMP_MS = 10s).
+  const staleTime = (Date.now() / 1000) - 120;
+  for (let i = 0; i < 200; i++) {
+    const name = `${stateFile}.pid${i}.tmp`;
+    writeFileSync(name, "", { mode: 0o600 });
+    utimesSync(name, staleTime, staleTime);
+  }
+
+  // Trigger one mutate (pause) — reapStaleTmps must unlink at most 100.
+  const q = createConcurrencyQueue({ stateFile });
+  q.pauseUntil(Date.now() + 1_000, "ADV7-2 probe");
+
+  // Count remaining .tmp files.
+  const remaining = readdirSync(dir).filter((n: string) => n.startsWith(`${"state.json"}.`) && n.endsWith(".tmp"));
+  assert(remaining.length === 100,
+    `ADV7-2: reapStaleTmps unlinked exactly 100 of 200 stale .tmp files (left ${remaining.length}, expected 100)`);
+
+  // A second mutate unlinks the rest.
+  q.pauseUntil(Date.now() + 2_000, "ADV7-2 probe 2");
+  const remaining2 = readdirSync(dir).filter((n: string) => n.startsWith(`${"state.json"}.`) && n.endsWith(".tmp"));
+  assert(remaining2.length === 0,
+    `ADV7-2: second mutate unlinks the remaining 100 stale .tmp files (left ${remaining2.length})`);
+
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
