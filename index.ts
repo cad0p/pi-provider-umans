@@ -916,7 +916,24 @@ export default async function (pi: ExtensionAPI) {
     let releaseToken: () => void = () => {};
     try {
     tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
-      releaseToken = await concurrencyQueue.waitForLaunch(ourId, signal);
+      let releaseTokenThisIter: () => void;
+      try {
+        releaseTokenThisIter = await concurrencyQueue.waitForLaunch(ourId, signal);
+      } catch (err) {
+        // C3: waitForLaunch rejects with "waitForLaunch aborted" when the
+        // signal is already aborted (or aborts mid-wait). Return undefined
+        // (matching the disabled-mode shape) instead of surfacing the throw
+        // as an uncaught extension error on Ctrl-C. The handler's `if (release)`
+        // guard becomes the abort path. waitForLaunch already cancelled our
+        // waiter entry; the finally is a no-op (released stays false → cancel
+        // is a belt-and-suspenders no-op since the id is already gone).
+        if (signal?.aborted) {
+          released = true;
+          return undefined;
+        }
+        throw err; // non-abort throw (lock timeout, EACCES) — propagate
+      }
+      releaseToken = releaseTokenThisIter;
       // We are head + hold the launch token. Poll /usage until the server reports
       // a free slot (or the plan is unlimited) and the account isn't deprioritized.
       // The token stays held during the poll + the subsequent send so the next
@@ -1009,9 +1026,17 @@ export default async function (pi: ExtensionAPI) {
         });
         if (decision === "launch") break; // capacity free — proceed to send
         if (decision === "abort") {
+          // C3: return undefined on abort (matching the disabled-mode shape)
+          // instead of throwing. The handler's `if (release)` guard becomes
+          // the abort path, so a Ctrl-C mid-poll surfaces as a clean
+          // cancellation rather than an uncaught extension error toast/log.
+          // We already hold the token (touchToken returned true above), so
+          // release it before returning — the watchdog would reap it
+          // eventually, but releasing now frees the next head immediately.
+          try { releaseToken(); } catch { /* best-effort */ }
           concurrencyQueue.cancel(ourId);
           released = true;
-          throw new Error("concurrency-queue: acquireSlot aborted mid-poll");
+          return undefined;
         }
         if (decision === "failOpen") {
           // CORR4-3: only fail open when no known pause is active. A known

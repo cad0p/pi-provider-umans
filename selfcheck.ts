@@ -1041,6 +1041,43 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- C3: acquireSlot returns undefined on abort (not throw) ---
+// When the user aborts mid-poll (Ctrl-C), decideLaunch returns "abort" and
+// acquireSlot used to throw, surfacing as an uncaught extension error toast.
+// C3: return undefined (matching the disabled-mode shape) so the handler's
+// `if (release)` guard is the abort path. acquireSlot delegates the abort to
+// waitForLaunch, which rejects when the signal is already aborted — acquireSlot's
+// try/catch converts that rejection into `return undefined` (no fetchUsage
+// network call happens, since waitForLaunch rejects before the poll loop).
+// We verify the seam: an already-aborted signal makes waitForLaunch reject
+// (the contract acquireSlot catches), and decideLaunch returns "abort" for a
+// mid-poll abort (the branch that returns undefined).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c3-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+  const id = q.join()!;
+  const ac = new AbortController();
+  ac.abort();
+  // waitForLaunch with an already-aborted signal rejects (acquireSlot catches
+  // this and returns undefined rather than re-throwing).
+  let rejected = false;
+  try {
+    await q.waitForLaunch(id, ac.signal);
+  } catch (e) {
+    rejected = true;
+    assert((e as Error).message.includes("aborted"),
+      "C3: waitForLaunch rejects with an abort error (the seam acquireSlot catches)");
+  }
+  assert(rejected, "C3: already-aborted signal rejects waitForLaunch (acquireSlot returns undefined)");
+  // The mid-poll abort decision (signal aborts AFTER the token is held) drives
+  // the `return undefined` branch in acquireSlot's poll loop.
+  assert(decideLaunch({ isFree: false, elapsedMs: 1_000, queuePaused: false, signalAborted: true }) === "abort",
+    "C3: decideLaunch returns 'abort' for a mid-poll abort (acquireSlot returns undefined, not throw)");
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV4-1: acquireLock doesn't throw ENOENT when the parent dir is missing ---
 // The lockfile lives in the same dir as the state file. When the parent dir
 // doesn't exist, acquireLock's openSync(lockFile, "wx") threw ENOENT BEFORE
