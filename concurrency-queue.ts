@@ -542,6 +542,17 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   const lockFile = `${cfg.stateFile}.lock`;
   const ourPid = cfg.pid;
 
+  // COV4-1: ensure the state file's parent dir exists before the first mutate.
+  // The lockfile lives in the same dir as the state file, so acquireLock's
+  // openSync(lockFile, "wx") throws ENOENT when the parent dir is missing —
+  // BEFORE writeStateAtomic's own mkdirSync ever runs (it runs inside withLock,
+  // i.e. after acquireLock already tried to open the lockfile). Bites a fresh
+  // pi install or a test harness pointing stateFile at a nested path. Hoisting
+  // mkdirSync here fixes both the lockfile and state-file paths. Best-effort:
+  // EEXIST/EACCES are swallowed (the latter surfaces on the first mutate as a
+  // more informative EACCES from openSync, matching the prior behavior).
+  try { mkdirSync(dirname(cfg.stateFile), { recursive: true }); } catch { /* EEXIST or EACCES (surfaces on first mutate) */ }
+
   // Track whether THIS process currently holds the token, so we only release
   // our own and so the status bar can show "launching".
   let holdsToken = false;

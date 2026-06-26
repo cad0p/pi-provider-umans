@@ -579,6 +579,31 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV4-1: acquireLock doesn't throw ENOENT when the parent dir is missing ---
+// The lockfile lives in the same dir as the state file. When the parent dir
+// doesn't exist, acquireLock's openSync(lockFile, "wx") threw ENOENT BEFORE
+// writeStateAtomic's mkdirSync (inside withLock) ever ran — aborting the turn on
+// first use. mkdirSync is now hoisted into the factory so the dir exists before
+// the first mutate. We point stateFile at a non-existent nested dir and assert
+// join() succeeds (the dir is created + the first mutate writes through).
+{
+  const base = mkdtempSync(join(tmpdir(), "umans-q-"));
+  // A nested path whose parent does NOT exist yet (the factory must create it).
+  const stateFile = join(base, "nonexistent-parent", "nested", "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+  const id = q.join();
+  assert(id !== null, "COV4-1: join succeeds when parent dir is missing (mkdirSync hoisted)");
+
+  // The state file must have been written (the first mutate wrote through).
+  const { readFileSync } = await import("node:fs");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 1 && st.waiters[0].id === id,
+    "COV4-1: first mutate wrote the waiter through the created nested dir");
+
+  q.reset();
+  rmSync(base, { recursive: true, force: true });
+}
+
 // --- COV-MED-6: concurrencyLimit() edge inputs (parseConcurrencyLimit) ---
 // "2.5" → 2.5 (fractional, kept as-is), " " → fallback, "0" → fallback,
 // "abc" → fallback, "" → fallback, undefined → fallback.
