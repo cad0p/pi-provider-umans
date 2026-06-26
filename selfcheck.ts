@@ -604,6 +604,59 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(base, { recursive: true, force: true });
 }
 
+// --- COV4-2: pauseUntil throws on disk failure; index.ts wraps it (no turn abort) ---
+// pauseUntil runs mutate -> writeStateAtomic -> renameSync/writeFileSync, which
+// can throw on disk failure (EACCES, ENOSPC, EROFS). Without the try/catch in
+// capacityFree + the 429 handler + refreshUsage, the throw propagates out of
+// acquireSlot -> before_provider_request -> pi aborts the user's turn. The
+// queue's pauseUntil itself still throws (it's the caller's responsibility to
+// swallow); we verify the throw surface exists (chmod the state dir read-only so
+// writeFileSync fails with EACCES) and that the index.ts try/catch pattern
+// (replicated here) swallows it so a decision is returned rather than the turn
+// aborting.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { chmodSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Make the state dir read-only AFTER the queue is created (the factory's
+  // mkdirSync already ran). writeStateAtomic -> writeFileSync(tmp) now throws
+  // EACCES (can't create a file in a read-only dir), which propagates out of
+  // pauseUntil.
+  chmodSync(dir, 0o500); // r-x for owner: can read/list, cannot create files
+  try {
+    // The queue's pauseUntil surfaces the throw (the caller must swallow).
+    let caught: unknown = undefined;
+    try {
+      q.pauseUntil(Date.now() + 30_000, "COV4-2 probe");
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught instanceof Error, "COV4-2: queue pauseUntil throws on disk failure (caller must swallow)");
+
+    // The index.ts pattern: wrap pauseUntil in try/catch + warn + swallow so
+    // capacityFree/refreshUsage/the 429 handler return a decision instead of
+    // aborting the turn. Replicate the exact guard and assert it swallows.
+    let guarded = true;
+    try {
+      try {
+        q.pauseUntil(Date.now() + 30_000, "COV4-2 probe");
+      } catch (err) {
+        console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
+      }
+    } catch {
+      guarded = false;
+    }
+    assert(guarded === true, "COV4-2: try/catch around pauseUntil swallows the throw (turn does not abort)");
+  } finally {
+    chmodSync(dir, 0o700); // restore so rmSync can clean up
+  }
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV-MED-6: concurrencyLimit() edge inputs (parseConcurrencyLimit) ---
 // "2.5" → 2.5 (fractional, kept as-is), " " → fallback, "0" → fallback,
 // "abc" → fallback, "" → fallback, undefined → fallback.

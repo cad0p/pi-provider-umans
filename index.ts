@@ -792,7 +792,14 @@ export default async function (pi: ExtensionAPI) {
     // the status bar reads concurrencyQueue.snapshot() for paused state).
     const priority = parsePriority(data.usage?.priority);
     if (priority.low) {
-      concurrencyQueue.pauseUntil(priority.until, priority.reason ?? undefined);
+      // COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS).
+      // The pause is a best-effort coordination signal; warn + swallow so the
+      // 5s refreshUsage timer doesn't propagate a disk error.
+      try {
+        concurrencyQueue.pauseUntil(priority.until, priority.reason ?? undefined);
+      } catch (err) {
+        console.warn("umans: pauseUntil threw in refreshUsage (continuing):", err instanceof Error ? err.message : err);
+      }
     } else {
       concurrencyQueue.clearPause();
     }
@@ -863,8 +870,17 @@ export default async function (pi: ExtensionAPI) {
           queuePaused: concurrencyQueue.snapshot().paused,
         });
         if (decision.repause) {
-          // Refresh the shared pause so sibling processes back off too.
-          concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
+          // COV4-2: pauseUntil runs mutate -> writeStateAtomic -> renameSync,
+          // which can throw on disk failure (EACCES, ENOSPC, EROFS). The pause
+          // is a best-effort coordination signal (the server's priority.low +
+          // the 120s watchdog bound it); it must not abort a turn that already
+          // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
+          // ADV3-1 drain-resilience pattern.
+          try {
+            concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
+          } catch (err) {
+            console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
+          }
         }
         return decision.free;
       };
@@ -1361,7 +1377,15 @@ export default async function (pi: ExtensionAPI) {
           if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000);
         }
       }
-      concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
+      // COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS).
+      // The lost pause is bounded by the 120s watchdog + the 5s refreshUsage
+      // poll, and the 429 notify still fires below. Warn + swallow so the
+      // after_provider_response handler doesn't propagate a disk error.
+      try {
+        concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
+      } catch (err) {
+        console.warn("umans: pauseUntil threw in 429 handler (continuing):", err instanceof Error ? err.message : err);
+      }
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
         "warning",
