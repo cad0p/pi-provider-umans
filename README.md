@@ -126,7 +126,7 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 
 - `npm run check` — `tsc --noEmit`, must be green.
 - `npm test` — runs `selfcheck.ts` (`node --experimental-strip-types selfcheck.ts`), the branchy pure-logic + queue integration checks. Must pass before merge.
-- `npm run test:integration` — runs `./test-concurrency-gate.sh`, the **cross-process serialization proof** (spawns N `pi` processes against the live gateway + asserts peak concurrency stays under the cap). This requires a real `UMANS_API_KEY` and is **not run in CI** — run it locally before merging any change to the concurrency queue. Usage: `./test-concurrency-gate.sh <min-peak> <max-peak>` (e.g. `./test-concurrency-gate.sh 4 6`).
+- `npm run test:integration` — runs `./test-concurrency-gate.sh`, the **cross-process serialization proof** (spawns N `pi` processes against the live gateway + asserts peak concurrency stays under the cap). This requires a real `UMANS_API_KEY` and is **not run in CI** — run it locally before merging any change to the concurrency queue. Usage: `./test-concurrency-gate.sh [limit] [jobs] [--runs N] [--min-peak N]` (e.g. `./test-concurrency-gate.sh 2 5 --runs 3 --min-peak 2`).
 
 ## Getting an API Key
 
