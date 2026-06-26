@@ -2518,6 +2518,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(r3.elapsedMs >= 40, `CMP7-3: timeout path honored when no parentSignal (took ${r3.elapsedMs}ms)`);
 }
 
+// --- CMP8-2: AbortSignal.any composition (already-aborted parent aborts immediately) ---
+// The four signal-composition sites (waitForLaunch, analyzeImage, searchWeb,
+// fetchUsage) now use AbortSignal.any instead of the manual addEventListener
+// bridge. An already-aborted parent must immediately abort the composed signal.
+{
+  const parent = new AbortController();
+  parent.abort();
+  const ctrl = new AbortController();
+  const composed = AbortSignal.any([parent.signal, ctrl.signal]);
+  assert(composed.aborted === true, "CMP8-2: already-aborted parent aborts composed signal immediately");
+  // A composed signal with a non-aborted parent is not aborted until one source aborts.
+  const parent2 = new AbortController();
+  const ctrl2 = new AbortController();
+  const composed2 = AbortSignal.any([parent2.signal, ctrl2.signal]);
+  assert(composed2.aborted === false, "CMP8-2: composed signal not aborted when no source aborted");
+  ctrl2.abort();
+  assert(composed2.aborted === true, "CMP8-2: composed signal aborts when a source aborts");
+}
+
 // --- COV7-2: acquireSlot C1 re-join + MAX_TOKEN_REJOINS fail-open ---
 // The C1 HIGH fix (re-stamp token, re-join on reap) was tested only at the pure
 // touchToken seam. The integrated acquireSlot loop (token reaped mid-poll ->

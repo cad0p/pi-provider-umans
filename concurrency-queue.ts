@@ -907,8 +907,15 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void> {
       return new Promise((resolve, reject) => {
-        // If the signal is already aborted, cancel + reject immediately.
-        if (signal?.aborted || resetAbort.signal.aborted) {
+        // CMP8-2: compose the caller's signal + the per-instance resetAbort
+        // controller via AbortSignal.any (Node 20.3+; declared in package.json
+        // engines). Replaces the manual addEventListener + finally
+        // removeEventListener bridge (listener-leak footgun + boilerplate).
+        // A single composed signal covers both abort sources; if the caller
+        // passed no signal, resetAbort.signal is the sole source.
+        const composed = signal ? AbortSignal.any([signal, resetAbort.signal]) : resetAbort.signal;
+        // If already aborted, cancel + reject immediately.
+        if (composed.aborted) {
           try { this.cancel(ourId); } catch { /* best-effort */ }
           reject(new Error("concurrency-queue: waitForLaunch aborted"));
           return;
@@ -919,13 +926,8 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           try { this.cancel(ourId); } catch { /* best-effort */ }
           reject(new Error("concurrency-queue: waitForLaunch aborted"));
         };
-        if (signal) signal.addEventListener("abort", onAbort, { once: true });
-        // CORR7-2: compose the per-instance resetAbort controller with the
-        // caller's signal so reset() can stop an in-flight poll loop. Use the
-        // addEventListener bridge (not AbortSignal.any) for Node 18+ compat,
-        // matching the existing abort plumbing in analyzeImage/fetchUsage.
-        resetAbort.signal.addEventListener("abort", onAbort, { once: true });
-        const cleanResetListener = () => resetAbort.signal.removeEventListener("abort", onAbort);
+        composed.addEventListener("abort", onAbort, { once: true });
+        const cleanComposedListener = () => composed.removeEventListener("abort", onAbort);
         const poll = () => {
           // Stop polling the moment the turn is aborted; otherwise the orphaned
           // promise would claim the token when freed and resolve a release fn
@@ -971,14 +973,13 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
             });
           } catch (err) {
             if (timer) clearTimeout(timer);
-            cleanResetListener();
+            cleanComposedListener();
             try { this.cancel(ourId); } catch { /* best-effort */ }
             reject(new Error(`concurrency-queue: poll failed: ${err instanceof Error ? err.message : err}`));
             return;
           }
           if (got) {
-            if (signal) signal.removeEventListener("abort", onAbort);
-            cleanResetListener();
+            cleanComposedListener();
             resolve(() => {
               // Release: remove our token and our waiter entry. A throw here
               // (lock timeout, EACCES, ENOSPC) propagates to releaseSlot in

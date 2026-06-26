@@ -582,13 +582,14 @@ async function analyzeImage(
   signal?: AbortSignal,
   concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
 ): Promise<string> {
+  // CMP8-2: compose the caller's signal + a timer-driven controller via
+  // AbortSignal.any (Node 20.3+; declared in package.json engines). Replaces
+  // the manual addEventListener + finally removeEventListener bridge
+  // (listener-leak footgun + boilerplate). The fetch aborts when EITHER the
+  // parent signal aborts OR the timer fires.
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), VISION_TIMEOUT_MS);
-  const onAbort = () => ctrl.abort();
-  if (signal) {
-    if (signal.aborted) ctrl.abort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  }
+  const composed = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
   try {
     const res = await fetch(`${baseUrl}/v1/messages`, {
       method: "POST",
@@ -615,7 +616,7 @@ async function analyzeImage(
           },
         ],
       }),
-      signal: ctrl.signal,
+      signal: composed,
     });
     if (!res.ok) {
       // CORR8-2: a 429 from a side-call deprioritizes the whole account too
@@ -642,7 +643,6 @@ async function analyzeImage(
     return text || "(no analysis returned)";
   } finally {
     clearTimeout(timer);
-    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -664,13 +664,11 @@ async function searchWeb(
   signal?: AbortSignal,
   concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
 ): Promise<string> {
+  // CMP8-2: compose the caller's signal + a timer-driven controller via
+  // AbortSignal.any (Node 20.3+). See analyzeImage for the rationale.
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SEARCH_TIMEOUT_MS);
-  const onAbort = () => ctrl.abort();
-  if (signal) {
-    if (signal.aborted) ctrl.abort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  }
+  const composed = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
   try {
     const res = await fetch(`${baseUrl}/v1/messages`, {
       method: "POST",
@@ -696,7 +694,7 @@ async function searchWeb(
           },
         ],
       }),
-      signal: ctrl.signal,
+      signal: composed,
     });
     if (!res.ok) {
       // CORR8-2: a 429 from a side-call deprioritizes the whole account too
@@ -737,7 +735,6 @@ async function searchWeb(
     return "(no search results returned)";
   } finally {
     clearTimeout(timer);
-    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -955,24 +952,20 @@ export default async function (pi: ExtensionAPI) {
   // { limits, usage } on a 2xx, or null on any failure (caller decides how to
   // handle — refreshUsage leaves cached values, fetchUsageSnapshot retries).
   // CMP7-3: accept an optional parentSignal (the turn's AbortSignal) + compose
-  // it into ctrl via the addEventListener("abort", ...) bridge already used in
-  // analyzeImage/searchWeb (not AbortSignal.any, for Node 18+ compat). So a
-  // Ctrl-C mid capacity-poll aborts the in-flight /usage fetch immediately
-  // instead of waiting up to 3s for the timeout.
+  // it into the fetch signal so a Ctrl-C mid capacity-poll aborts the in-flight
+  // /usage fetch immediately instead of waiting up to 3s for the timeout.
+  // CMP8-2: composition now uses AbortSignal.any (Node 20.3+) instead of the
+  // manual addEventListener + finally removeEventListener bridge.
   async function fetchUsage(apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<{
     limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
     usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
   } | null> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const onAbort = () => ctrl.abort();
-    if (parentSignal) {
-      if (parentSignal.aborted) ctrl.abort();
-      else parentSignal.addEventListener("abort", onAbort, { once: true });
-    }
+    const composed = parentSignal ? AbortSignal.any([parentSignal, ctrl.signal]) : ctrl.signal;
     try {
       const res = await fetch(`${baseUrl}/v1/usage`, {
-        signal: ctrl.signal,
+        signal: composed,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           Accept: "application/json",
@@ -988,7 +981,6 @@ export default async function (pi: ExtensionAPI) {
       return null;
     } finally {
       clearTimeout(timer);
-      if (parentSignal) parentSignal.removeEventListener("abort", onAbort);
     }
   }
 

@@ -20,6 +20,9 @@
   ],
   "author": "",
   "license": "MIT",
+  "engines": {
+    "node": ">=20.3.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/umans-ai/pi-provider-umans.git"
