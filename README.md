@@ -98,6 +98,7 @@ This provider ships a **cross-process FIFO queue** to keep you under the soft ca
 - Vision handoff and web-search side-calls go through the **same queue**.
 - The status bar shows live state: `q <queued>*` (the `*` marks this process holding the token / launching) and `PAUSED <Ns>` while backing off.
 - **Unlimited plans** (Code Max, `limit === undefined`): the queue still serializes launches + honors `priority.low`, but skips the capacity check.
+- **Operator reset**: `/umans-concurrency status` shows the queue depth + pause state; `/umans-concurrency reset` force-clears a poisoned pause (incl. a 429-origin pause) and drops this process's own waiter/token entry — useful for un-wedging without editing `~/.pi/agent/umans-concurrency.json` by hand.
 
 | Env var | Default | Effect |
 |---|---|---|

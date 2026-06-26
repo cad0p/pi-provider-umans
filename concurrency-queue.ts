@@ -590,8 +590,8 @@ export interface ConcurrencyQueue {
    * priority.low===false must not wipe a sibling's freshly-written 429 pause.
    * The 429 pause survives until it naturally elapses OR /usage reports
    * priority.low===true (confirming the server caught up). Pass {force:true}
-   * to clear unconditionally (not currently used by the provider; available
-   * for explicit operator reset).
+   * to clear unconditionally (used by the /umans-concurrency reset operator
+   * command to un-wedge a poisoned pause without editing the JSON by hand).
    */
   clearPause(opts?: { force?: boolean }): void;
   /** Snapshot for status-bar display. */

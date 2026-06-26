@@ -1286,6 +1286,60 @@ export default async function (pi: ExtensionAPI) {
     });
   }
 
+  // /umans-concurrency: operator control of the cross-process FIFO gate.
+  // CLN5-2: wires clearPause({force:true}) + reset() to a real caller so the
+  // `force` option is not a speculative-caller export. `reset` clears a
+  // poisoned pause (e.g. a stale 429-origin pause wedging the queue) and this
+  // process's own waiter/token entry — useful for un-wedging without editing
+  // ~/.pi/agent/umans-concurrency.json by hand.
+  pi.registerCommand("umans-concurrency", {
+    description: "Umans concurrency queue: show status, or force-reset the pause/queue",
+    getArgumentCompletions(prefix: string) {
+      return ["status", "reset"]
+        .filter((s) => s.startsWith(prefix.trimStart()))
+        .map((value) => ({ value, label: value }));
+    },
+    handler: async (args: string, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const sub = parts[0] ?? "status";
+      if (sub === "status") {
+        if (concurrencyDisabled) {
+          ctx.ui.notify("Umans concurrency queue: disabled (UMANS_CONCURRENCY_DISABLE=1)", "info");
+          return;
+        }
+        const snap = concurrencyQueue.snapshot();
+        const paused = snap.paused
+          ? `paused ${Math.max(0, Math.round((snap.pausedUntil - Date.now()) / 1000))}s${snap.pausedReason ? ` (${snap.pausedReason})` : ""}`
+          : "running";
+        ctx.ui.notify(`Umans concurrency: queued=${snap.queued} tokenHeld=${snap.tokenHeld} ${paused}`, "info");
+        return;
+      }
+      if (sub === "reset") {
+        if (concurrencyDisabled) {
+          ctx.ui.notify("Umans concurrency queue: disabled — nothing to reset", "info");
+          return;
+        }
+        // Force-clear any pause (incl. a 429-origin pause that would otherwise
+        // survive until it naturally elapses) + drop this process's own
+        // waiter/token entry. Does NOT unlink the shared state file (siblings
+        // may still be queued).
+        try {
+          concurrencyQueue.clearPause({ force: true });
+        } catch (err) {
+          ctx.ui.notify(`Umans concurrency: clearPause threw: ${err instanceof Error ? err.message : err}`, "error");
+        }
+        try {
+          concurrencyQueue.reset();
+        } catch (err) {
+          ctx.ui.notify(`Umans concurrency: reset threw: ${err instanceof Error ? err.message : err}`, "error");
+        }
+        ctx.ui.notify("Umans concurrency: pause force-cleared + own waiter/token entry reset", "info");
+        return;
+      }
+      ctx.ui.notify("Usage: /umans-concurrency [status|reset]", "info");
+    },
+  });
+
   // === Concurrency queue: hold the outbound request until a slot is free ===
   // before_provider_request fires after the payload is built, right before the
   // HTTP send, and is awaited by pi. We join the cross-process FIFO here so the
