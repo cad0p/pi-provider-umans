@@ -798,9 +798,10 @@ export default async function (pi: ExtensionAPI) {
   }
 
   // Lightweight one-shot /v1/usage fetch used by the head waiter to decide
-  // whether to launch. Cheaper than refreshUsage: it only needs
-  // concurrent_sessions + limit + hard_cap + priority, and it must be fast so
-  // the queue doesn't stall. Returns null on any failure (caller retries).
+  // whether to launch. Uses a shorter timeout (3s vs 5s) so a slow /usage
+  // response doesn't stall the head-waiter poll; reads only the
+  // capacity-decision fields (concurrent_sessions + limit + hard_cap +
+  // priority). Returns null on any failure (caller retries).
   async function fetchUsageSnapshot(apiKey: string): Promise<{
     concurrentSessions: number | undefined;
     limit: number | undefined;
