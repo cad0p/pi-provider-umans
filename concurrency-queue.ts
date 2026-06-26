@@ -890,7 +890,19 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // depth) so a poisoned reason never reaches the shared file,
           // regardless of caller. parsePriority already sanitizes the
           // server-sourced reason; this catches any future caller.
-          state.pausedReason = sanitizeReason(reason) ?? state.pausedReason ?? null;
+          // CORR7-1: do NOT overwrite a PAUSE_REASON_429 tag with a non-429
+          // reason when extending. CORR4-1's clearPause guard keys on the
+          // reason STRING, so a /usage priority.low tick with a longer deadline
+          // + a non-null reason (e.g. "Account deprioritized") would wipe the
+          // 429 tag, letting the next stale priority.low===false tick clear the
+          // pause early — exactly the race CORR4-1 exists to prevent. The 429
+          // tag stays authoritative; the longer deadline still extends
+          // pausedUntil. When the 429 pause naturally elapses (pausedUntil <=
+          // now), clearPause clears it normally.
+          const newReason = sanitizeReason(reason);
+          state.pausedReason = state.pausedReason === PAUSE_REASON_429
+            ? PAUSE_REASON_429
+            : (newReason ?? state.pausedReason ?? null);
           state.pausedTs = now;
         }
       });

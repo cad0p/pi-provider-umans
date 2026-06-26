@@ -5,7 +5,7 @@
 // - createConcurrencyQueue: FIFO + launch-token + pause (file-backed, temp dir)
 //
 // Run: node --experimental-strip-types selfcheck.ts
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval } from "./index.ts";
@@ -1948,6 +1948,60 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(guard < 100, "ADV3-1: drain terminates (no infinite loop on a throwing slot)");
   assert(released.length === 1 && released[0] === "B", "ADV3-1: clean slot still released between throwing ones");
   assert(updateCount === 3, "ADV3-1: updateStatus ran once per drained slot (in finally)");
+}
+
+// --- CORR7-1: preserve 429-origin tag when priority.low extends pause ---
+// CORR4-1's clearPause guard keys on the reason string (PAUSE_REASON_429).
+// pauseUntil overwrites pausedReason whenever it extends pausedUntil, so a
+// /usage priority.low tick with a longer deadline + a non-null reason (e.g.
+// "Account deprioritized") would wipe the 429 tag — then the next stale
+// priority.low===false tick's clearPause() would clear the pause early,
+// exactly the race CORR4-1 exists to prevent. The 429 tag must stay
+// authoritative; only the deadline extends.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr7-1-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const qA = createConcurrencyQueue({ stateFile });
+  const qB = createConcurrencyQueue({ stateFile }); // sibling
+
+  // A writes a 429-origin pause 30s out.
+  const t0 = Date.now();
+  const until429 = t0 + 30_000;
+  qA.pauseUntil(until429, PAUSE_REASON_429);
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === until429, "CORR7-1: 429 pause written with requested deadline");
+  assert(st.pausedReason === PAUSE_REASON_429, "CORR7-1: 429 pause tagged PAUSE_REASON_429");
+
+  // /usage priority.low tick with a LONGER deadline + a non-null reason.
+  // Must extend pausedUntil but NOT overwrite the 429 tag.
+  const untilLow = t0 + 60_000;
+  qA.pauseUntil(untilLow, "Account deprioritized");
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === untilLow, "CORR7-1: longer priority.low deadline extends pausedUntil");
+  assert(st.pausedReason === PAUSE_REASON_429,
+    "CORR7-1: 429 tag preserved when priority.low extends (not overwritten to Account deprioritized)");
+
+  // clearPause() (no force) must NOT clear the pause — the 429 tag is still
+  // authoritative (CORR4-1 protection holds even after the extend).
+  qB.clearPause();
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === untilLow, "CORR7-1: 429 pause survives a stale clearPause after extend");
+  assert(st.pausedReason === PAUSE_REASON_429, "CORR7-1: 429 tag survives a stale clearPause after extend");
+
+  // Advance time past the (extended) deadline + clearPause() — clears normally.
+  // We simulate elapse by writing a past pausedUntil directly so reapStale /
+  // clearPause sees it as elapsed (clearPause's guard is `pausedUntil > now`).
+  const elapsed = JSON.parse(readFileSync(stateFile, "utf8"));
+  elapsed.pausedUntil = Date.now() - 1_000;
+  writeFileSync(stateFile, JSON.stringify(elapsed));
+  qB.clearPause();
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === 0 && st.pausedReason === null,
+    "CORR7-1: 429 pause clears naturally after the deadline elapses");
+
+  qA.reset(); qB.reset();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 console.log("\nall checks passed");
