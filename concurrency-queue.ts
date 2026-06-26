@@ -207,6 +207,11 @@ export interface PriorityState {
  * may be an ISO string, epoch seconds, or null; when low===true but boxed_until is
  * null/absent, we fall back to now + PRIORITY_BACKOFF_MS so callers always get a
  * concrete deadline to honor.
+ * SEC7-2: clamp `until` to now + MAX_PAUSE_MS so the parse boundary matches the
+ * 429 path's defense-in-depth (a poisoned boxed_until like 2099-12-31 cannot
+ * propagate a centuries-long deadline even if a future caller bypasses
+ * pauseUntil's own clamp). Low priority — the write boundary already clamps +
+ * is only in-repo consumer, but this closes the parse-boundary gap.
  */
 export function parsePriority(raw: unknown): PriorityState {
   const p = (raw ?? {}) as {
@@ -225,6 +230,8 @@ export function parsePriority(raw: unknown): PriorityState {
       if (!Number.isNaN(t)) ms = t;
     }
     until = ms > 0 ? ms : Date.now() + PRIORITY_BACKOFF_MS;
+    // SEC7-2: clamp at the parse boundary too (defense-in-depth).
+    until = clampPauseUntil(until, Date.now(), MAX_PAUSE_MS);
   }
   return { low, until, reason: sanitizeReason(p.reason) };
 }
@@ -388,7 +395,12 @@ export function readState(path: string): QueueState {
  * standalone queue module.
  */
 export function isPidDead(pid: number): boolean {
-  if (!pid || pid <= 0) return true;
+  // SEC7-3: defensive guard for non-numeric / non-finite input. The shape
+  // guards (isWaiterEntry/isTokenState) already drop malformed entries, but a
+  // future caller could bypass them; treat non-number / NaN / Infinity as
+  // dead so reapStale reclaims rather than passing garbage to process.kill
+  // (which would throw a synchronous TypeError not filtered by the catch).
+  if (typeof pid !== "number" || !Number.isFinite(pid) || !pid || pid <= 0) return true;
   try {
     // process.kill(pid, 0) throws ESRCH (no such process) or EPERM (process
     // exists but caller lacks permission). ESRCH -> dead. EPERM -> the process

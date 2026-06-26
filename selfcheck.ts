@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -288,7 +288,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 // responses), an epoch-seconds number, or null. The ISO path (Date.parse) and
 // a malformed string (NaN → fallback) were previously untested.
 {
-  const future = "2026-12-31T00:00:00Z";
+  const future = new Date(Date.now() + 60_000).toISOString();
   const pIso = parsePriority({ low: true, boxed_until: future, reason: "boxed" });
   assert(pIso.low === true && pIso.until === Date.parse(future),
     "COV-HIGH-2: parsePriority ISO boxed_until -> ms via Date.parse");
@@ -2850,6 +2850,89 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   try { statSync(stateFile); stateWritten = true; } catch { /* not written */ }
   assert(stateWritten, "CORR7-5: state file written (mutate completed despite .tmp dir)");
 
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- SEC7-2: parsePriority clamps `until` to now + MAX_PAUSE_MS (parse boundary) ---
+// The clamp lived only at the write boundary (pauseUntil). parsePriority now
+// clamps at the parse boundary too so a poisoned boxed_until (e.g. 2099-12-31)
+// cannot propagate a centuries-long deadline even if a future caller bypasses
+// pauseUntil's clamp.
+{
+  const p = parsePriority({ low: true, boxed_until: "2099-12-31T00:00:00Z" });
+  assert(p.low === true, "SEC7-2: parsePriority low=true");
+  assert(p.until <= Date.now() + MAX_PAUSE_MS + 1_000,
+    "SEC7-2: parsePriority clamps until to now + MAX_PAUSE_MS (not 2099)");
+  assert(p.until < Date.parse("2099-12-31T00:00:00Z"),
+    "SEC7-2: parsePriority clamped below the raw boxed_until");
+  // A sub-ceiling boxed_until is unchanged.
+  const future = new Date(Date.now() + 60_000).toISOString();
+  const p2 = parsePriority({ low: true, boxed_until: future });
+  assert(p2.until === Date.parse(future), "SEC7-2: parsePriority sub-ceiling boxed_until unchanged");
+}
+
+// --- SEC7-3: isPidDead guards non-numeric / non-finite input + EPERM (PID 1) ---
+// isPidDead relied on shape guards (isWaiterEntry/isTokenState) to drop malformed
+// entries before calling process.kill. A future caller bypassing them would
+// pass garbage to process.kill (synchronous TypeError not filtered by catch).
+// Add a defensive typeof/Number.isFinite guard returning true (dead). Also
+// pin the EPERM path (PID 1 on macOS -> alive) to lock CORR2-4.
+{
+  assert(isPidDead(NaN) === true, "SEC7-3: isPidDead(NaN) -> true (non-finite guarded)");
+  assert(isPidDead(Infinity) === true, "SEC7-3: isPidDead(Infinity) -> true (non-finite guarded)");
+  assert(isPidDead("123" as any) === true, "SEC7-3: isPidDead(string) -> true (non-number guarded)");
+  assert(isPidDead(undefined as any) === true, "SEC7-3: isPidDead(undefined) -> true (non-number guarded)");
+  assert(isPidDead(0) === true, "SEC7-3: isPidDead(0) -> true (falsy)");
+  assert(isPidDead(-1) === true, "SEC7-3: isPidDead(-1) -> true (non-positive)");
+  // EPERM path: PID 1 (init/launchd) exists but we lack permission to signal
+  // it -> treat as alive (CORR2-4 fail-safe). On macOS/Linux PID 1 is always
+  // present; on Windows this is a no-op best-effort.
+  if (process.platform !== "win32") {
+    assert(isPidDead(1) === false, "SEC7-3: isPidDead(1) -> false (EPERM -> alive, CORR2-4 fail-safe)");
+  }
+}
+
+// --- SEC7-4: gateway error body is capped + sanitized (no control/ANSI echo) ---
+// analyzeImage/searchWeb echoed the raw gateway error body (200 chars) into the
+// thrown error / tool result. A compromised gateway can push crafted text that
+// flows into the model's context (prompt-injection surface). sanitizeErrorBody
+// caps to 80 chars + strips non-printable / ANSI-escape chars.
+{
+  const ansiEscape = "\x1b[31mred\x1b[0m";
+  const control = "\x00\x07";
+  const long = "A".repeat(200);
+  const crafted = `${ansiEscape}${control}${long}`;
+  const safe = sanitizeErrorBody(crafted);
+  assert(safe.length <= 80, "SEC7-4: error body capped to <= 80 chars");
+  assert(!/[\x00-\x1f\x7f]/.test(safe), "SEC7-4: error body has no control/ANSI-escape chars");
+  assert(!safe.includes("\x1b"), "SEC7-4: ESC byte removed from error body");
+  // A short, clean body passes through unchanged.
+  assert(sanitizeErrorBody("not found") === "not found", "SEC7-4: short clean body unchanged");
+  // An empty/whitespace body yields an empty string (caller omits the `: ` ).
+  assert(sanitizeErrorBody("   ") === "", "SEC7-4: whitespace-only body -> empty");
+  assert(sanitizeErrorBody("") === "", "SEC7-4: empty body -> empty");
+}
+
+// --- SEC7-5: state file + lockfile created with mode 0600 (regression guard) ---
+// The 0o600 mode (no PID leakage, no world-readable queue state) was not
+// asserted in selfcheck beyond the S3 block. Add an explicit, deterministic
+// assertion: trigger a write + assert (statSync(stateFile).mode & 0o777) ===
+// 0o600. The lockfile mode is covered by S3's best-effort mid-acquire poll;
+// here we deterministically assert the state file mode (the writeStateAtomic
+// path) + the 0o600 arg to openSync is the same used by acquireLock.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sec7-5-"));
+  const stateFile = join(dir, "state.json");
+  const { statSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+  // join + waitForLaunch forces a writeStateAtomic (state file) + acquireLock
+  // (lockfile), both at 0o600.
+  const id = q.join()!;
+  const release = await q.waitForLaunch(id);
+  release();
+  const stateMode = statSync(stateFile).mode & 0o777;
+  assert(stateMode === 0o600, `SEC7-5: state file mode is 0600 (got 0o${stateMode.toString(8)})`);
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }

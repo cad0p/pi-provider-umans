@@ -468,6 +468,21 @@ export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
 
+/**
+ * SEC7-4: cap + sanitize a gateway error body before echoing it into a tool
+ * result / thrown error message. Gateway error bodies are attacker-controlled
+ * (a compromised/misconfigured gateway can push crafted text) + flow into the
+ * model's context (prompt-injection surface). Cap to 80 chars (down from 200)
+ * + strip non-printable / control / ANSI-escape chars so a crafted body cannot
+ * mangle the message or inject control sequences. Mirrors sanitizeReason's
+ * approach. Exported so selfcheck can unit-test the cap + strip.
+ */
+const ERROR_BODY_MAX_CHARS = 80;
+export function sanitizeErrorBody(body: string): string {
+  const cleaned = body.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
+}
+
 /*
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
@@ -537,7 +552,11 @@ async function analyzeImage(
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+      // SEC7-4: cap + sanitize the gateway error body before echoing it (cap 80,
+      // strip non-printable / ANSI-escape) so a crafted body cannot inject
+      // control sequences or mangle the tool result.
+      const safe = sanitizeErrorBody(txt);
+      throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
     }
     const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
     const text = (data.content ?? [])
@@ -605,7 +624,9 @@ async function searchWeb(
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}${txt ? `: ${txt.slice(0, 200)}` : ""}`);
+      // SEC7-4: cap + sanitize the gateway error body before echoing it.
+      const safe = sanitizeErrorBody(txt);
+      throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
     }
     const data = (await res.json()) as {
       content?: Array<{
