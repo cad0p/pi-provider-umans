@@ -1308,6 +1308,17 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "CORR8-3/ADV8-1: '8' → 8 (valid positive decimal)");
   assert(parseConcurrencyLimit(" 12 ", fallback) === 12,
     "CORR8-3/ADV8-1: ' 12 ' → 12 (whitespace trimmed, valid)");
+  // SEC9-5 / CORR9-1: huge integer strings pass /^\d+$/ + Number.isInteger but
+  // exceed Number.MAX_SAFE_INTEGER, silently disabling the cap. isSafeInteger +
+  // a 1024 ceiling reject them to fallback.
+  assert(parseConcurrencyLimit("999999999999999999999", fallback) === fallback,
+    "SEC9-5/CORR9-1: '999999999999999999999' → fallback (unsafe integer)");
+  assert(parseConcurrencyLimit("1025", fallback) === fallback,
+    "SEC9-5/CORR9-1: '1025' → fallback (exceeds 1024 cap)");
+  assert(parseConcurrencyLimit("64", fallback) === 64,
+    "SEC9-5/CORR9-1: '64' → 64 (valid, under cap)");
+  assert(parseConcurrencyLimit("1024", fallback) === 1024,
+    "SEC9-5/CORR9-1: '1024' → 1024 (cap boundary, inclusive)");
 }
 
 // --- S3: state file + lockfile created with mode 0600 (no PID leakage) ---

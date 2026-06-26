@@ -353,12 +353,18 @@ export function isCapacityFree(
  * rejected to fallback. A "0x10" typo would silently set the gate to 16,
  * defeating the cap. Mirrors the 429 Retry-After parse (which already used
  * /^\d+$/). The existing `n > 0` check still rejects 0.
+ * SEC9-5 / CORR9-1: Number.isInteger returns true for huge integers within
+ * Number.MAX_VALUE (e.g. "999999999999999999999" → 1e21), silently disabling
+ * the cap. Tightened to Number.isSafeInteger (rejects >2^53-1) + a practical
+ * ceiling of 1024 so a long-digit typo falls back instead of effectively
+ * unbounding the gate.
  */
+const MAX_CONCURRENCY_LIMIT = 1024;
 export function parseConcurrencyLimit(envValue: string | undefined, fallback: number | undefined): number | undefined {
   const trimmed = envValue?.trim();
   if (!trimmed || !/^\d+$/.test(trimmed)) return fallback;
   const n = Number(trimmed);
-  return Number.isInteger(n) && n > 0 ? n : fallback;
+  return Number.isSafeInteger(n) && n > 0 && n <= MAX_CONCURRENCY_LIMIT ? n : fallback;
 }
 
 /** Generate a unique waiter/token id. */
