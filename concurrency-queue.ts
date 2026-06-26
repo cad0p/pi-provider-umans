@@ -160,6 +160,20 @@ export const MAX_PAUSE_429_MS = 5 * PRIORITY_BACKOFF_MS; // 150,000 ms (2.5 min)
 export const PAUSE_REASON_429 = "HTTP 429 from gateway";
 
 /**
+ * SEC9-2/SEC8-1: upper bound on the state file size we'll read+parse.
+ * Legitimate state is <2 KB even with hundreds of waiters; a poisoned or
+ * runaway file (e.g. 1 GB) would OOM/stall the pi process. readState stats the
+ * file first + bails to the empty-state catch when st.size exceeds this.
+ */
+export const MAX_STATE_BYTES = 1_000_000;
+/**
+ * SEC9-2/SEC8-1: upper bound on the lockfile size. Legitimate content is
+ * `{"pid":12345}` (< 16 bytes); a poisoned lockfile would be caught by the
+ * mtime ceiling regardless, but bounding the read avoids a large-file hazard.
+ */
+export const MAX_LOCKFILE_BYTES = 256;
+
+/**
  * Clamp a candidate pause deadline to now + MAX_PAUSE_MS (or a tighter ceiling
  * when passed — e.g. MAX_PAUSE_429_MS for a 429-sourced pause) so a poisoned or
  * over-large Retry-After/boxed_until cannot wedge the queue for centuries.
@@ -385,6 +399,13 @@ function isTokenState(t: unknown): t is TokenState {
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string): QueueState {
   try {
+    // SEC9-2/SEC8-1: stat before readFileSync. A poisoned/runaway state file
+    // (e.g. 1 GB) would OOM/stall the pi process before JSON.parse. Bail to
+    // the empty-state catch when st.size > MAX_STATE_BYTES.
+    const st = statSync(path);
+    if (st.size > MAX_STATE_BYTES) {
+      return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+    }
     const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw) as Partial<QueueState>;
     const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
@@ -594,8 +615,14 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
         // lockfile content (lstat already confirmed it's a regular file, so
         // readFileSync does not follow a symlink here). Malformed/empty content
         // falls back to the mtime check below.
+        // SEC9-2/SEC8-1: bound the read — legitimate content is {"pid":N} (<16B);
+        // a poisoned lockfile is caught by the mtime ceiling regardless, but
+        // bounding avoids a large-file hazard.
         let holderPid: number | undefined;
         try {
+          if (st.size > MAX_LOCKFILE_BYTES) {
+            throw new Error("lockfile too large");
+          }
           const raw = readFileSync(lockFile, "utf8");
           const parsed = JSON.parse(raw) as { pid?: unknown };
           if (typeof parsed.pid === "number" && Number.isFinite(parsed.pid)) {

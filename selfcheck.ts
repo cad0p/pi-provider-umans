@@ -522,6 +522,21 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- SEC9-2/SEC8-1: readFileSync size bound on state file ---
+// A poisoned/runaway state file (e.g. 1 GB) would OOM/stall the pi process
+// before JSON.parse. readState stats first + bails to empty state when
+// st.size > MAX_STATE_BYTES (1 MB; legitimate state is <2 KB).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  // Write a 2 MB state file (well over the 1 MB cap).
+  writeFileSync(stateFile, "{\"x\":" + "\"".repeat(2_000_000) + "\"}");
+  const st = readState(stateFile);
+  assert(st.waiters.length === 0 && st.token === null && st.pausedUntil === 0,
+    "SEC9-2: oversized state file returns empty state (no OOM)");
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV-HIGH-4: cancel paths (non-existent id, non-head waiter, token-holder) ---
 // cancel is a hot path (called on every acquireSlot release) but was never
 // exercised by selfcheck. Covers: no-op on missing id, removal of a non-head
@@ -2409,6 +2424,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const id3 = q3.join()!;
   assert(id3 !== null, "CMP7-1: malformed lockfile content falls back to mtime check (reclaimed when stale)");
   q3.reset();
+
+  // SEC9-2/SEC8-1: an oversized lockfile (> MAX_LOCKFILE_BYTES = 256) must not
+  // be read into memory; the PID fast-path falls back to the mtime check.
+  writeFileSync(lockFile, "{\"pid\":" + " ".repeat(2_000) + "}", { mode: 0o600 });
+  const staleTime2 = (Date.now() / 1000) - 10; // past ceiling so mtime fallback reclaims
+  utimesSync(lockFile, staleTime2, staleTime2);
+  const q4 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
+  const id4 = q4.join()!;
+  assert(id4 !== null, "SEC9-2: oversized lockfile falls back to mtime reclaim (no large read)");
+  q4.reset();
 
   rmSync(dir, { recursive: true, force: true });
 }
