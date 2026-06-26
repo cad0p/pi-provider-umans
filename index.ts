@@ -876,6 +876,14 @@ export default async function (pi: ExtensionAPI) {
       // at the cap) cannot wedge the queue forever. After the cap, fail open
       // (launch anyway) — matching the /usage-unreachable fallback's stance
       // that the queue must not block indefinitely.
+      // CORR4-3: do NOT fail open during a KNOWN active pause (shared
+      // pausedUntil, e.g. a 429 the gate observed). Fail-open for an
+      // unreachable /usage is fine (no signal); fail-open for a POSITIVE
+      // deprio signal launches into a still-deprioritized account, risking
+      // another 429 and extending the account-wide deprioritization — exactly
+      // what the gate exists to prevent. Keep waiting when a known pause is
+      // active; the pause has a bounded deadline (clamped to MAX_PAUSE_MS)
+      // and the 120s watchdog reaps the token if this process hangs.
       const pollStart = Date.now();
       let stalled = false;
       while (!(await capacityFree())) {
@@ -884,7 +892,10 @@ export default async function (pi: ExtensionAPI) {
           released = true;
           throw new Error("concurrency-queue: acquireSlot aborted mid-poll");
         }
-        if (Date.now() - pollStart >= CAPACITY_POLL_TIMEOUT_MS) {
+        if (Date.now() - pollStart >= CAPACITY_POLL_TIMEOUT_MS && !concurrencyQueue.snapshot().paused) {
+          // CORR4-3: only fail open when no known pause is active. A known
+          // pause means the gate has a positive deprio signal; keep waiting
+          // (bounded by the pause deadline + the 120s token watchdog).
           stalled = true;
           break; // fail open below
         }
