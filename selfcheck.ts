@@ -550,6 +550,39 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV6-2: double-join on one queue survives reset() (Set of waiter ids) ---
+// ourWaiterId was a single `let`; a second join() overwrote it so reset()
+// cleared only the most-recent waiter. Reachable from transformMessageImages
+// (Promise.all → acquireSlot → join() per image). Probe (5×) confirmed: two
+// join() calls then reset() leaves exactly 1 waiter every time. Track a Set of
+// this process's waiter ids so reset() splices every one.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov6-2-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Join twice — simulates two concurrent acquireSlot calls (multi-image
+  // handoff). Both ids land in the waiter FIFO.
+  const id1 = q.join()!;
+  const id2 = q.join()!;
+  assert(id1 !== id2, "COV6-2: two join() calls return distinct ids");
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 2, "COV6-2: both waiters present in the file after double-join");
+  assert(st.waiters.some((w: { id: string }) => w.id === id1) &&
+         st.waiters.some((w: { id: string }) => w.id === id2),
+    "COV6-2: both waiter ids recorded in FIFO");
+
+  // reset() must splice BOTH (the old single-slot design leaked id1).
+  q.reset();
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 0, "COV6-2: reset() removes both waiters after double-join");
+  assert(!st.waiters.some((w: { id: string }) => w.id === id1) &&
+         !st.waiters.some((w: { id: string }) => w.id === id2),
+    "COV6-2: neither double-joined waiter leaks past reset()");
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- SEC6-2: writeStateAtomic uses O_EXCL ("wx"), does not follow a planted symlink ---
 // The per-pid temp name `${path}.${process.pid}.tmp` + writeFileSync (no O_EXCL)
 // follows a planted symlink → write-redirect to an arbitrary file (probe-
@@ -614,6 +647,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
 assert(isPidDead(process.pid) === false, "isPidDead: own pid alive");
 assert(isPidDead(-1) === true, "isPidDead: invalid pid dead");
 assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");

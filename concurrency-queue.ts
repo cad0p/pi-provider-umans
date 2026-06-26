@@ -678,11 +678,22 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // our own and so the status bar can show "launching".
   let holdsToken = false;
   let ourTokenId: string | null = null;
-  // COV5-5 / ADV5-4: track our waiter id (set in join) alongside ourTokenId so
+  // COV5-5 / ADV5-4: track our waiter ids (set in join) alongside ourTokenId so
   // reset() can splice out a queued-but-not-launched waiter. Without this, a
   // process that join()ed but is still queued (ourTokenId === null) has reset()
   // as a no-op, leaking the waiter for staleWaiterMs (5 min) if the process
   // doesn't exit — blocking siblings behind a dead-PID entry.
+  // COV6-2: a Set (not a single slot) so a second join() on one queue does NOT
+  // overwrite the first id. Reachable from transformMessageImages (multi-image
+  // handoff runs Promise.all → acquireSlot → join() per image). Probe (5×)
+  // confirmed: two join() calls then reset() leaves exactly 1 waiter every
+  // time with the single-slot design. The token single-slot (ourTokenId) is
+  // safe — token release is closure-captured per waitForLaunch — but a Set is
+  // used here because waiters accumulate.
+  const ourWaiterIds: Set<string> = new Set();
+  // Kept as the most-recent id for the cancel(ourId) hot path (release in
+  // acquireSlot passes the specific id it joined with, so the Set is the
+  // source of truth; this is just a convenience handle).
   let ourWaiterId: string | null = null;
 
   function mutate<T>(fn: (now: number, state: QueueState) => T): T {
@@ -700,6 +711,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       mutate((now, state) => {
         state.waiters.push({ id, pid: ourPid(), ts: now });
       });
+      ourWaiterIds.add(id);
       ourWaiterId = id;
       return id;
     },
@@ -785,6 +797,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
                   holdsToken = false;
                   ourTokenId = null;
                 }
+                ourWaiterIds.delete(ourId);
                 if (ourWaiterId === ourId) {
                   ourWaiterId = null;
                 }
@@ -893,6 +906,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           holdsToken = false;
           ourTokenId = null;
         }
+        ourWaiterIds.delete(ourId);
         if (ourWaiterId === ourId) {
           ourWaiterId = null;
         }
@@ -911,20 +925,27 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // join()ed but is still queued has reset() as a no-op, leaking the
       // waiter for staleWaiterMs (5 min) if the process doesn't exit —
       // blocking siblings behind a dead-PID entry.
+      // COV6-2: splice EVERY id in ourWaiterIds (a Set, not a single slot) so a
+      // second join() on one queue does not leak the first waiter. Reachable
+      // from transformMessageImages (Promise.all → acquireSlot → join() per
+      // image). The token single-slot (ourTokenId) is safe — token release is
+      // closure-captured per waitForLaunch — but waiters accumulate, so we
+      // splice the whole set.
       try {
         mutate((_now, state) => {
-          const id = ourTokenId ?? ourWaiterId;
-          if (id) {
+          for (const id of ourWaiterIds) {
             const idx = state.waiters.findIndex((w) => w.id === id);
             if (idx >= 0) state.waiters.splice(idx, 1);
-            if (state.token && state.token.id === id) {
-              state.token = null;
-            }
+          }
+          const tokId = ourTokenId;
+          if (tokId && state.token && state.token.id === tokId) {
+            state.token = null;
           }
         });
       } catch { /* ignore: lock unavailable on shutdown; watchdog will clean up */ }
       holdsToken = false;
       ourTokenId = null;
+      ourWaiterIds.clear();
       ourWaiterId = null;
     },
   };
