@@ -703,8 +703,17 @@ export default async function (pi: ExtensionAPI) {
   // local count. UMANS_CONCURRENCY_DISABLE opts out (fire-and-forget).
   // UMANS_CONCURRENCY_LIMIT is now only a display/testing hint: when set, the
   // capacity check uses it instead of the server's limits.concurrency.limit.
+  // COV7-1: UMANS_CONCURRENCY_STATE_FILE overrides the state file path so the
+  // handler-wiring harness mock in selfcheck can point the real queue at a
+  // tmpdir (isolating the test from the live ~/.pi/agent state file). Also
+  // handy for local multi-process serialization experiments. No-op in normal
+  // use (the default path is used when unset/empty).
   const concurrencyDisabled = process.env[CONCURRENCY_DISABLE_ENV] === "1";
-  const concurrencyQueue: ConcurrencyQueue = createConcurrencyQueue({ disabled: concurrencyDisabled });
+  const concurrencyStateFile = process.env.UMANS_CONCURRENCY_STATE_FILE?.trim() || undefined;
+  const concurrencyQueue: ConcurrencyQueue = createConcurrencyQueue({
+    disabled: concurrencyDisabled,
+    ...(concurrencyStateFile ? { stateFile: concurrencyStateFile } : {}),
+  });
   function concurrencyLimit(): number | undefined {
     return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
   }

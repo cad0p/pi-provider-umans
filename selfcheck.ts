@@ -5,10 +5,10 @@
 // - createConcurrencyQueue: FIFO + launch-token + pause (file-backed, temp dir)
 //
 // Run: node --experimental-strip-types selfcheck.ts
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -2002,6 +2002,162 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV7-1 (HIGH): pi-harness mock for handler-wiring integration ---
+// None of the 11 pi.on(...) handlers was exercised by selfcheck — only the 6
+// pure/extracted seams were. A regression swapping mainTurnRelease for a Set,
+// dropping the ADV2-F2 try/finally, or wiring session_shutdown to NOT call
+// reset() would not be caught. This harness mock constructs a minimal
+// ExtensionAPI stub (on/registerTool/registerCommand/registerProvider) + a
+// stub ctx (model.provider="umans", signal, ui.setWidget/notify, modelRegistry),
+// drives the real default export (index.ts factory), and dispatches synthetic
+// events: before_provider_request -> message_end -> turn_end -> agent_end ->
+// session_shutdown. globalThis.fetch is stubbed so acquireSlot's /usage poll sees
+// free capacity + no priority.low, and /v1/models/info falls back to the static
+// catalog. The real concurrencyQueue points at a tmpdir state file via the
+// UMANS_CONCURRENCY_STATE_FILE test seam.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov7-1-harness-"));
+  const stateFile = join(dir, "state.json");
+
+  // Save + set env so the factory wires a real queue at the tmpdir path.
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_DISABLE: "", // ensure the factory runs
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    if (v === "") delete process.env[k]; else process.env[k] = v;
+  }
+  // Clear UMANS_DISABLE explicitly (envOverrides sets "" but process.env may
+  // retain the key).
+  delete process.env.UMANS_DISABLE;
+
+  // Stub globalThis.fetch so acquireSlot's /usage poll returns free capacity
+  // (concurrent_sessions 0, limit 2, no priority.low) and /v1/models/info
+  // falls back to the static catalog (return non-OK so fetchModelCatalog
+  // returns undefined -> STATIC_CATALOG).
+  const realFetch = globalThis.fetch;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any, _init?: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    // /v1/models/info -> non-OK so the factory falls back to STATIC_CATALOG.
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+
+  try {
+    // --- Minimal ExtensionAPI stub ---
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, handler: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool() { /* no-op */ },
+      registerCommand() { /* no-op */ },
+      registerProvider() { /* no-op */ },
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(opts?: { model?: any; signal?: AbortSignal }): any {
+      return {
+        model: opts?.model ?? { provider: "umans", id: "umans-flash" },
+        signal: opts?.signal ?? new AbortController().signal,
+        mode: "print",
+        hasUI: false,
+        cwd: dir,
+        isIdle: () => true,
+        ui: {
+          setWidget: (key: string, content: any) => { widgets.set(key, content); },
+          setStatus: (key: string, text: string | undefined) => { statuses.set(key, text); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_name: string, text: string) => text },
+        },
+        modelRegistry: {
+          getApiKeyForProvider: async (_name: string) => "uk-test-key",
+        },
+        sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let last: any;
+      for (const h of hs) last = await h(event === "before_provider_request" ? { type: event, payload: {} } : event === "after_provider_response" ? { type: event, status: 200, headers: {} } : { type: event }, ctx ?? makeCtx());
+      return last;
+    }
+
+    // Run the real factory.
+    await umansFactory(pi as any);
+
+    // Sanity: the factory registered handlers for the events we drive.
+    assert(handlers.has("before_provider_request"), "COV7-1: before_provider_request handler registered");
+    assert(handlers.has("message_end"), "COV7-1: message_end handler registered");
+    assert(handlers.has("turn_end"), "COV7-1: turn_end handler registered");
+    assert(handlers.has("agent_end"), "COV7-1: agent_end handler registered");
+    assert(handlers.has("session_shutdown"), "COV7-1: session_shutdown handler registered");
+
+    // (a) before_provider_request: acquireSlot joins + claims token + polls
+    // /usage (free) -> mainTurnRelease is set. The token must be held in the
+    // shared state file (a sibling queue would see tokenHeld via snapshot).
+    // The state file is written by acquireSlot's join + waitForLaunch.
+    await dispatch("before_provider_request", makeCtx());
+    // Give the poll a moment (acquireSlot awaits waitForLaunch + capacityFree).
+    await new Promise((r) => setTimeout(r, 50));
+    const probeQ = createConcurrencyQueue({ stateFile });
+    assert(probeQ.snapshot().tokenHeld === true || probeQ.snapshot().queued >= 1,
+      "COV7-1: before_provider_request acquired a slot (token held or queued)");
+    probeQ.reset();
+
+    // (b) message_end with an Umans assistant message: releases the main-turn
+    // slot (mainTurnRelease cleared). After this, turn_end/agent_end are no-ops.
+    await dispatch("message_end", makeCtx({ model: { provider: "umans", id: "umans-flash" } }));
+    // The token must be released (no longer held by this process).
+    const probeQ2 = createConcurrencyQueue({ stateFile });
+    assert(probeQ2.snapshot().tokenHeld === false,
+      "COV7-1: message_end released the main-turn slot (token freed)");
+    probeQ2.reset();
+
+    // (c) turn_end + agent_end AFTER message_end are no-ops (token already
+    // released — calling releaseMainTurn on an undefined mainTurnRelease is a
+    // no-op, and the token stays free).
+    await dispatch("turn_end", makeCtx());
+    await dispatch("agent_end", makeCtx());
+    const probeQ3 = createConcurrencyQueue({ stateFile });
+    assert(probeQ3.snapshot().tokenHeld === false,
+      "COV7-1: turn_end + agent_end after message_end are no-ops (token stays free)");
+    probeQ3.reset();
+
+    // (d) session_shutdown calls reset() — clears any waiter/token entry this
+    // process owns. After a clean message_end there's nothing to clear, but
+    // the handler must not throw + must drop the widget. Verify the widget is
+    // cleared (setWidget("umans", undefined)) as a proxy for reset() running.
+    await dispatch("session_shutdown", makeCtx());
+    assert(widgets.get("umans") === undefined,
+      "COV7-1: session_shutdown cleared the status widget (reset ran)");
+
+    // The /usage poll was actually called by acquireSlot (proves the wiring
+    // drove the real capacity-free path, not a stubbed queue).
+    assert(usageCalls > 0, "COV7-1: acquireSlot polled /v1/usage through the real wiring");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 console.log("\nall checks passed");
