@@ -483,6 +483,70 @@ export function sanitizeErrorBody(body: string): string {
   return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
 }
 
+/**
+ * Shared 429 handler: parse Retry-After (strict integer form only), clamp to
+ * MAX_PAUSE_429_MS, push the shared pause (PAUSE_REASON_429) so sibling pi
+ * processes back off, and return the resolved `until` deadline so the caller
+ * can notify. COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS)
+ * — the lost pause is bounded by the 120s watchdog + the 5s refreshUsage poll,
+ * so warn + swallow so the caller's turn is not aborted.
+ *
+ * CORR8-2: extracted from after_provider_response so the side-call sites
+ * (analyzeImage, searchWeb) push the SAME shared pause when they receive a
+ * 429. Per D6 each side-call consumes a real account concurrency slot, and
+ * per Umans docs each concurrency 429 deprioritizes the whole account ~30
+ * min — so a side-call 429 must back off siblings (and the main turn on its
+ * next launch), not merely throw.
+ *
+ * Accepts either a fetch Response (res.headers.get) or a pi after_provider_
+ * response event (event.headers[...]) — the Retry-After header lookup is
+ * duck-typed so the same helper drives all three sites.
+ */
+export function handle429(
+  source: { status: number; headers?: Headers | Record<string, string> | undefined | null },
+  concurrencyQueue: { pauseUntil(until: number, reason?: string | null): void },
+): number {
+  const retryAfter = readRetryAfter(source.headers);
+  let until = Date.now() + PRIORITY_BACKOFF_MS;
+  if (retryAfter) {
+    // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or an
+    // HTTP-date. We only accept the integer form: Number() accepts hex
+    // ("0x10"=16), scientific notation ("1e10"=1e10), and other misparses
+    // that can wedge the queue (S2/S4). Parse strictly and cap the resulting
+    // deadline at now + MAX_PAUSE_429_MS via clampPauseUntil (ADV4-2: a
+    // 429-sourced pause is clamped tighter than the 5h ceiling so a
+    // misconfigured UMANS_BASE_URL returning 429 forever cannot wedge the
+    // account for hours; pauseUntil also enforces this ceiling).
+    const trimmed = String(retryAfter).trim();
+    if (/^\d+$/.test(trimmed)) {
+      const secs = parseInt(trimmed, 10);
+      if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000, Date.now(), MAX_PAUSE_429_MS);
+    }
+  }
+  try {
+    concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
+  } catch (err) {
+    console.warn("umans: pauseUntil threw in 429 handler (continuing):", err instanceof Error ? err.message : err);
+  }
+  return until;
+}
+
+/** Duck-typed Retry-After header lookup (fetch Headers .get OR a plain record). */
+function readRetryAfter(headers: Headers | Record<string, string> | undefined | null): string | undefined {
+  if (!headers) return undefined;
+  // fetch Response.headers (Headers) exposes .get; pi's after_provider_response
+  // event.headers is a plain record indexed by lowercased header name.
+  if (typeof (headers as Headers).get === "function") {
+    return (headers as Headers).get("retry-after") ?? undefined;
+  }
+  const rec = headers as Record<string, string>;
+  // Try exact + case-insensitive (Retry-After / retry-after / RETRY-AFTER).
+  for (const k of Object.keys(rec)) {
+    if (k.toLowerCase() === "retry-after") return rec[k];
+  }
+  return undefined;
+}
+
 /*
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
@@ -514,6 +578,7 @@ async function analyzeImage(
   image: { data: string; mimeType: string },
   prompt: string,
   signal?: AbortSignal,
+  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
 ): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), VISION_TIMEOUT_MS);
@@ -551,6 +616,14 @@ async function analyzeImage(
       signal: ctrl.signal,
     });
     if (!res.ok) {
+      // CORR8-2: a 429 from a side-call deprioritizes the whole account too
+      // (per D6 the side-call consumes a real concurrency slot). Push the
+      // shared pause so sibling pi processes (and the main turn on its next
+      // launch) back off — do NOT merely throw. The helper parses Retry-After
+      // (strict) + clamps to MAX_PAUSE_429_MS + calls pauseUntil (try/catch).
+      if (res.status === 429 && concurrencyQueue) {
+        handle429(res, concurrencyQueue);
+      }
       const txt = await res.text().catch(() => "");
       // SEC7-4: cap + sanitize the gateway error body before echoing it (cap 80,
       // strip non-printable / ANSI-escape) so a crafted body cannot inject
@@ -587,6 +660,7 @@ async function searchWeb(
   baseUrl: string,
   query: string,
   signal?: AbortSignal,
+  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
 ): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SEARCH_TIMEOUT_MS);
@@ -623,6 +697,14 @@ async function searchWeb(
       signal: ctrl.signal,
     });
     if (!res.ok) {
+      // CORR8-2: a 429 from a side-call deprioritizes the whole account too
+      // (per D6 the side-call consumes a real concurrency slot). Push the
+      // shared pause so sibling pi processes (and the main turn on its next
+      // launch) back off — do NOT merely throw. The helper parses Retry-After
+      // (strict) + clamps to MAX_PAUSE_429_MS + calls pauseUntil (try/catch).
+      if (res.status === 429 && concurrencyQueue) {
+        handle429(res, concurrencyQueue);
+      }
       const txt = await res.text().catch(() => "");
       // SEC7-4: cap + sanitize the gateway error body before echoing it.
       const safe = sanitizeErrorBody(txt);
@@ -1232,7 +1314,7 @@ export default async function (pi: ExtensionAPI) {
       // the main turn's slot.
       const release = await acquireSlot(apiKey, signal);
       try {
-        const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
+        const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal, concurrencyQueue);
         return { content: [{ type: "text", text: results }], details: {} };
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
@@ -1318,6 +1400,7 @@ export default async function (pi: ExtensionAPI) {
             { data: img.data, mimeType: img.mimeType },
             VISION_ANALYSIS_PROMPT,
             ctx?.signal,
+            concurrencyQueue,
           );
         } catch (err) {
           const m = err instanceof Error ? err.message : String(err);
@@ -1395,7 +1478,7 @@ export default async function (pi: ExtensionAPI) {
         // manage their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, signal);
         try {
-          const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
+          const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal, concurrencyQueue);
           return { content: [{ type: "text", text: answer }], details: {} };
         } catch (err) {
           const m = err instanceof Error ? err.message : String(err);
@@ -1672,32 +1755,10 @@ export default async function (pi: ExtensionAPI) {
     // immediately re-launching. Per Umans docs, each 429 deprioritizes the
     // account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
-      const retryAfter = event.headers?.["retry-after"];
-      let until = Date.now() + PRIORITY_BACKOFF_MS;
-      if (retryAfter) {
-        // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or
-        // an HTTP-date. We only accept the integer form: Number() accepts
-        // hex ("0x10"=16), scientific notation ("1e10"=1e10), and other
-        // misparses that can wedge the queue (S2/S4). Parse strictly and cap
-        // the resulting deadline at now + MAX_PAUSE_429_MS via clampPauseUntil
-        // (ADV4-2: a 429-sourced pause is clamped tighter than the 5h ceiling
-        // so a misconfigured UMANS_BASE_URL returning 429 forever cannot wedge
-        // the account for hours; pauseUntil also enforces this ceiling).
-        const trimmed = String(retryAfter).trim();
-        if (/^\d+$/.test(trimmed)) {
-          const secs = parseInt(trimmed, 10);
-          if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000, Date.now(), MAX_PAUSE_429_MS);
-        }
-      }
-      // COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS).
-      // The lost pause is bounded by the 120s watchdog + the 5s refreshUsage
-      // poll, and the 429 notify still fires below. Warn + swallow so the
-      // after_provider_response handler doesn't propagate a disk error.
-      try {
-        concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
-      } catch (err) {
-        console.warn("umans: pauseUntil threw in 429 handler (continuing):", err instanceof Error ? err.message : err);
-      }
+      // CORR8-2: delegate to the shared handle429 helper (also used by
+      // analyzeImage + searchWeb) so every 429 site parses Retry-After the
+      // same way + pushes the shared pause with the same PAUSE_REASON_429 tag.
+      const until = handle429(event, concurrencyQueue);
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
         "warning",

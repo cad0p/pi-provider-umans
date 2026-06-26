@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody, handle429 } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -22,6 +22,7 @@ import {
   MAX_PAUSE_MS,
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
+  PRIORITY_BACKOFF_MS,
 } from "./concurrency-queue.ts";
 
 function vision(name: string, v: boolean | "via-handoff" = true, deprecation?: unknown) {
@@ -2955,6 +2956,82 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // An empty/whitespace body yields an empty string (caller omits the `: ` ).
   assert(sanitizeErrorBody("   ") === "", "SEC7-4: whitespace-only body -> empty");
   assert(sanitizeErrorBody("") === "", "SEC7-4: empty body -> empty");
+}
+
+// --- CORR8-2: side-call 429s (vision handoff, web search) push the shared pause ---
+// Per D6, analyzeImage + searchWeb each call acquireSlot because they "consume
+// a real account concurrency slot." Per Umans docs, each concurrency 429
+// deprioritizes the whole account ~30 min. Yet when a side-call received HTTP
+// 429 it merely threw — it did NOT call pauseUntil(until, PAUSE_REASON_429),
+// so sibling pi processes (and the main turn on its next launch) would not back
+// off. The shared handle429 helper is now called from all 3 sites
+// (analyzeImage, searchWeb, after_provider_response). Verify the helper writes
+// the shared pause (pausedUntil set, pausedReason === PAUSE_REASON_429) for both
+// a fetch-Response-shaped input + a pi-event-shaped input, honors Retry-After,
+// rejects hex/sci-notation, + clamps to MAX_PAUSE_429_MS.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr8-2-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // (a) fetch-Response shape (Headers .get): Retry-After 60 → pause 60s.
+  const resLike = new Response("{}", { status: 429, headers: { "retry-after": "60" } });
+  const untilA = handle429({ status: 429, headers: resLike.headers }, q);
+  const stA = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stA.pausedUntil === untilA, "CORR8-2: handle429 returns the written pausedUntil (fetch-Response shape)");
+  assert(stA.pausedUntil > Date.now() + 50_000, "CORR8-2: Retry-After 60s honored (pause ~60s)");
+  assert(stA.pausedReason === PAUSE_REASON_429, "CORR8-2: pause tagged PAUSE_REASON_429 (fetch-Response shape)");
+  q.clearPause({ force: true });
+
+  // (b) pi-event shape (record): Retry-After 120 → pause 120s.
+  const untilB = handle429({ status: 429, headers: { "retry-after": "120" } }, q);
+  const stB = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stB.pausedUntil === untilB, "CORR8-2: handle429 returns the written pausedUntil (pi-event shape)");
+  assert(stB.pausedUntil > Date.now() + 110_000, "CORR8-2: Retry-After 120s honored (pi-event shape)");
+  assert(stB.pausedReason === PAUSE_REASON_429, "CORR8-2: pause tagged PAUSE_REASON_429 (pi-event shape)");
+  q.clearPause({ force: true });
+
+  // (c) No Retry-After → falls back to PRIORITY_BACKOFF_MS (30s).
+  const untilC = handle429({ status: 429, headers: {} }, q);
+  const stC = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(untilC <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: no Retry-After → PRIORITY_BACKOFF_MS floor (30s)");
+  assert(stC.pausedReason === PAUSE_REASON_429, "CORR8-2: no Retry-After still tagged PAUSE_REASON_429");
+  q.clearPause({ force: true });
+
+  // (d) Hex/sci-notation Retry-After rejected → PRIORITY_BACKOFF_MS floor.
+  const untilHex = handle429({ status: 429, headers: { "retry-after": "0x10" } }, q);
+  assert(untilHex <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: hex Retry-After rejected → 30s floor");
+  q.clearPause({ force: true });
+  const untilSci = handle429({ status: 429, headers: { "retry-after": "1e10" } }, q);
+  assert(untilSci <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: sci-notation Retry-After rejected → 30s floor");
+  q.clearPause({ force: true });
+
+  // (e) Huge Retry-After clamped to MAX_PAUSE_429_MS (2.5 min), not 5h.
+  const untilHuge = handle429({ status: 429, headers: { "retry-after": "99999999" } }, q);
+  assert(untilHuge <= Date.now() + MAX_PAUSE_429_MS + 1_000, "CORR8-2: huge Retry-After clamped to MAX_PAUSE_429_MS (2.5 min)");
+  assert(untilHuge < Date.now() + MAX_PAUSE_MS, "CORR8-2: 429 pause tighter than the 5h ceiling");
+  q.clearPause({ force: true });
+
+  // (f) Case-insensitive header lookup (Retry-After / retry-after).
+  handle429({ status: 429, headers: { "Retry-After": "45" } }, q);
+  const stF = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stF.pausedUntil > Date.now() + 40_000, "CORR8-2: case-insensitive Retry-After header lookup");
+  q.clearPause({ force: true });
+
+  // (g) Non-429 status does not push a pause (the helper is 429-specific; callers
+  // guard on status === 429 before calling). Verify the helper itself doesn't
+  // refuse, but the caller's guard means a 200 doesn't reach it. We assert the
+  // caller pattern: only status 429 calls handle429. (The helper still writes a
+  // pause if called directly with a non-429 — that's the caller's contract.)
+  // Here we just verify a 429 with undefined headers doesn't throw.
+  let threw = false;
+  try { handle429({ status: 429, headers: undefined }, q); } catch { threw = true; }
+  assert(!threw, "CORR8-2: handle429 with undefined headers does not throw (PRIORITY_BACKOFF_MS floor)");
+  q.clearPause({ force: true });
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // --- SEC7-5: state file + lockfile created with mode 0600 (regression guard) ---
