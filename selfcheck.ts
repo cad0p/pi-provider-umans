@@ -2363,76 +2363,75 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
-// --- CMP7-1: lockfile carries PID+nonce for fast-path reclaim of a dead holder ---
-// Recovery was mtime-only — yanked when now - mtimeMs > 2s regardless of whether
-// the holder is still alive, so a slow-but-legitimate mutate (disk pressure)
-// holding >2s had its lockfile yanked mid-write. The lockfile now carries the
-// holder PID + a nonce; stale-recovery reads it + reclaims immediately if the
-// PID is dead (no 2s wait), falling back to the mtime check when alive. A
-// malformed/empty lockfile also falls back to mtime (graceful).
+// --- CMP7-1: lockfile reclaim relies on the mtime ceiling (SEC9-3 dropped the PID fast-path) ---
+// Recovery was mtime-only — yanked when now - mtimeMs > lockTimeoutMs. CMP7-1
+// added a PID-based fast-path that read the lockfile content; SEC9-3 dropped
+// that read (TOCTOU between lstatSync + readFileSync). The mtime ceiling is
+// now the sole reclaim bound: a stale lockfile is reclaimed regardless of
+// holder PID; a fresh lockfile spins until the ceiling. A malformed/oversized/
+// symlink lockfile is unlinked without being followed.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-cmp7-1-"));
   const stateFile = join(dir, "state.json");
   const lockFile = `${stateFile}.lock`;
-  const { writeFileSync, readFileSync, utimesSync } = await import("node:fs");
+  const { writeFileSync, readFileSync, utimesSync, symlinkSync, lstatSync } = await import("node:fs");
 
-  // Plant a lockfile with a DEAD holder PID (99999999 — unlikely to exist) +
-  // a FRESH mtime (within the 2s ceiling). The old mtime-only recovery would
-  // NOT reclaim (mtime is fresh); the new PID-based fast-path reclaims
-  // immediately because the holder is dead.
+  // Plant a lockfile with a STALE mtime (past the 2s ceiling). The holder PID
+  // is dead (99999999) but that no longer matters — the mtime ceiling reclaims.
   writeFileSync(lockFile, JSON.stringify({ pid: 99_999_999, nonce: "abc" }), { mode: 0o600, encoding: "utf8" });
-  const freshTime = Date.now() / 1000;
-  utimesSync(lockFile, freshTime, freshTime); // fresh mtime — within 2s
+  const staleTime0 = (Date.now() / 1000) - 10; // 10s ago — past 2s ceiling
+  utimesSync(lockFile, staleTime0, staleTime0);
 
-  // join() -> acquireLock must reclaim the dead-holder lockfile immediately
-  // (no 2s spin wait) + write through.
+  // join() -> acquireLock reclaims the stale lockfile immediately (no spin).
   const t0 = Date.now();
   const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id = q.join()!;
   const elapsed = Date.now() - t0;
-  assert(id !== null, "CMP7-1: join reclaims a dead-holder lockfile (PID dead)");
-  assert(elapsed < 1_000, `CMP7-1: dead-holder reclaim is immediate (no 2s wait) (took ${elapsed}ms)`);
+  assert(id !== null, "CMP7-1: join reclaims a stale lockfile (mtime ceiling)");
+  assert(elapsed < 1_000, `CMP7-1: stale lockfile reclaim is immediate (no 2s wait) (took ${elapsed}ms)`);
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 1 && st.waiters[0].id === id,
-    "CMP7-1: dead-holder lockfile reclaimed + mutate wrote through");
+    "CMP7-1: stale lockfile reclaimed + mutate wrote through");
 
   q.reset();
 
   // Plant a lockfile with a LIVE holder PID (this process) + a FRESH mtime.
-  // The PID is alive so the fast-path does NOT reclaim immediately. The lock is
-  // only reclaimed once the mtime exceeds the ceiling (same as the pre-CMP7-1
-  // behavior — CMP7-1's improvement is the dead-holder fast-path, not changing
-  // the live-holder mtime ceiling). Assert the fast-path did NOT fire: the
-  // acquire spins for a while (not immediate) before the mtime ceiling reclaims.
+  // The fresh mtime means NOT stale, so acquire spins until the mtime ceiling.
   writeFileSync(lockFile, JSON.stringify({ pid: process.pid, nonce: "xyz" }), { mode: 0o600, encoding: "utf8" });
+  const freshTime = Date.now() / 1000;
   utimesSync(lockFile, freshTime, freshTime);
   const q2 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 300, lockRetryMs: 5 });
   const t1 = Date.now();
   const id2 = q2.join()!; // spins until the 300ms mtime ceiling, then reclaims
   const elapsed2 = Date.now() - t1;
-  assert(id2 !== null, "CMP7-1: live-holder lockfile eventually reclaimed via mtime ceiling");
-  assert(elapsed2 >= 200, `CMP7-1: live-holder fast-path did NOT fire (spun ${elapsed2}ms until mtime ceiling, not immediate)`);
+  assert(id2 !== null, "CMP7-1: fresh lockfile eventually reclaimed via mtime ceiling");
+  assert(elapsed2 >= 200, `CMP7-1: fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
   q2.reset();
 
-  // Malformed lockfile content (not JSON / missing pid) falls back to the
-  // mtime check. A fresh mtime + malformed content -> spin (not reclaimed); a
-  // stale mtime + malformed content -> reclaimed by mtime fallback.
+  // Malformed lockfile content (not JSON) is not read at all post-SEC9-3; the
+  // mtime ceiling is the sole bound. A stale mtime + malformed content -> reclaimed.
   writeFileSync(lockFile, "not-json", { mode: 0o600 });
   const staleTime = (Date.now() / 1000) - 10; // 10s ago — past 2s ceiling
   utimesSync(lockFile, staleTime, staleTime);
   const q3 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id3 = q3.join()!;
-  assert(id3 !== null, "CMP7-1: malformed lockfile content falls back to mtime check (reclaimed when stale)");
+  assert(id3 !== null, "CMP7-1: malformed lockfile content reclaimed via mtime ceiling when stale");
   q3.reset();
 
-  // SEC9-2/SEC8-1: an oversized lockfile (> MAX_LOCKFILE_BYTES = 256) must not
-  // be read into memory; the PID fast-path falls back to the mtime check.
-  writeFileSync(lockFile, "{\"pid\":" + " ".repeat(2_000) + "}", { mode: 0o600 });
-  const staleTime2 = (Date.now() / 1000) - 10; // past ceiling so mtime fallback reclaims
-  utimesSync(lockFile, staleTime2, staleTime2);
+  // SEC9-3: a symlink lockfile is unlinked directly (NOT followed). lstatSync
+  // detects non-regular files + unlinkSync removes the symlink itself.
+  const target = join(dir, "target");
+  writeFileSync(target, "secret", { mode: 0o600 });
+  try { unlinkSync(lockFile); } catch { /* may not exist */ }
+  symlinkSync(target, lockFile);
   const q4 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id4 = q4.join()!;
-  assert(id4 !== null, "SEC9-2: oversized lockfile falls back to mtime reclaim (no large read)");
+  assert(id4 !== null, "SEC9-3: symlink lockfile reclaimed (not followed)");
+  // The symlink itself is gone; the target is untouched.
+  let symlinkGone = false;
+  try { lstatSync(lockFile); } catch { symlinkGone = true; }
+  assert(symlinkGone, "SEC9-3: symlink lockfile unlinked (not followed)");
+  assert(readFileSync(target, "utf8") === "secret", "SEC9-3: symlink target untouched");
   q4.reset();
 
   rmSync(dir, { recursive: true, force: true });

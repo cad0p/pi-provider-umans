@@ -166,12 +166,6 @@ export const PAUSE_REASON_429 = "HTTP 429 from gateway";
  * file first + bails to the empty-state catch when st.size exceeds this.
  */
 export const MAX_STATE_BYTES = 1_000_000;
-/**
- * SEC9-2/SEC8-1: upper bound on the lockfile size. Legitimate content is
- * `{"pid":12345}` (< 16 bytes); a poisoned lockfile would be caught by the
- * mtime ceiling regardless, but bounding the read avoids a large-file hazard.
- */
-export const MAX_LOCKFILE_BYTES = 256;
 
 /**
  * Clamp a candidate pause deadline to now + MAX_PAUSE_MS (or a tighter ceiling
@@ -611,26 +605,15 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }
-        // CMP7-1: fast-path reclaim if the holder PID is dead. Read the
-        // lockfile content (lstat already confirmed it's a regular file, so
-        // readFileSync does not follow a symlink here). Malformed/empty content
-        // falls back to the mtime check below.
-        // SEC9-2/SEC8-1: bound the read — legitimate content is {"pid":N} (<16B);
-        // a poisoned lockfile is caught by the mtime ceiling regardless, but
-        // bounding avoids a large-file hazard.
-        let holderPid: number | undefined;
-        try {
-          if (st.size > MAX_LOCKFILE_BYTES) {
-            throw new Error("lockfile too large");
-          }
-          const raw = readFileSync(lockFile, "utf8");
-          const parsed = JSON.parse(raw) as { pid?: unknown };
-          if (typeof parsed.pid === "number" && Number.isFinite(parsed.pid)) {
-            holderPid = parsed.pid;
-          }
-        } catch { /* malformed/empty — fall back to mtime */ }
-        const holderDead = holderPid !== undefined && isPidDead(holderPid);
-        if (holderDead || cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
+        // SEC9-3: the mtime ceiling is the authoritative reclaim bound. The
+        // PID-based fast-path (CMP7-1) was an optimization that read the
+        // lockfile content via readFileSync — dropped here to remove the
+        // TOCTOU between lstatSync (confirms regular file) + readFileSync
+        // (follows symlinks) that an attacker could exploit to wedge or leak.
+        // The mtime check alone is correct + removes the read vector entirely;
+        // a slow-but-legitimate mutate holding past lockTimeoutMs is reclaimed
+        // (bounded stall, no lost write — O_EXCL + atomic rename preserve it).
+        if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }
