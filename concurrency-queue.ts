@@ -112,7 +112,7 @@ const DEFAULT_STATE_FILE = `${homedir()}/.pi/agent/umans-concurrency.json`;
 // token. 30s was too tight and reaped tokens held by legitimately long streaming
 // turns, racing a sibling launch the same way as the message_end release race.
 const DEFAULT_STALE_TOKEN_MS = 120_000;
-const DEFAULT_STALE_WAITER_MS = 5 * 60_000;
+const DEFAULT_STALE_WAITER_MS = 5 * 60 * 1000;
 const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
 
@@ -870,12 +870,8 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // safe — token release is closure-captured per waitForLaunch — but a Set is
   // used here because waiters accumulate.
   const ourWaiterIds: Set<string> = new Set();
-  // CLN7-1: ourWaiterIds (Set) is the sole source of truth for this process's
-  // waiter ids. The dead `let ourWaiterId` single-slot (leftover from the
-  // COV6-2 Set refactor) was written in join() and cleared in release/cancel/
-  // reset but NEVER read to drive any behavior — cancel takes ourId as a
-  // parameter and consults the Set. Deleted. The ourTokenId single-slot is
-  // safe (token release is closure-captured per waitForLaunch) — kept.
+  // CLN7-1: ourWaiterIds (Set) is the sole source of truth. Deleted the dead
+  // let ourWaiterId single-slot.
   // CORR7-2: a per-instance AbortController that reset() aborts to stop any
   // in-flight waitForLaunch poll loop on the same queue instance. Without it,
   // reset() splices our waiter id from the file, but a concurrent poll loop's

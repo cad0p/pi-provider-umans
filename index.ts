@@ -122,7 +122,7 @@ const CAPACITY_POLL_TIMEOUT_MS = 60_000;
  *   into a still-deprioritized account.
  * - `wait`: keep polling (300ms + jitter).
  */
-export type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
+type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
 export function decideLaunch(opts: {
   isFree: boolean;
   elapsedMs: number;
@@ -557,8 +557,8 @@ function readRetryAfter(headers: Headers | Record<string, string> | undefined | 
 // CLN2-L2: ConcurrencyQueue is imported directly (line 45) and used at the
 // factory call site. CLN4-1: the speculative type exports (QueueState /
 // WaiterEntry / TokenState / QueueConfig / CapacitySnapshot / CapacityInputs)
-// and newId were unexported — they had no in-repo consumer (not even tests).
-// External consumers should import from concurrency-queue.ts directly.
+// had no in-repo consumer (not even tests). External consumers should import
+// from concurrency-queue.ts directly.
 // Local type alias for the release function returned by acquireSlot.
 type Release = () => void;
 
