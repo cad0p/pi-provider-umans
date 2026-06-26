@@ -1025,4 +1025,59 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- ADV3-1: drain loop resilient to a throwing release fn ---
+// releaseSlot wraps release() in try/catch/finally so a throw (e.g. O_EXCL
+// lock timeout after 2s, EACCES, ENOSPC) is swallowed and the drain continues;
+// the Set.delete + updateStatus live in a finally so the slot is removed even
+// on throw (prevents an infinite drain loop). releaseSlot is a closure in
+// index.ts (not exported), so this probe replicates the exact drain shape
+// (while (size) releaseOldest() over a Set<Release>) and asserts: (1) every
+// slot is removed even when release() throws, (2) the drain terminates, (3)
+// a non-throwing slot interspersed with throwing ones is still released. This
+// pins the contract the closure must satisfy; if the closure's shape is later
+// regressed (e.g. delete moved before try, or catch omitted), this probe still
+// encodes the required invariant.
+{
+  type Release = () => void;
+  const inflightSlots = new Set<Release>();
+  let released: string[] = [];
+  let updateCount = 0;
+  // Mirror the releaseSlot shape from index.ts (ADV3-1).
+  function releaseSlot(release: Release | undefined): void {
+    if (!release) return;
+    try {
+      try {
+        release();
+      } catch (err) {
+        // Transient (lock timeout) or environmental; the watchdog reaps.
+        console.warn("umans: concurrency release threw (drain continues):", err instanceof Error ? err.message : err);
+      }
+    } finally {
+      inflightSlots.delete(release);
+      updateCount++;
+    }
+  }
+  function releaseOldest(): void {
+    const oldest = inflightSlots.values().next().value;
+    releaseSlot(oldest);
+  }
+
+  // Slot A throws, slot B is clean, slot C throws — all must be drained.
+  const A: Release = () => { throw new Error("A: lock timeout"); };
+  const B: Release = () => { released.push("B"); };
+  const C: Release = () => { throw new Error("C: EACCES"); };
+  inflightSlots.add(A);
+  inflightSlots.add(B);
+  inflightSlots.add(C);
+
+  // The drain must terminate (not loop forever) and remove all slots.
+  let guard = 0;
+  while (inflightSlots.size && guard++ < 100) releaseOldest();
+
+  assert(inflightSlots.size === 0, "ADV3-1: drain removes all slots even when release() throws");
+  assert(guard < 100, "ADV3-1: drain terminates (no infinite loop on a throwing slot)");
+  assert(released.length === 1 && released[0] === "B", "ADV3-1: clean slot still released between throwing ones");
+  assert(updateCount === 3, "ADV3-1: updateStatus ran once per drained slot (in finally)");
+}
+
 console.log("\nall checks passed");

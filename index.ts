@@ -1253,11 +1253,29 @@ export default async function (pi: ExtensionAPI) {
   // turn_end and agent_end are safety nets for turns that error before
   // message_end fires.
   const inflightSlots = new Set<Release>();
+  // ADV3-1: release() calls mutate() -> withLock -> acquireLock, which can
+  // throw (e.g. O_EXCL lock timeout after 2s per CMP-MED-2, EACCES, ENOSPC).
+  // A throw propagating out of releaseSlot would abort the while(inflightSlots.size)
+  // drains in agent_end / session_shutdown mid-loop, leaking the remaining slots'
+  // tokens/waiters (bounded only by the 120s watchdog). Wrap release() in a
+  // try/catch: on throw, warn (the lock-timeout is transient; the watchdog will
+  // reap the stale token/waiter) and swallow so the drain continues. Keep the
+  // Set.delete + updateStatus in a finally so the slot is removed from the set
+  // even on throw — otherwise a repeatedly-throwing slot would loop forever.
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
-    inflightSlots.delete(release);
-    release();
-    updateStatus(undefined as any);
+    try {
+      try {
+        release();
+      } catch (err) {
+        // Transient (lock timeout) or environmental (EACCES/ENOSPC); the
+        // 120s watchdog reaps the stale token/waiter entry regardless.
+        console.warn("umans: concurrency release threw (drain continues):", err instanceof Error ? err.message : err);
+      }
+    } finally {
+      inflightSlots.delete(release);
+      updateStatus(undefined as any);
+    }
   }
   // CLN2-L5: message_end and turn_end both release the oldest inflight slot
   // (one-per-turn, FIFO order). Dedupe the two-line body into a helper. The
