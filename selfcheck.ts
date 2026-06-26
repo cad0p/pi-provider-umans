@@ -989,8 +989,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // --- ADV-1: stale .tmp files are reaped by writeStateAtomic; fresh ones are not ---
 // A crashed writer (killed between writeFileSync and renameSync) leaves a
 // <path>.<pid>.tmp that would accumulate forever. writeStateAtomic now
-// best-effort unlinks any <path>.*.tmp older than 60s. A fresh .tmp (just
-// written by another process) has a current mtime and must be left alone.
+// best-effort unlinks any <path>.*.tmp older than STALE_TMP_MS (10s). A fresh
+// .tmp (just written by another process) has a current mtime and must be left
+// alone.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
@@ -999,7 +1000,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Pre-create a stale .tmp (old mtime) simulating a crashed writer.
   const staleTmp = `${stateFile}.99999.tmp`;
   writeFileSync(staleTmp, "{}", { mode: 0o600 });
-  const oldTime = (Date.now() / 1000) - 120; // 120s ago — past the 60s threshold
+  const oldTime = (Date.now() / 1000) - 120; // 120s ago — past the 10s threshold
   utimesSync(staleTmp, oldTime, oldTime);
 
   // Pre-create a fresh .tmp (current mtime) simulating a live writer mid-write.

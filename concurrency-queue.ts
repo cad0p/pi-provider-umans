@@ -455,7 +455,7 @@ function writeStateAtomic(path: string, state: QueueState): void {
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
   // ADV-1: best-effort reap of stale .tmp files left by a crashed writer (a
   // process killed between writeFileSync and renameSync). We unlink any
-  // <path>.*.tmp older than STALE_TMP_MS (60s). A fresh .tmp just written by
+  // <path>.*.tmp older than STALE_TMP_MS (10s). A fresh .tmp just written by
   // another live process has a current mtime and is left alone. Mirrors the
   // lockfile mtime-recovery pattern. Best-effort: errors are swallowed.
   reapStaleTmps(path);
@@ -464,8 +464,16 @@ function writeStateAtomic(path: string, state: QueueState): void {
   renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
 }
 
-/** Max age of a .tmp file before it's considered a crashed writer's leftover. */
-const STALE_TMP_MS = 60_000;
+/**
+ * Max age of a .tmp file before it's considered a crashed writer's leftover.
+ * Matches DEFAULT_LOCK_TIMEOUT_MS (2s): no legitimate writer holds the lock
+ * longer than the lock timeout (the lockfile is yanked at 2s), so a .tmp older
+ * than 2s is by construction from a crashed/reaped writer. The reaper is
+ * best-effort cleanup — the actual safety boundary is the atomic renameSync
+ * (a crashed writer's .tmp never reaches `path`, and rename is atomic on
+ * POSIX & Windows). 5x the lock timeout (10s) gives clock-resolution slack.
+ */
+const STALE_TMP_MS = 10_000;
 
 /** Best-effort unlink of stale <path>.*.tmp files older than STALE_TMP_MS. */
 function reapStaleTmps(path: string): void {
