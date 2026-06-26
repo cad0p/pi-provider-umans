@@ -522,10 +522,11 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- SEC9-2/SEC8-1: readFileSync size bound on state file ---
+// --- SEC9-2/SEC8-1 + SEC9-4: readFileSync size bound + non-regular-file guard on state file ---
 // A poisoned/runaway state file (e.g. 1 GB) would OOM/stall the pi process
-// before JSON.parse. readState stats first + bails to empty state when
-// st.size > MAX_STATE_BYTES (1 MB; legitimate state is <2 KB).
+// before JSON.parse. A FIFO/pipe or character device would block readFileSync
+// indefinitely (wedging mutate + the O_EXCL lock). readState lstats first + bails
+// to empty state when !st.isFile() || st.size > MAX_STATE_BYTES (1 MB).
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
@@ -534,6 +535,19 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   const st = readState(stateFile);
   assert(st.waiters.length === 0 && st.token === null && st.pausedUntil === 0,
     "SEC9-2: oversized state file returns empty state (no OOM)");
+
+  // SEC9-4: a FIFO (named pipe) would block readFileSync forever. readState
+  // must detect non-regular files via lstatSync + return empty state (no hang).
+  const fifoPath = join(dir, "state.fifo");
+  const { execSync } = await import("node:child_process");
+  try {
+    execSync(`mkfifo "${fifoPath}"`);
+    const fst = readState(fifoPath);
+    assert(fst.waiters.length === 0 && fst.token === null,
+      "SEC9-4: FIFO state file returns empty state (no hang)");
+  } catch {
+    // mkfifo unavailable (non-POSIX) — skip the FIFO assertion gracefully.
+  }
   rmSync(dir, { recursive: true, force: true });
 }
 

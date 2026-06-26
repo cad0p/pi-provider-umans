@@ -393,11 +393,16 @@ function isTokenState(t: unknown): t is TokenState {
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string): QueueState {
   try {
-    // SEC9-2/SEC8-1: stat before readFileSync. A poisoned/runaway state file
-    // (e.g. 1 GB) would OOM/stall the pi process before JSON.parse. Bail to
-    // the empty-state catch when st.size > MAX_STATE_BYTES.
-    const st = statSync(path);
-    if (st.size > MAX_STATE_BYTES) {
+    // SEC9-2/SEC8-1 + SEC9-4: lstat before readFileSync. Combines two guards
+    // in one stat call:
+    //  - size bound: a poisoned/runaway state file (e.g. 1 GB) would OOM/stall
+    //    the pi process before JSON.parse. Bail when st.size > MAX_STATE_BYTES.
+    //  - non-regular file: a FIFO/pipe or character device would block
+    //    readFileSync indefinitely (wedging the mutate call + the O_EXCL lock).
+    // lstatSync (not statSync) so a symlink state file is detected as
+    // non-regular + treated as empty without following the link.
+    const st = lstatSync(path);
+    if (!st.isFile() || st.size > MAX_STATE_BYTES) {
       return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
     }
     const raw = readFileSync(path, "utf8");
