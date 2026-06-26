@@ -31,7 +31,9 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build'",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types selfcheck.ts",
+    "test:integration": "./test-concurrency-gate.sh"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.7",
