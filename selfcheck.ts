@@ -1707,8 +1707,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // A process that join()ed but is still queued (hasn't claimed the token) has
 // ourTokenId === null. Previously reset() was a no-op in this state, leaking
 // the waiter for staleWaiterMs (5 min) if the process didn't exit — blocking
-// siblings behind a dead-PID entry. reset() now tracks ourWaiterId (set in
-// join) and splices out that waiter entry even when ourTokenId is null.
+// siblings behind a dead-PID entry. reset() now tracks every id in
+// ourWaiterIds (the Set populated by join) and splices out each waiter entry
+// even when ourTokenId is null.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
@@ -2363,9 +2364,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     const ourEntries = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).length;
     assert(ourEntries <= 1,
       `CORR8-3: retry did not orphan a waiter (our entries=${ourEntries}, expected <=1)`);
-    // And if a token is held by us, it must be the SAME id as our single waiter
-    // entry (not a stale first-acquire token orphaned alongside the second).
-    if (parsed.token && parsed.token.pid === process.pid) {
+    // And if a token is held by us alongside our waiter entry, it must be the
+    // SAME id (not a stale first-acquire token orphaned alongside the second).
+    // When ourEntries === 0 the token-holder's waiter entry has already been
+    // promoted/removed — nothing to cross-check.
+    if (parsed.token && parsed.token.pid === process.pid && ourEntries === 1) {
       const ourWaiterIds = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).map((w: any) => w.id);
       assert(ourWaiterIds.includes(parsed.token.id),
         "CORR8-3: held token matches our waiter entry (no orphaned first-acquire token)");
@@ -2529,15 +2532,18 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // Plant a lockfile with a LIVE holder PID (this process) + a FRESH mtime.
   // The fresh mtime means NOT stale, so acquire spins until the mtime ceiling.
+  // Set the mtime ~80ms in the past so the mtime ceiling (now + ~220ms) fires
+  // comfortably before the acquire deadline (now + lockTimeoutMs=300ms) —
+  // avoiding a deadline/mtime race under scheduler jitter.
   writeFileSync(lockFile, JSON.stringify({ pid: process.pid }), { mode: 0o600, encoding: "utf8" });
-  const freshTime = Date.now() / 1000;
+  const freshTime = (Date.now() / 1000) - 0.08;
   utimesSync(lockFile, freshTime, freshTime);
   const q2 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 300, lockRetryMs: 5 });
   const t1 = Date.now();
-  const id2 = q2.join()!; // spins until the 300ms mtime ceiling, then reclaims
+  const id2 = q2.join()!; // spins until the mtime ceiling, then reclaims
   const elapsed2 = Date.now() - t1;
   assert(id2 !== null, "CMP7-1: fresh lockfile eventually reclaimed via mtime ceiling");
-  assert(elapsed2 >= 200, `CMP7-1: fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
+  assert(elapsed2 >= 150, `CMP7-1: fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
   q2.reset();
 
   // Malformed lockfile content (not JSON) is not read at all post-SEC9-3; the

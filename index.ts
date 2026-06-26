@@ -87,6 +87,7 @@ const VISION_MODEL_ENV = "UMANS_VISION_MODEL";
 const SEARCH_DISABLE_ENV = "UMANS_SEARCH_DISABLE";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
 const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
+const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
 const VISION_MAX_TOKENS = 1024;
 const VISION_TIMEOUT_MS = 60_000;
 const VISION_ANALYSIS_PROMPT =
@@ -855,7 +856,7 @@ export default async function (pi: ExtensionAPI) {
   // handy for local multi-process serialization experiments. No-op in normal
   // use (the default path is used when unset/empty).
   const concurrencyDisabled = process.env[CONCURRENCY_DISABLE_ENV] === "1";
-  const concurrencyStateFile = process.env.UMANS_CONCURRENCY_STATE_FILE?.trim() || undefined;
+  const concurrencyStateFile = process.env[CONCURRENCY_STATE_FILE_ENV]?.trim() || undefined;
   const concurrencyQueue: ConcurrencyQueue = createConcurrencyQueue({
     disabled: concurrencyDisabled,
     ...(concurrencyStateFile ? { stateFile: concurrencyStateFile } : {}),
@@ -950,7 +951,8 @@ export default async function (pi: ExtensionAPI) {
   // fetchUsageSnapshot both build the identical AbortController + fetch +
   // JSON-parse skeleton; this helper dedupes ~15 lines. Returns the parsed
   // { limits, usage } on a 2xx, or null on any failure (caller decides how to
-  // handle — refreshUsage leaves cached values, fetchUsageSnapshot retries).
+  // handle — refreshUsage leaves cached values, fetchUsageSnapshot returns null
+  // and the caller fails-open).
   // CMP7-3: accept an optional parentSignal (the turn's AbortSignal) + compose
   // it into the fetch signal so a Ctrl-C mid capacity-poll aborts the in-flight
   // /usage fetch immediately instead of waiting up to 3s for the timeout.
@@ -1665,13 +1667,13 @@ export default async function (pi: ExtensionAPI) {
   let mainTurnRelease: Release | undefined;
   // ADV3-1: release() calls mutate() -> withLock -> acquireLock, which can
   // throw (e.g. O_EXCL lock timeout after 2s per CMP-MED-2, EACCES, ENOSPC).
-  // A throw propagating out of releaseSlot would abort the drains in
-  // agent_end / session_shutdown mid-loop, leaking the token until the 120s
+  // A throw propagating out of releaseSlot would abort the caller (message_end /
+  // turn_end / agent_end / session_shutdown), leaking the token until the 120s
   // watchdog. Wrap release() in a try/catch: on throw, warn (the lock-timeout
   // is transient; the watchdog will reap the stale token/waiter) and swallow
-  // so the drain continues. Keep the slot clear + updateStatus in a finally so
-  // the slot is released even on throw — otherwise a repeatedly-throwing slot
-  // would loop forever.
+  // so the single-slot release completes. Keep the slot clear + updateStatus in
+  // a finally so the slot is released even on throw — otherwise a
+  // repeatedly-throwing slot would loop forever.
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
     try {
@@ -1680,7 +1682,7 @@ export default async function (pi: ExtensionAPI) {
       } catch (err) {
         // Transient (lock timeout) or environmental (EACCES/ENOSPC); the
         // 120s watchdog reaps the stale token/waiter entry regardless.
-        console.warn("umans: concurrency release threw (drain continues):", err instanceof Error ? err.message : err);
+        console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
       }
     } finally {
       if (mainTurnRelease === release) mainTurnRelease = undefined;
@@ -1689,7 +1691,7 @@ export default async function (pi: ExtensionAPI) {
   }
   // Release the main-turn slot if held. Called at assistant message_end
   // (primary), turn_end / agent_end (safety nets), and session_shutdown
-  // (drain). At most one main-turn slot is ever outstanding (CORR5-3), so a
+  // (cleanup). At most one main-turn slot is ever outstanding (CORR5-3), so a
   // single release is sufficient.
   function releaseMainTurn(): void {
     releaseSlot(mainTurnRelease);
