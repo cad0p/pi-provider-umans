@@ -636,6 +636,12 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // our own and so the status bar can show "launching".
   let holdsToken = false;
   let ourTokenId: string | null = null;
+  // COV5-5 / ADV5-4: track our waiter id (set in join) alongside ourTokenId so
+  // reset() can splice out a queued-but-not-launched waiter. Without this, a
+  // process that join()ed but is still queued (ourTokenId === null) has reset()
+  // as a no-op, leaking the waiter for staleWaiterMs (5 min) if the process
+  // doesn't exit — blocking siblings behind a dead-PID entry.
+  let ourWaiterId: string | null = null;
 
   function mutate<T>(fn: (now: number, state: QueueState) => T): T {
     return withLock(cfg, lockFile, (now) => {
@@ -652,6 +658,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       mutate((now, state) => {
         state.waiters.push({ id, pid: ourPid(), ts: now });
       });
+      ourWaiterId = id;
       return id;
     },
 
@@ -736,6 +743,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
                   holdsToken = false;
                   ourTokenId = null;
                 }
+                if (ourWaiterId === ourId) {
+                  ourWaiterId = null;
+                }
               });
             });
             return;
@@ -814,6 +824,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           holdsToken = false;
           ourTokenId = null;
         }
+        if (ourWaiterId === ourId) {
+          ourWaiterId = null;
+        }
       });
     },
 
@@ -824,12 +837,18 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // sibling pi processes' queue state. Leave both files for natural expiry
       // (the watchdog reaps stale token/waiter entries) and stale-lockfile
       // recovery. Matches the scope of `cancel`.
+      // COV5-5 / ADV5-4: also splice out a queued-but-not-launched waiter
+      // (ourTokenId === null, ourWaiterId set). Without this, a process that
+      // join()ed but is still queued has reset() as a no-op, leaking the
+      // waiter for staleWaiterMs (5 min) if the process doesn't exit —
+      // blocking siblings behind a dead-PID entry.
       try {
         mutate((_now, state) => {
-          if (ourTokenId) {
-            const idx = state.waiters.findIndex((w) => w.id === ourTokenId);
+          const id = ourTokenId ?? ourWaiterId;
+          if (id) {
+            const idx = state.waiters.findIndex((w) => w.id === id);
             if (idx >= 0) state.waiters.splice(idx, 1);
-            if (state.token && state.token.id === ourTokenId) {
+            if (state.token && state.token.id === id) {
               state.token = null;
             }
           }
@@ -837,6 +856,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       } catch { /* ignore: lock unavailable on shutdown; watchdog will clean up */ }
       holdsToken = false;
       ourTokenId = null;
+      ourWaiterId = null;
     },
 
     holdsToken(): boolean {

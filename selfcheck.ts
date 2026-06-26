@@ -1175,6 +1175,54 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV5-5 / ADV5-4: reset() splices a queued-but-not-launched waiter ---
+// A process that join()ed but is still queued (hasn't claimed the token) has
+// ourTokenId === null. Previously reset() was a no-op in this state, leaking
+// the waiter for staleWaiterMs (5 min) if the process didn't exit — blocking
+// siblings behind a dead-PID entry. reset() now tracks ourWaiterId (set in
+// join) and splices out that waiter entry even when ourTokenId is null.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync, writeFileSync } = await import("node:fs");
+
+  // Seed the shared file with a sibling holding the token + a sibling waiter
+  // ahead of us, so our join()ed waiter is queued (not head) and cannot claim.
+  const now = Date.now();
+  const siblingState = {
+    waiters: [
+      { id: "sibling-head", pid: process.pid, ts: now },
+    ],
+    token: { id: "sibling-tok", pid: process.pid, ts: now },
+    pausedUntil: 0,
+    pausedReason: null,
+  };
+  writeFileSync(stateFile, JSON.stringify(siblingState));
+
+  // We join the queue (queued behind the sibling, token held — ourTokenId
+  // stays null). Then session_shutdown fires and reset() is called.
+  const q = createConcurrencyQueue({ stateFile });
+  const ourId = q.join();
+  assert(ourId !== null, "COV5-5: join returned a waiter id");
+  // Confirm our waiter is in the file before reset.
+  const before = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(before.waiters.some((w: { id: string }) => w.id === ourId),
+    "COV5-5: our waiter entry present in the file after join");
+
+  q.reset();
+
+  // Our waiter entry must be gone; the sibling's entries must remain.
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!after.waiters.some((w: { id: string }) => w.id === ourId),
+    "COV5-5: reset() splices our queued-but-not-launched waiter entry");
+  assert(after.waiters.some((w: { id: string }) => w.id === "sibling-head"),
+    "COV5-5: reset() does not remove a sibling's waiter entry");
+  assert(after.token !== null && after.token.id === "sibling-tok",
+    "COV5-5: reset() does not remove a sibling's token");
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- C4/ADV-2: waitForLaunch(ourId, signal) rejects + cancels on abort ---
 // An aborted turn must not leave a waiter entry at the head of the shared file
 // (which would block sibling pi processes for staleWaiterMs = 5 min) and must
