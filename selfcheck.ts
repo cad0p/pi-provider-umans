@@ -924,6 +924,68 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV4-4: head-waiter-reaped re-insert path (head reaped → re-inserted at tail → next waiter claims first) ---
+// The ADV-4 test covers a TAIL waiter aged past staleWaiterMs (re-inserted,
+// survives). The re-insert path also runs when the HEAD waiter itself is
+// reaped — a deep FIFO where the head waiter's PID is alive but its ts aged
+// past staleWaiterMs because the token holder ran a very long turn. In that
+// case the head is re-inserted at the TAIL, and a DIFFERENT waiter (formerly
+// #2) becomes head. A regression that re-inserted at the head (preserving
+// place) would silently break the FIFO order under long turns. We assert that
+// after the head is aged + reaped, the second waiter claims the token first.
+//
+// Symmetry-breaking: both waiters poll at 50ms, so if they join at the same
+// time they age together and the re-insert order is racy. We stagger the
+// joins (waiter 2 joins 400ms after waiter 1) with staleWaiterMs=500 so only
+// waiter 1 is reaped when the token frees (waiter 2's ts stays fresh).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  // staleWaiterMs=500ms so we can stagger the joins and only age waiter 1.
+  const q = createConcurrencyQueue({ stateFile, staleWaiterMs: 500 });
+
+  // A third queue instance holds the token so the head waiter can't claim it
+  // (simulating a long-running turn by another process). The token's
+  // staleTokenMs defaults to 120s, so it survives the test window.
+  const idHolder = q.join()!;
+  const rHolder = await q.waitForLaunch(idHolder);
+  assert(q.holdsToken() === true, "COV4-4: token held by the holder");
+
+  // Waiter 1 joins → becomes head (behind the held token).
+  const id1 = q.join()!;
+  const ctrl1 = new AbortController();
+  const p1 = q.waitForLaunch(id1, ctrl1.signal).catch(() => { /* aborted */ });
+  await new Promise((r) => setTimeout(r, 60)); // let waiter 1's poll fire
+
+  // Waiter 2 joins 400ms after waiter 1 (ts fresher), → tail.
+  await new Promise((r) => setTimeout(r, 340)); // t≈400ms total
+  const id2 = q.join()!;
+  const ctrl2 = new AbortController();
+  let got2 = false;
+  const p2 = q.waitForLaunch(id2, ctrl2.signal).then(() => { got2 = true; }).catch(() => { /* aborted */ });
+  await new Promise((r) => setTimeout(r, 60)); // let waiter 2's poll fire
+
+  // Age past staleWaiterMs (500ms) so waiter 1 (ts≈0) is reaped on its next
+  // poll and re-inserted at the TAIL. Waiter 2 (ts≈400) stays fresh
+  // (now-ts≈200 < 500) and becomes the head. Waiter 1's poll re-inserts it
+  // at the tail, NOT the head.
+  await new Promise((r) => setTimeout(r, 220)); // t≈620ms: waiter 1 reaped + re-inserted at tail
+
+  // Release the token. Waiter 2 (now the head) should claim it FIRST — not
+  // waiter 1 (re-inserted at the tail). Give the 50ms poll time to fire.
+  rHolder();
+  await new Promise((r) => setTimeout(r, 150));
+  assert(got2, "COV4-4: second waiter claims the token first after the head was reaped + re-inserted at tail");
+
+  // Cleanly stop both poll loops.
+  ctrl1.abort();
+  ctrl2.abort();
+  await Promise.all([p1, p2]);
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- ADV-1: stale .tmp files are reaped by writeStateAtomic; fresh ones are not ---
 // A crashed writer (killed between writeFileSync and renameSync) leaves a
 // <path>.<pid>.tmp that would accumulate forever. writeStateAtomic now
