@@ -132,6 +132,18 @@ export const PRIORITY_BACKOFF_MS = 30_000;
 export const MAX_PAUSE_MS = 5 * 60 * 60 * 1000; // 18,000,000 ms
 
 /**
+ * Reason tag written by the 429 handler (index.ts after_provider_response).
+ * CORR4-1: /usage LAGS a 429 (the design acknowledges this at the capacityFree
+ * doc-comment), so a stale 5s refreshUsage tick reporting priority.low===false
+ * would wipe a sibling's freshly-written 429 pause within 1-5s — letting the
+ * next waiter launch into the deprio the gate exists to prevent. clearPause
+ * refuses to clear a pause tagged with this reason until it naturally elapses
+ * OR /usage reports priority.low===true (confirming the server caught up).
+ * Exported so the provider tags the 429 pause with the exact same string.
+ */
+export const PAUSE_REASON_429 = "HTTP 429 from gateway";
+
+/**
  * Clamp a candidate pause deadline to now + MAX_PAUSE_MS so a poisoned or
  * over-large Retry-After/boxed_until cannot wedge the queue for centuries.
  * Exported so the provider (index.ts) can clamp its Retry-After parse to the
@@ -483,8 +495,17 @@ export interface ConcurrencyQueue {
    * all processes via the state file; idempotent (extends the deadline).
    */
   pauseUntil(until: number, reason?: string | null): void;
-  /** Clear deprioritization early (e.g. when /usage reports priority.low===false). */
-  clearPause(): void;
+  /**
+   * Clear deprioritization early (e.g. when /usage reports priority.low===false).
+   * CORR4-1: by default this REFUSES to clear a 429-origin pause (tagged
+   * PAUSE_REASON_429) — /usage lags a 429 by 1-5s, so a stale tick reporting
+   * priority.low===false must not wipe a sibling's freshly-written 429 pause.
+   * The 429 pause survives until it naturally elapses OR /usage reports
+   * priority.low===true (confirming the server caught up). Pass {force:true}
+   * to clear unconditionally (not currently used by the provider; available
+   * for explicit operator reset).
+   */
+  clearPause(opts?: { force?: boolean }): void;
   /** Snapshot for status-bar display. */
   snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   /** Remove our waiter entry if still present (best-effort, used on abort). */
@@ -648,8 +669,21 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       });
     },
 
-    clearPause(): void {
-      mutate((_now, state) => {
+    clearPause(opts?: { force?: boolean }): void {
+      mutate((now, state) => {
+        // CORR4-1: /usage LAGS a 429 by 1-5s. A stale 5s refreshUsage tick
+        // reporting priority.low===false would wipe a sibling's freshly-written
+        // 429 pause, letting the next waiter launch into the deprio the gate
+        // exists to prevent. Refuse to clear a 429-origin pause (tagged
+        // PAUSE_REASON_429) unless forced — the 429 pause survives until it
+        // naturally elapses (reapStale/pausedUntil<=now) OR /usage reports
+        // priority.low===true (refreshUsage only calls clearPause on the
+        // low===false branch, so a 429 pause set by a sibling survives the
+        // stale tick; the 429 writer's OWN refreshUsage clears it only after its
+        // own /usage catches up to priority.low===true then back to false).
+        if (!opts?.force && state.pausedReason === PAUSE_REASON_429 && state.pausedUntil > now) {
+          return; // keep the 429-origin pause
+        }
         state.pausedUntil = 0;
         state.pausedReason = null;
         state.pausedTs = 0;

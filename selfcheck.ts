@@ -19,6 +19,7 @@ import {
   isCapacityFree,
   parseConcurrencyLimit,
   MAX_PAUSE_MS,
+  PAUSE_REASON_429,
 } from "./concurrency-queue.ts";
 
 function vision(name: string, v: boolean | "via-handoff" = true, deprecation?: unknown) {
@@ -694,9 +695,61 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(snapB.paused === true, "C2: sibling sees shared paused before /usage catches up");
   assert(snapB.pausedUntil === until, "C2: sibling sees the exact shared deadline");
 
-  // A clears it (e.g. /usage reports priority.low === false). B sees it lift.
-  qA.clearPause();
+  // A clears it (force: a 429-origin pause survives a plain clearPause per
+  // CORR4-1; the C2 test asserts the shared-file visibility, so force-clear).
+  qA.clearPause({ force: true });
   assert(qB.snapshot().paused === false, "C2: sibling sees pause lift when cleared");
+
+  qA.reset(); qB.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- CORR4-1: clearPause refuses to wipe a 429-origin pause on a stale /usage tick ---
+// /usage LAGS a 429 by 1-5s (the design acknowledges this at the capacityFree
+// doc-comment). refreshUsage's 5s timer calls clearPause() when /usage reports
+// priority.low===false, but a stale tick would wipe a sibling's freshly-written
+// 429 pause, letting the next waiter launch into the deprio the gate exists to
+// prevent. clearPause now refuses to clear a 429-origin pause (tagged
+// PAUSE_REASON_429) until it naturally elapses OR /usage reports
+// priority.low===true (refreshUsage only calls clearPause on low===false, so a
+// 429 pause set by a sibling survives the stale tick). A non-429 pause
+// (priority.low-origin) is still cleared by a plain clearPause so the queue
+// drains as soon as /usage says traffic is healthy.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const qA = createConcurrencyQueue({ stateFile });
+  const qB = createConcurrencyQueue({ stateFile }); // simulates a sibling
+
+  // A writes a 429-origin pause (e.g. it just got a 429). 30s deadline.
+  const until = Date.now() + 30_000;
+  qA.pauseUntil(until, PAUSE_REASON_429);
+  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause visible to sibling");
+  assert(qB.snapshot().pausedReason === PAUSE_REASON_429, "CORR4-1: pause tagged 429");
+
+  // B's stale /usage tick (priority.low===false) calls clearPause(). The 429
+  // pause MUST survive — /usage hasn't caught up yet.
+  qB.clearPause();
+  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause survives a stale /usage clearPause");
+  assert(qB.snapshot().pausedReason === PAUSE_REASON_429,
+    "CORR4-1: 429 pause reason preserved after stale clearPause");
+
+  // A non-429 pause (priority.low-origin) IS cleared by a plain clearPause —
+  // refreshUsage must still drain the queue when /usage says traffic is healthy.
+  qA.clearPause({ force: true }); // reset to a clean slate
+  const untilLow = Date.now() + 30_000;
+  qA.pauseUntil(untilLow, "priority.low from /usage");
+  assert(qB.snapshot().paused === true && qB.snapshot().pausedReason === "priority.low from /usage",
+    "CORR4-1: priority.low-origin pause set");
+  qB.clearPause();
+  assert(qB.snapshot().paused === false,
+    "CORR4-1: non-429 pause cleared by plain clearPause (queue drains on healthy /usage)");
+
+  // force:true clears a 429 pause unconditionally (operator/explicit reset).
+  qA.pauseUntil(Date.now() + 30_000, PAUSE_REASON_429);
+  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause re-set for force-clear");
+  qB.clearPause({ force: true });
+  assert(qB.snapshot().paused === false, "CORR4-1: force:true clears a 429 pause unconditionally");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });

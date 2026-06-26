@@ -43,6 +43,7 @@ import {
   isCapacityFree,
   parseConcurrencyLimit,
   PRIORITY_BACKOFF_MS,
+  PAUSE_REASON_429,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -1349,7 +1350,7 @@ export default async function (pi: ExtensionAPI) {
           if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000);
         }
       }
-      concurrencyQueue.pauseUntil(until, "HTTP 429 from gateway");
+      concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
         "warning",
