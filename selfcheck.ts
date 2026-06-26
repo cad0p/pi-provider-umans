@@ -2160,4 +2160,57 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- CORR7-2: reset() aborts an in-flight waitForLaunch poll loop ---
+// reset() clears ourWaiterIds/ourTokenId + splices entries from the file, but a
+// concurrently-running waitForLaunch poll loop on the same queue instance
+// re-inserts the waiter id at the tail every 50ms (ADV-4's re-insert path)
+// until the turn's AbortSignal aborts — leaking a dead-PID waiter for
+// staleWaiterMs (5 min) if the process exits first. reset() now aborts a
+// per-instance AbortController composed into waitForLaunch, so the poll stops
+// + the promise rejects + the waiter is NOT re-inserted.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr7-2-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // A sibling queue instance holds the token so our waitForLaunch blocks.
+  const qSibling = createConcurrencyQueue({ stateFile });
+  const idSibling = qSibling.join()!;
+  await qSibling.waitForLaunch(idSibling);
+  assert(qSibling.snapshot().tokenHeld === true, "CORR7-2: sibling holds the token");
+
+  // Our queue joins + starts waitForLaunch (blocks — token held by sibling).
+  const ourId = q.join()!;
+  let rejected = false;
+  const p = q.waitForLaunch(ourId).catch(() => { rejected = true; });
+  await new Promise((r) => setTimeout(r, 80)); // let the 50ms poll fire + re-insert
+  assert(!rejected, "CORR7-2: waitForLaunch blocks while sibling holds token");
+
+  // reset() must abort the in-flight poll loop.
+  q.reset();
+  await p;
+  assert(rejected, "CORR7-2: reset() aborts the in-flight waitForLaunch (promise rejects)");
+
+  // The waiter must NOT be re-inserted after reset (the poll loop stopped).
+  // Give a moment to ensure no straggler poll fires.
+  await new Promise((r) => setTimeout(r, 80));
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(!st.waiters.some((w: { id: string }) => w.id === ourId),
+    "CORR7-2: our waiter is NOT re-inserted after reset (poll loop stopped)");
+
+  // A subsequent waitForLaunch on the same queue works (fresh resetAbort
+  // controller was created, not pre-aborted).
+  const idAgain = q.join()!;
+  let resolvedAgain = false;
+  const pAgain = q.waitForLaunch(idAgain).then((r) => { resolvedAgain = true; return r; }).catch(() => {});
+  // Release the sibling token so our new waiter can claim it.
+  qSibling.cancel(idSibling);
+  await pAgain;
+  assert(resolvedAgain, "CORR7-2: subsequent waitForLaunch works after reset (fresh controller)");
+
+  q.reset(); qSibling.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");

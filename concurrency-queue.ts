@@ -743,6 +743,16 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // acquireSlot passes the specific id it joined with, so the Set is the
   // source of truth; this is just a convenience handle).
   let ourWaiterId: string | null = null;
+  // CORR7-2: a per-instance AbortController that reset() aborts to stop any
+  // in-flight waitForLaunch poll loop on the same queue instance. Without it,
+  // reset() splices our waiter id from the file, but a concurrent poll loop's
+  // mutate sees stillQueued===false and RE-INSERTS the id at the tail (ADV-4's
+  // re-insert path) every 50ms until the turn's AbortSignal aborts — leaking a
+  // dead-PID waiter for staleWaiterMs (5 min) if the process exits before pi
+  // aborts the signal. reset() aborts this controller so the poll stops + the
+  // promise rejects (acquireSlot catches + returns undefined). A fresh
+  // controller is created on each reset so subsequent waits are not pre-aborted.
+  let resetAbort: AbortController = new AbortController();
 
   function mutate<T>(fn: (now: number, state: QueueState) => T): T {
     return withLock(cfg, lockFile, (now) => {
@@ -772,7 +782,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void> {
       return new Promise((resolve, reject) => {
         // If the signal is already aborted, cancel + reject immediately.
-        if (signal?.aborted) {
+        if (signal?.aborted || resetAbort.signal.aborted) {
           try { this.cancel(ourId); } catch { /* best-effort */ }
           reject(new Error("concurrency-queue: waitForLaunch aborted"));
           return;
@@ -784,11 +794,17 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           reject(new Error("concurrency-queue: waitForLaunch aborted"));
         };
         if (signal) signal.addEventListener("abort", onAbort, { once: true });
+        // CORR7-2: compose the per-instance resetAbort controller with the
+        // caller's signal so reset() can stop an in-flight poll loop. Use the
+        // addEventListener bridge (not AbortSignal.any) for Node 18+ compat,
+        // matching the existing abort plumbing in analyzeImage/fetchUsage.
+        resetAbort.signal.addEventListener("abort", onAbort, { once: true });
+        const cleanResetListener = () => resetAbort.signal.removeEventListener("abort", onAbort);
         const poll = () => {
           // Stop polling the moment the turn is aborted; otherwise the orphaned
           // promise would claim the token when freed and resolve a release fn
           // nobody holds (ADV-2 token leak).
-          if (signal?.aborted) return;
+          if (signal?.aborted || resetAbort.signal.aborted) return;
           // ADV4-1: the FIRST poll() runs synchronously inside the Promise
           // executor, so a throw here rejects the promise and acquireSlot's
           // finally cleans up — safe. But every SUBSEQUENT poll is a
@@ -829,12 +845,14 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
             });
           } catch (err) {
             if (timer) clearTimeout(timer);
+            cleanResetListener();
             try { this.cancel(ourId); } catch { /* best-effort */ }
             reject(new Error(`concurrency-queue: poll failed: ${err instanceof Error ? err.message : err}`));
             return;
           }
           if (got) {
             if (signal) signal.removeEventListener("abort", onAbort);
+            cleanResetListener();
             resolve(() => {
               // Release: remove our token and our waiter entry. A throw here
               // (lock timeout, EACCES, ENOSPC) propagates to releaseSlot in
@@ -986,6 +1004,17 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     reset(): void {
+      // CORR7-2: abort the per-instance resetAbort controller FIRST so any
+      // in-flight waitForLaunch poll loop on this queue instance stops +
+      // rejects (acquireSlot catches + returns undefined). Without this, reset()
+      // splices our waiter id from the file, but a concurrent poll loop's mutate
+      // sees stillQueued===false and RE-INSERTS the id at the tail (ADV-4's
+      // re-insert path) every 50ms until the turn's AbortSignal aborts — leaking
+      // a dead-PID waiter for staleWaiterMs (5 min) if the process exits before
+      // pi aborts the signal. A fresh controller is created so subsequent waits
+      // are not pre-aborted.
+      resetAbort.abort();
+      resetAbort = new AbortController();
       // Clear only OUR OWN entries: our waiter entry and the launch token if
       // we hold it. Do NOT unlink the shared state file or the lockfile — that
       // would race concurrent writers (breaking the O_EXCL invariant) and wipe
