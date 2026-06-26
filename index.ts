@@ -478,8 +478,10 @@ export function hashImageId(data: string): string {
  * approach. Exported so selfcheck can unit-test the cap + strip.
  */
 const ERROR_BODY_MAX_CHARS = 80;
+// SEC9-1/SEC8-3: mirror sanitizeReason's strip — control + ESC + Unicode
+// bidi/RTL overrides + zero-width/BOM chars that could spoof displayed text.
 export function sanitizeErrorBody(body: string): string {
-  const cleaned = body.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  const cleaned = body.replace(/[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "").trim();
   return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
 }
 

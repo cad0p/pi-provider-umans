@@ -182,13 +182,15 @@ export function clampPauseUntil(until: number, now: number = Date.now(), ceiling
  * the injection surface without losing signal.
  */
 const PAUSE_REASON_MAX_CHARS = 64;
-function sanitizeReason(reason: string | null | undefined): string | null {
+// SEC9-1/SEC8-3: strip control chars (incl. DEL), ESC (0x1b, ANSI escape
+// introducer), + Unicode bidi/RTL override chars (U+202A-E, U+2066-9, U+061C)
+// and zero-width / BOM chars (U+200B-F, U+FEFF) that could spoof the displayed
+// pause reason in the status bar. Keeps printable ASCII + common printable
+// Unicode. Mirrored in sanitizeErrorBody (index.ts).
+const SANITIZE_CTRL_RE = /[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+export function sanitizeReason(reason: string | null | undefined): string | null {
   if (typeof reason !== "string") return null;
-  // Strip control chars (incl. DEL), the ESC byte (0x1b, the ANSI escape
-  // introducer), and other non-printable bytes. Keep printable ASCII + common
-  // printable Unicode (letters/digits/punctuation/space). This also neutralizes
-  // ANSI CSI sequences (ESC [ ... m) by removing the ESC byte.
-  const cleaned = reason.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  const cleaned = reason.replace(SANITIZE_CTRL_RE, "").trim();
   if (!cleaned) return null;
   return cleaned.length > PAUSE_REASON_MAX_CHARS
     ? cleaned.slice(0, PAUSE_REASON_MAX_CHARS)

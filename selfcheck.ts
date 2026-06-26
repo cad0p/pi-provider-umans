@@ -23,6 +23,7 @@ import {
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
   PRIORITY_BACKOFF_MS,
+  sanitizeReason,
   type QueueState,
   type QueueConfig,
 } from "./concurrency-queue.ts";
@@ -2984,6 +2985,20 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // An empty/whitespace body yields an empty string (caller omits the `: ` ).
   assert(sanitizeErrorBody("   ") === "", "SEC7-4: whitespace-only body -> empty");
   assert(sanitizeErrorBody("") === "", "SEC7-4: empty body -> empty");
+}
+
+// --- SEC9-1/SEC8-3: bidi/RTL + zero-width + BOM stripped from pause reason + error body ---
+// sanitizeReason + sanitizeErrorBody previously stripped only \x00-\x1f+\x7f;
+// Unicode bidi overrides (U+202A-E, U+2066-9, U+061C) + zero-width / BOM chars
+// (U+200B-F, U+FEFF) passed through to the status bar render, allowing a crafted
+// priority.reason / gateway body to spoof the displayed text.
+{
+  const r = sanitizeReason("\u202Egnirts RTL \u200B\uFEFF");
+  assert(r !== null && !/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(r), "SEC9-1: sanitizeReason strips bidi/zero-width/BOM");
+  assert(r !== null && r.includes("gnirts") && r.includes("RTL"), "SEC9-1: sanitizeReason keeps printable ASCII");
+  const b = sanitizeErrorBody("\u202Ebody\u200B");
+  assert(!/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(b), "SEC9-1: sanitizeErrorBody strips bidi/zero-width");
+  assert(b === "body", "SEC9-1: sanitizeErrorBody keeps printable ASCII body");
 }
 
 // --- CORR8-2: side-call 429s (vision handoff, web search) push the shared pause ---
