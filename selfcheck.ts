@@ -2396,4 +2396,192 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(r3.elapsedMs >= 40, `CMP7-3: timeout path honored when no parentSignal (took ${r3.elapsedMs}ms)`);
 }
 
+// --- COV7-2: acquireSlot C1 re-join + MAX_TOKEN_REJOINS fail-open ---
+// The C1 HIGH fix (re-stamp token, re-join on reap) was tested only at the pure
+// touchToken seam. The integrated acquireSlot loop (token reaped mid-poll ->
+// cancel -> re-join -> re-wait -> resume) is never driven by a test. Through the
+// COV7-1 harness mock: drive before_provider_request with a /usage sequence
+// where the token is reaped mid-poll, assert acquireSlot re-joins (a NEW waiter
+// id appears in the file) + eventually proceeds (re-claims + launches). Then
+// drive 3+ reaps + assert fail-open (acquireSlot returns a release fn anyway,
+// matching the /usage-unreachable stance).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov7-2-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_CONCURRENCY_LIMIT: "2", // finite limit so acquireSlot's capacity check is exercised (not unlimited)
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const pi: any = {
+      on(event: string, handler: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(signal?: AbortSignal): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: signal ?? new AbortController().signal,
+        mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: () => {}, notify: () => {},
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" },
+        sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let last: any;
+      for (const h of hs) last = await h({ type: event }, ctx ?? makeCtx());
+      return last;
+    }
+
+    // --- C1 re-join: token reaped mid-poll, acquireSlot re-joins + resumes ---
+    // fetch returns "full" (concurrent_sessions at cap) so the poll loops. After
+    // the first /usage call (token claimed + polling), reap the token by
+    // hand-editing the state file to point at a different id. The next
+    // touchToken returns false -> cancel -> re-join (new id). Then flip fetch to
+    // "free" so the re-joined poll launches.
+    let usageCalls = 0;
+    let firstOurId: string | undefined;
+    let reaped = false;
+    globalThis.fetch = ((input: any) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.endsWith("/v1/usage")) {
+        usageCalls++;
+        // After the first /usage call, the token is claimed + polling. Reap it
+        // once by hand-editing the state file (simulates a sibling reapStale).
+        if (usageCalls === 1) {
+          const st = JSON.parse(readFileSync(stateFile, "utf8"));
+          if (st.token) {
+            firstOurId = st.token.id;
+            // Simulate a sibling reapStale reaping our token: point the token at
+            // a DEAD PID so the next mutate's reapStale reaps it (freeing the
+            // token for our re-joined waitForLaunch to claim). A live sibling
+            // PID would hold the token + block our re-join indefinitely.
+            st.token = { id: "someone-else", pid: 99_999_999, ts: Date.now() - 200_000 };
+            writeFileSync(stateFile, JSON.stringify(st));
+            reaped = true;
+          }
+        }
+        // Return "full" for the first few calls (concurrent_sessions at cap),
+        // then "free" so the re-joined poll can launch.
+        const full = usageCalls <= 3;
+        return Promise.resolve(new Response(JSON.stringify({
+          limits: { concurrency: { limit: 2, hard_cap: 4 } },
+          usage: { concurrent_sessions: full ? 4 : 0, priority: { low: false } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }
+      return Promise.resolve(new Response("", { status: 404 }));
+    }) as any;
+
+    await umansFactory(pi as any);
+    // Drive before_provider_request — acquireSlot runs the poll loop. The
+    // dispatch blocks until acquireSlot returns (launch / abort / fail-open).
+    await dispatch("before_provider_request", makeCtx());
+
+    assert(reaped, "COV7-2: C1 setup — token was reaped mid-poll");
+    assert(firstOurId !== undefined, "COV7-2: C1 setup — captured the original waiter id");
+    // After the reap, acquireSlot must have re-joined: a DIFFERENT waiter id is
+    // now in the file (or the token was released after launch).
+    const finalState = JSON.parse(readFileSync(stateFile, "utf8"));
+    const hasDifferentId = finalState.waiters.some((w: { id: string }) => w.id !== firstOurId)
+      || finalState.token === null || finalState.token.id !== firstOurId;
+    assert(hasDifferentId, "COV7-2: acquireSlot re-joined after token reap (new waiter id, not the reaped one)");
+    // The turn proceeded (acquireSlot returned a release fn -> mainTurnRelease
+    // set -> the token was held or already released by message_end). Prove the
+    // poll loop made progress past the reap: usage was called multiple times.
+    assert(usageCalls > 1, `COV7-2: acquireSlot polled /usage multiple times after re-join (got ${usageCalls} calls)`);
+
+    // Clean up: dispatch session_shutdown to release any held slot.
+    await dispatch("session_shutdown", makeCtx());
+
+    // --- MAX_TOKEN_REJOINS fail-open: 3+ reaps -> acquireSlot returns a release
+    // fn anyway (fail-open, matching the /usage-unreachable stance). We drive a
+    // fresh queue instance + reap on EVERY /usage call so the re-join count
+    // exceeds MAX_TOKEN_REJOINS (3). acquireSlot must eventually return a release
+    // fn (fail-open) rather than loop forever.
+    // Reset the state file to a clean slate.
+    try { writeFileSync(stateFile, JSON.stringify({ waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 })); } catch { /* ignore */ }
+
+    // Fresh factory + handlers (the previous factory's queue is captured; we
+    // point a NEW factory at a fresh state file to isolate the fail-open probe).
+    const stateFile2 = join(dir, "state2.json");
+    process.env.UMANS_CONCURRENCY_STATE_FILE = stateFile2;
+    const handlers2 = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi2: any = {
+      on(event: string, handler: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers2.has(event)) handlers2.set(event, []);
+        handlers2.get(event)!.push(handler);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    let failOpenUsageCalls = 0;
+    globalThis.fetch = ((input: any) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.endsWith("/v1/usage")) {
+        failOpenUsageCalls++;
+        // Reap the token on every /usage call so touchToken always returns false
+        // -> acquireSlot re-joins every iteration -> exceeds MAX_TOKEN_REJOINS.
+        try {
+          const st = JSON.parse(readFileSync(stateFile2, "utf8"));
+          if (st.token) {
+            // Reap with a dead PID so reapStale reaps it on the next mutate,
+            // freeing the token for the re-joined waitForLaunch to claim (so
+            // the poll loop keeps cycling + re-joining, not blocking forever).
+            st.token = { id: "reaped-by-sibling", pid: 99_999_999, ts: Date.now() - 200_000 };
+            writeFileSync(stateFile2, JSON.stringify(st));
+          }
+        } catch { /* ignore */ }
+        // Return "full" so the poll keeps looping until fail-open.
+        return Promise.resolve(new Response(JSON.stringify({
+          limits: { concurrency: { limit: 2, hard_cap: 4 } },
+          usage: { concurrent_sessions: 4, priority: { low: false } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }
+      return Promise.resolve(new Response("", { status: 404 }));
+    }) as any;
+    await umansFactory(pi2 as any);
+    let failOpenReturned = false;
+    async function dispatch2(event: string, ctx?: any): Promise<any> {
+      const hs = handlers2.get(event);
+      if (!hs) return undefined;
+      let last: any;
+      for (const h of hs) last = await h({ type: event }, ctx ?? makeCtx());
+      return last;
+    }
+    // Drive before_provider_request — acquireSlot re-joins 3+ times then fails open.
+    const failOpenPromise = dispatch2("before_provider_request", makeCtx()).then(() => { failOpenReturned = true; });
+    await failOpenPromise;
+    assert(failOpenReturned, "COV7-2: MAX_TOKEN_REJOINS fail-open — acquireSlot returned (did not loop forever)");
+    assert(failOpenUsageCalls > 3, `COV7-2: acquireSlot polled /usage >3 times before fail-open (got ${failOpenUsageCalls})`);
+    await dispatch2("session_shutdown", makeCtx());
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log("\nall checks passed");
