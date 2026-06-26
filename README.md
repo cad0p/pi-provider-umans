@@ -99,6 +99,9 @@ This provider ships a **cross-process FIFO queue** to keep you under the soft ca
 - The status bar shows live state: `q <queued>*` (the `*` marks this process holding the token / launching) and `PAUSED <Ns>` while backing off.
 - **Unlimited plans** (Code Max, `limit === undefined`): the queue still serializes launches + honors `priority.low`, but skips the capacity check.
 - **Operator reset**: `/umans-concurrency status` shows the queue depth + pause state; `/umans-concurrency reset` force-clears a poisoned pause (incl. a 429-origin pause) and drops this process's own waiter/token entry — useful for un-wedging without editing `~/.pi/agent/umans-concurrency.json` by hand.
+- **Local filesystem required**: the queue state file lives at `~/.pi/agent/umans-concurrency.json` and must be on a local filesystem (not NFS / iCloud / Dropbox) — `O_EXCL` locking is broken on network filesystems, and a network-synced home can lose writes.
+
+The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`) are documented in the table below; the general Configuration table links back here to avoid duplicating them.
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -116,8 +119,7 @@ This provider ships a **cross-process FIFO queue** to keep you under the soft ca
 | `UMANS_VISION_DISABLE` | `0` | `1` starts vision handoff off (toggle live with `/umans-vision`). |
 | `UMANS_VISION_MODEL` | `umans-kimi-k2.7` | Seed the vision model id. |
 | `UMANS_SEARCH_DISABLE` | `0` | `1` disables the `umans_web_search` tool (e.g. when you use your own MCP web-search tool). Vision handoff is unaffected. |
-| `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the FIFO concurrency gate. |
-| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the concurrency soft cap. |
+| `UMANS_CONCURRENCY_*` | — | See [Concurrency & rate-limit safety](#concurrency--rate-limit-safety) for `UMANS_CONCURRENCY_DISABLE` and `UMANS_CONCURRENCY_LIMIT`. |
 
 ## Getting an API Key
 
