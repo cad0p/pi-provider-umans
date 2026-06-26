@@ -359,10 +359,10 @@ export function hashImageId(data: string): string {
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
 // CLN2-L2: ConcurrencyQueue is imported directly (line 45) and used at the
-// factory call site. QueueState/WaiterEntry/TokenState have no in-repo
-// consumer (selfcheck imports the pure helpers + types directly from
-// concurrency-queue.ts). External consumers should import from
-// concurrency-queue.ts directly. Drop the speculative re-export.
+// factory call site. CLN4-1: the speculative type exports (QueueState /
+// WaiterEntry / TokenState / QueueConfig / CapacitySnapshot / CapacityInputs)
+// and newId were unexported — they had no in-repo consumer (not even tests).
+// External consumers should import from concurrency-queue.ts directly.
 // Local type alias for the release function returned by acquireSlot.
 type Release = () => void;
 

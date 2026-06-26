@@ -52,19 +52,19 @@ import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
-export interface WaiterEntry {
+interface WaiterEntry {
   id: string;
   pid: number;
   ts: number;
 }
 
-export interface TokenState {
+interface TokenState {
   id: string;
   pid: number;
   ts: number;
 }
 
-export interface QueueState {
+interface QueueState {
   /** FIFO of waiters; index 0 is the head (next to launch). */
   waiters: WaiterEntry[];
   /** The launch token: held by the process currently sending or polling /usage. null when free. */
@@ -87,7 +87,7 @@ export interface QueueState {
   pausedTs: number;
 }
 
-export interface QueueConfig {
+interface QueueConfig {
   /** Path to the state file. Defaults to ~/.pi/agent/umans-concurrency.json. */
   stateFile?: string;
   /** Max age of the launch token before it's considered stale (reapable). */
@@ -210,7 +210,7 @@ export function parsePriority(raw: unknown): PriorityState {
  * shape fetchUsageSnapshot returns (concurrentSessions + limit + hardCap +
  * priority).
  */
-export interface CapacitySnapshot {
+interface CapacitySnapshot {
   concurrentSessions: number | undefined;
   limit: number | undefined;
   /**
@@ -229,7 +229,7 @@ export interface CapacitySnapshot {
  * Inputs to the capacity decision: the effective concurrency cap (env override
  * or the live /usage value) and whether the shared pausedUntil is active.
  */
-export interface CapacityInputs {
+interface CapacityInputs {
   limit: number | undefined;
   queuePaused: boolean;
 }
@@ -295,7 +295,7 @@ export function parseConcurrencyLimit(envValue: string | undefined, fallback: nu
 }
 
 /** Generate a unique waiter/token id. */
-export function newId(): string {
+function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
