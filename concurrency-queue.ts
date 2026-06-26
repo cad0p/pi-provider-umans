@@ -1098,6 +1098,10 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null } {
+      // CMP9-4: snapshot reads without the lock (atomic rename prevents torn
+      // reads; value may be one mutate stale — capacity-poll compensates via
+      // /usage priority.low). Correct for the status bar; the brief staleness
+      // is acceptable for an operator-facing view.
       // Read without mutating; still reap for an accurate view.
       const now = cfg.now();
       const state = reapStale(readState(cfg.stateFile), cfg, now);
