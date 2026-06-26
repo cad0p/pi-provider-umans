@@ -178,6 +178,28 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     { concurrentSessions: 1, limit: 4, hardCap: 1, priority: okState },
     { limit: 2, queuePaused: false },
   ).free === false, "CORR2-1: server hard_cap (1) < local limit (2) → at cap");
+
+  // CORR8-1 (HIGH): unlimited-plan path (inputs.limit === undefined) must
+  // NOT short-circuit before the hard_cap gate. hard_cap is the actual 429
+  // threshold; an unlimited plan (Code Max) can still trip the account-wide
+  // burst cap. Previously isCapacityFree returned { free: true } before
+  // evaluating concurrent_sessions against hard_cap — the gate would launch a
+  // request the server 429s (probe-confirmed: limit=undefined, hardCap=8,
+  // concurrentSessions=10 → free: true). Now the cap check runs: at/over
+  // hard_cap → not free; under hard_cap (or all caps undefined) → free.
+  assert(isCapacityFree(
+    { concurrentSessions: 10, limit: undefined, hardCap: 8, priority: okState },
+    { limit: undefined, queuePaused: false },
+  ).free === false, "CORR8-1: unlimited plan (limit undefined) + cur (10) at/over hard_cap (8) → not free (D5)");
+  assert(isCapacityFree(
+    { concurrentSessions: 5, limit: undefined, hardCap: 8, priority: okState },
+    { limit: undefined, queuePaused: false },
+  ).free === true, "CORR8-1: unlimited plan (limit undefined) + cur (5) under hard_cap (8) → free");
+  // True unlimited (all caps undefined) → free (no cap to exceed).
+  assert(isCapacityFree(
+    { concurrentSessions: 999, limit: undefined, hardCap: undefined, priority: okState },
+    { limit: undefined, queuePaused: false },
+  ).free === true, "CORR8-1: all caps undefined → free (no cap to exceed)");
 }
 
 // --- COV5-1: decideLaunch capacity-poll branch logic (extracted from acquireSlot) ---

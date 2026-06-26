@@ -274,11 +274,15 @@ interface CapacityInputs {
  *   process backs off all siblings before /usage propagates priority.low).
  * - If priority.low → not free + repause so siblings back off too (honored
  *   BEFORE the unlimited short-circuit so Code Max still pushes the pause).
- * - If the plan is unlimited (limit === undefined) → free (D5; priority.low
- *   already honored via the repause path above when snap is present).
  * - If /usage is unreachable (snap === null) → free (trust headroom rather
  *   than block forever; the queue still serializes launches via the token).
- * - If concurrent_sessions >= hardCap (or limit when hardCap absent) → not free.
+ * - If concurrent_sessions >= hardCap (or limit when hardCap absent, or
+ *   inputs.limit when both snap caps are absent) → not free. CORR8-1 (HIGH):
+ *   an unlimited plan (inputs.limit === undefined) is NO LONGER a short-
+ *   circuit — when snap.hardCap is present the gate compares against it so a
+ *   Code Max account can't trip the account-wide burst cap; only when ALL
+ *   caps are undefined (true unlimited with no burst cap reported) is the
+ *   gate free (no cap to exceed).
  * - Otherwise → free.
  *
  * CORR2-1: the gate's PURPOSE is to prevent 429s, which hit at `hard_cap`, not
@@ -303,7 +307,18 @@ export function isCapacityFree(
   if (snap?.priority.low) {
     return { free: false, repause: { until: snap.priority.until, reason: snap.priority.reason } };
   }
-  if (inputs.limit === undefined) return { free: true }; // Code Max / unlimited
+  // CORR8-1 (HIGH): the unlimited-plan short-circuit (inputs.limit ===
+  // undefined) used to return { free: true } BEFORE evaluating
+  // concurrent_sessions against hard_cap — contradicting D5 ("When hard_cap is
+  // present, the gate compares against it; when absent, it falls back to
+  // limit"). hard_cap is the actual 429 threshold, and an unlimited plan
+  // (Code Max, limit undefined) still trips the account-wide burst cap. We
+  // dropped the short-circuit; the cap check below handles all cases: when
+  // hard_cap (or limit) is present, gate against it; when ALL of
+  // snap.hardCap / snap.limit / inputs.limit are undefined (a true unlimited
+  // plan with no burst cap reported), `cap` is undefined and we return free
+  // (no cap to exceed — correct). The `!snap` (usage-unreachable) check stays
+  // before the cap check so we trust headroom rather than block forever.
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
   const cur = snap.concurrentSessions ?? 0;
   // CORR2-1: prefer hard_cap (the 429 threshold) over limit; fall back to
