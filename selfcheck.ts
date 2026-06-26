@@ -1025,6 +1025,70 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- ADV4-1: setTimeout(poll) throw rejects the promise, not the process ---
+// waitForLaunch re-enters poll via setTimeout(poll, 50). A throw from mutate()
+// inside that re-entry (acquireLock timeout, readFileSync EACCES, writeStateAtomic
+// ENOSPC) is not on any promise chain and would surface as an uncaughtException,
+// crashing the Node process (and leaking the waiter for staleWaiterMs = 5 min if
+// a uncaughtException handler is installed). The poll body is now wrapped in
+// try/catch: on throw it clears the timer, best-effort cancels our waiter entry,
+// and rejects the waitForLaunch promise so acquireSlot's finally runs. We force
+// the throw by removing the state file's parent directory after the first poll,
+// so the next setTimeout(poll) re-entry's mutate -> acquireLock -> openSync throws
+// ENOENT immediately (no busy-spin, no event-loop blocking) — the same throw
+// surface as the ADV4-1 reproduction (acquireLock failure) without the timing
+// fragility of a fresh-mtime toucher (the acquireLock busy-spin blocks the
+// toucher's setInterval, so a toucher-based probe can't keep the mtime fresh).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { renameSync } = await import("node:fs");
+
+  // Waiter 1 joins + claims the token (first poll is synchronous + succeeds).
+  const q = createConcurrencyQueue({ stateFile });
+  const id1 = q.join()!;
+  await q.waitForLaunch(id1);
+  assert(q.holdsToken() === true, "ADV4-1: waiter 1 holds the token");
+
+  // Waiter 2 joins + starts polling. Its FIRST poll runs synchronously inside
+  // the Promise executor: it sees the token held by 1, returns false, and arms
+  // setTimeout(poll, 50). That first poll does NOT throw (the dir exists), so
+  // the rejection we assert below can ONLY come from a setTimeout re-entry —
+  // which is exactly the uncaught-throw path ADV4-1 fixes.
+  const id2 = q.join()!;
+  let rejected = false;
+  let errMsg = "";
+  const p2 = q.waitForLaunch(id2).catch((e: unknown) => {
+    rejected = true;
+    errMsg = e instanceof Error ? e.message : String(e);
+  });
+  await new Promise((r) => setTimeout(r, 30)); // let the first poll complete + re-arm
+  assert(!rejected, "ADV4-1: waiter 2 blocks while token held (no throw yet)");
+
+  // Remove the state file's parent directory so the next setTimeout(poll)
+  // re-entry's mutate -> acquireLock -> openSync(lockFile, "wx") throws ENOENT
+  // immediately. Without the try/catch, this throw would surface as an
+  // uncaughtException and crash the Node process.
+  const gone = `${dir}.gone`;
+  renameSync(dir, gone);
+
+  // Waiter 2's next poll fires within 50ms, tries to mutate, and throws. The
+  // throw must REJECT p2, not crash.
+  await p2;
+  assert(rejected, "ADV4-1: setTimeout(poll) throw rejects the promise (does not crash the process)");
+  assert(errMsg.startsWith("concurrency-queue: poll failed:"),
+    `ADV4-1: rejection carries the poll-failed message (got "${errMsg}")`);
+
+  // The cancel in the catch is best-effort: with the parent dir removed, the
+  // cancel's own mutate also throws ENOENT and is swallowed, so the waiter entry
+  // remains in the (renamed) file. That is acceptable — the entry is inert (the
+  // process exited the wait) and the watchdog reaps it via staleWaiterMs. The
+  // cancel-actually-removes-the-entry property is covered by the C4/ADV-5 abort
+  // tests where the dir is intact; this test proves the crash-prevention core.
+
+  rmSync(gone, { recursive: true, force: true });
+}
+
 // --- ADV3-1: drain loop resilient to a throwing release fn ---
 // releaseSlot wraps release() in try/catch/finally so a throw (e.g. O_EXCL
 // lock timeout after 2s, EACCES, ENOSPC) is swallowed and the drain continues;

@@ -564,32 +564,57 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // promise would claim the token when freed and resolve a release fn
           // nobody holds (ADV-2 token leak).
           if (signal?.aborted) return;
-          const got = mutate((now, state) => {
-            // ADV-4: if our waiter entry was reaped by staleWaiterMs (5 min)
-            // while we were still queued (e.g. a deep FIFO + slow models, or
-            // a perpetually-full /usage per ADV-3), re-insert it at the tail
-            // with a fresh timestamp so we don't poll forever with
-            // head.id !== ourId permanently true. Only dead-PID waiters are
-            // reaped for real; a live-PID waiter here means we were aged out
-            // and must re-join.
-            const stillQueued = state.waiters.some((w) => w.id === ourId);
-            if (!stillQueued) {
-              state.waiters.push({ id: ourId, pid: ourPid(), ts: now });
-            }
-            // Are we the head and is the token free?
-            const head = state.waiters[0];
-            if (!head || head.id !== ourId) return false; // not our turn
-            if (state.token) return false; // token held by someone (reaped if stale)
-            // Claim the token.
-            state.token = { id: ourId, pid: ourPid(), ts: now };
-            holdsToken = true;
-            ourTokenId = ourId;
-            return true;
-          });
+          // ADV4-1: the FIRST poll() runs synchronously inside the Promise
+          // executor, so a throw here rejects the promise and acquireSlot's
+          // finally cleans up — safe. But every SUBSEQUENT poll is a
+          // setTimeout callback; a throw from mutate() there (acquireLock
+          // timeout after 2s, readFileSync EACCES/EIO, writeStateAtomic
+          // ENOSPC/EROFS) is not on any promise chain and surfaces as an
+          // uncaughtException that terminates the Node process (and, with a
+          // uncaughtException handler installed, leaves the promise forever
+          // pending + the waiter leaked for staleWaiterMs = 5 min, stalling
+          // siblings). Wrap the body so a throw on any re-entry clears the
+          // timer, best-effort cancels our waiter entry, and rejects the
+          // waitForLaunch promise — mirroring releaseSlot's drain-resilience
+          // pattern (ADV3-1) so the poll loop is as resilient to lock/disk
+          // errors as the drain loop already is.
+          let got: boolean;
+          try {
+            got = mutate((now, state) => {
+              // ADV-4: if our waiter entry was reaped by staleWaiterMs (5 min)
+              // while we were still queued (e.g. a deep FIFO + slow models, or
+              // a perpetually-full /usage per ADV-3), re-insert it at the tail
+              // with a fresh timestamp so we don't poll forever with
+              // head.id !== ourId permanently true. Only dead-PID waiters are
+              // reaped for real; a live-PID waiter here means we were aged out
+              // and must re-join.
+              const stillQueued = state.waiters.some((w) => w.id === ourId);
+              if (!stillQueued) {
+                state.waiters.push({ id: ourId, pid: ourPid(), ts: now });
+              }
+              // Are we the head and is the token free?
+              const head = state.waiters[0];
+              if (!head || head.id !== ourId) return false; // not our turn
+              if (state.token) return false; // token held by someone (reaped if stale)
+              // Claim the token.
+              state.token = { id: ourId, pid: ourPid(), ts: now };
+              holdsToken = true;
+              ourTokenId = ourId;
+              return true;
+            });
+          } catch (err) {
+            if (timer) clearTimeout(timer);
+            try { this.cancel(ourId); } catch { /* best-effort */ }
+            reject(new Error(`concurrency-queue: poll failed: ${err instanceof Error ? err.message : err}`));
+            return;
+          }
           if (got) {
             if (signal) signal.removeEventListener("abort", onAbort);
             resolve(() => {
-              // Release: remove our token and our waiter entry.
+              // Release: remove our token and our waiter entry. A throw here
+              // (lock timeout, EACCES, ENOSPC) propagates to releaseSlot in
+              // index.ts, which wraps release() in try/catch (ADV3-1) so the
+              // drain continues and the watchdog reaps the stale entry.
               mutate((_now, state) => {
                 if (state.token && state.token.id === ourId) {
                   state.token = null;
