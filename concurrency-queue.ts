@@ -553,15 +553,23 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   while (fd === undefined) {
     try {
       fd = openSync(lockFile, "wx", 0o600);
-      // CMP7-1: write the holder PID + a short nonce into the lockfile so the
-      // stale-lock decision can distinguish "holder is dead" from "lockfile is
-      // merely old". A slow-but-legitimate mutate (disk pressure) holding >2s
-      // used to have its lockfile yanked mid-write; now a live holder PID keeps
-      // the lock until the mtime ceiling (the 2s bound still applies as the
+      // CMP7-1: write the holder PID into the lockfile so the stale-lock
+      // decision can distinguish "holder is dead" from "lockfile is merely
+      // old". A slow-but-legitimate mutate (disk pressure) holding >2s used to
+      // have its lockfile yanked mid-write; now a live holder PID keeps the
+      // lock until the mtime ceiling (the 2s bound still applies as the
       // fallback). readFileSync is guarded by the SEC7-1 lstatSync fix above
       // (a symlink lockfile is reclaimed without being followed). Malformed/
       // empty content falls back to the mtime check.
-      writeFileSync(fd, JSON.stringify({ pid: cfg.pid(), nonce: Math.random().toString(36).slice(2) }), { encoding: "utf8" });
+      // CMP8-1 / SEC8-5: the nonce field was DROPPED — it was write-only (the
+      // reclaim path below reads only parsed.pid, never the nonce), so it
+      // provided no fencing. A nonce that is never read back is not a fencing
+      // token. The PID-reuse bound is the documented 120s/2s timestamp
+      // (staleTokenMs / lockTimeoutMs): a recycled PID still ages out, so the
+      // worst case is a bounded stall, not a permanent wedge. Reading the
+      // nonce back + comparing would add complexity for a single-user dev
+      // tool; the drop is cleaner.
+      writeFileSync(fd, JSON.stringify({ pid: cfg.pid() }), { encoding: "utf8" });
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. Reclaim if the
