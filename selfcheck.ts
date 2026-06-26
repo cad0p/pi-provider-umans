@@ -23,6 +23,8 @@ import {
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
   PRIORITY_BACKOFF_MS,
+  type QueueState,
+  type QueueConfig,
 } from "./concurrency-queue.ts";
 
 function vision(name: string, v: boolean | "via-handoff" = true, deprecation?: unknown) {
@@ -40,6 +42,10 @@ function assert(cond: boolean, msg: string) {
   if (!cond) { console.error("FAIL:", msg); process.exit(1); }
   console.log("ok  ", msg);
 }
+
+// CLN9-3: QueueState + QueueConfig are exported as named types (used in exported fn signatures).
+assert(typeof (null as unknown as QueueState) === "object", "CLN9-3: QueueState type imported by name");
+assert(typeof (null as unknown as QueueConfig) === "object", "CLN9-3: QueueConfig type imported by name");
 
 // --- isNativeVision / pickVisionModel / hashImageId (unchanged) ---
 assert(isNativeVision(vision("a", true)) === true, "native vision is native");

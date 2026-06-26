@@ -64,7 +64,7 @@ interface TokenState {
   ts: number;
 }
 
-interface QueueState {
+export interface QueueState {
   /** FIFO of waiters; index 0 is the head (next to launch). */
   waiters: WaiterEntry[];
   /** The launch token: held by the process currently sending or polling /usage. null when free. */
@@ -87,7 +87,7 @@ interface QueueState {
   pausedTs: number;
 }
 
-interface QueueConfig {
+export interface QueueConfig {
   /** Path to the state file. Defaults to ~/.pi/agent/umans-concurrency.json. */
   stateFile?: string;
   /** Max age of the launch token before it's considered stale (reapable). */
