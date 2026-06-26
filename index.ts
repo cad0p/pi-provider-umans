@@ -1084,12 +1084,18 @@ export default async function (pi: ExtensionAPI) {
         // their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, ctx?.signal);
         try {
+          // ADV4-4: pass ctx?.signal so an aborted turn aborts the vision HTTP
+          // fetch (the tool path at umans_vision already passes `signal`; only
+          // the handoff path dropped it). The 60s VISION_TIMEOUT_MS still
+          // bounds the worst case, but passing the signal makes the handoff
+          // consistent with the tool + searchWeb.
           analysis = await analyzeImage(
             apiKey,
             model,
             baseUrl,
             { data: img.data, mimeType: img.mimeType },
             VISION_ANALYSIS_PROMPT,
+            ctx?.signal,
           );
         } catch (err) {
           const m = err instanceof Error ? err.message : String(err);
