@@ -569,12 +569,8 @@ function withLock<T>(cfg: Required<QueueConfig>, lockFile: string, fn: (now: num
 function writeStateAtomic(path: string, state: QueueState): void {
   const dir = dirname(path);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
-  // ADV-1: best-effort reap of stale .tmp files left by a crashed writer (a
-  // process killed between writeFileSync and renameSync). We unlink any
-  // <path>.*.tmp older than STALE_TMP_MS (10s). A fresh .tmp just written by
-  // another live process has a current mtime and is left alone. Mirrors the
-  // lockfile mtime-recovery pattern. Best-effort: errors are swallowed.
-  reapStaleTmps(path);
+  // C4: stale-.tmp reaping moved out to mutate's withLock block so it uses the
+  // injected cfg.now() (testability — a frozen clock now exercises the reaper).
   const tmp = `${path}.${process.pid}.tmp`;
   // SEC6-2: open with O_EXCL ("wx") + 0o600 so a planted symlink at the per-pid
   // temp name throws EEXIST instead of being followed. writeFileSync(symlink,
@@ -607,12 +603,14 @@ function writeStateAtomic(path: string, state: QueueState): void {
 const STALE_TMP_MS = 10_000;
 
 /** Best-effort unlink of stale <path>.*.tmp files older than STALE_TMP_MS. */
-function reapStaleTmps(path: string): void {
+// C4: now is threaded in from mutate's caller (cfg.now()) so a frozen clock
+// exercises the reaper — a regression inverting the comparison would not be
+// caught otherwise.
+function reapStaleTmps(path: string, now: number): void {
   const dir = dirname(path);
   const prefix = `${basename(path)}.`;
   let entries: string[];
   try { entries = readdirSync(dir); } catch { return; /* dir missing/unreadable */ }
-  const now = Date.now();
   for (const name of entries) {
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
@@ -750,6 +748,11 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     return withLock(cfg, lockFile, (now) => {
       const state = reapStale(readState(cfg.stateFile), cfg, now);
       const result = fn(now, state);
+      // C4: reap stale .tmp files inside the lock, using the injected cfg.now()
+      // (was Date.now() inside writeStateAtomic — a frozen clock never
+      // exercised the reaper). ADV-1: best-effort cleanup of crashed writers'
+      // leftovers; errors swallowed inside reapStaleTmps.
+      reapStaleTmps(cfg.stateFile, now);
       writeStateAtomic(cfg.stateFile, state);
       return result;
     });

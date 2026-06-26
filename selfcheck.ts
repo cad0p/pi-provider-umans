@@ -1502,7 +1502,46 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- createConcurrencyQueue: disabled mode is a no-op ---
+// --- C4: reapStaleTmps uses the injected cfg.now() (frozen-clock testability) ---
+// reapStaleTmps used Date.now() directly, so the .tmp reaper's staleness check
+// was never exercised with a frozen clock — a regression inverting the
+// comparison wouldn't be caught. Thread cfg.now() in from mutate's caller so a
+// frozen clock drives the reaper. We freeze now far in the future and assert a
+// .tmp whose mtime is older than STALE_TMP_MS (relative to the frozen now) is
+// reaped, while one whose mtime is within the window survives.
+{
+  const frozenNow = 1_700_000_000_000;
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c4-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync, statSync, utimesSync } = await import("node:fs");
+
+  // A stale .tmp: mtime 120s before the frozen clock (past the 10s threshold).
+  const staleTmp = `${stateFile}.99999.tmp`;
+  writeFileSync(staleTmp, "{}", { mode: 0o600 });
+  const staleMtime = (frozenNow / 1000) - 120;
+  utimesSync(staleTmp, staleMtime, staleMtime);
+
+  // A fresh .tmp: mtime 1s before the frozen clock (within the 10s window).
+  const freshTmp = `${stateFile}.88888.tmp`;
+  writeFileSync(freshTmp, "{}", { mode: 0o600 });
+  const freshMtime = (frozenNow / 1000) - 1;
+  utimesSync(freshTmp, freshMtime, freshMtime);
+
+  // A queue with a FROZEN now — the reaper must use this, not Date.now().
+  const q = createConcurrencyQueue({ stateFile, now: () => frozenNow });
+  q.pauseUntil(frozenNow + 1_000, "C4 frozen-clock probe");
+
+  let staleGone = false;
+  try { statSync(staleTmp); } catch { staleGone = true; }
+  assert(staleGone, "C4: stale .tmp (mtime > STALE_TMP_MS before frozen now) reaped via cfg.now()");
+
+  let freshExists = false;
+  try { statSync(freshTmp); freshExists = true; } catch { /* gone */ }
+  assert(freshExists, "C4: fresh .tmp (mtime within window before frozen now) left untouched");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
 {
   const q = createConcurrencyQueue({ disabled: true });
   assert(q.join() === null, "disabled: join returns null");
