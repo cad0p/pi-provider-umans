@@ -994,7 +994,11 @@ export default async function (pi: ExtensionAPI) {
       }
       // The side-call consumes a concurrency slot on the account; gate it
       // through the same cross-process FIFO so a burst of searches can't push
-      // the main turn past the soft cap.
+      // the main turn past the soft cap. ADV4-3: do NOT add `release` to
+      // inflightSlots — side-calls manage their own release via releaseSlot in
+      // the finally below. inflightSlots is main-turn-only (releaseOldest at
+      // message_end releases the oldest by insertion order; a side-call added
+      // there could be released instead of the main turn's slot).
       const release = await acquireSlot(apiKey, signal);
       try {
         const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal);
@@ -1067,6 +1071,8 @@ export default async function (pi: ExtensionAPI) {
         let analysis: string;
         // Gate the vision side-call through the same cross-process FIFO so a
         // multi-image handoff can't push the main turn past the soft cap.
+        // ADV4-3: do NOT add `release` to inflightSlots — side-calls manage
+        // their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, ctx?.signal);
         try {
           analysis = await analyzeImage(
@@ -1148,6 +1154,8 @@ export default async function (pi: ExtensionAPI) {
           };
         }
         const model = visionModelId;
+        // ADV4-3: do NOT add `release` to inflightSlots — side-calls manage
+        // their own release via releaseSlot in the finally below.
         const release = await acquireSlot(apiKey, signal);
         try {
           const answer = await analyzeImage(apiKey, model, baseUrl, image, params.question, signal);
@@ -1308,7 +1316,18 @@ export default async function (pi: ExtensionAPI) {
   // CLN2-L5: message_end and turn_end both release the oldest inflight slot
   // (one-per-turn, FIFO order). Dedupe the two-line body into a helper. The
   // agent_end and session_shutdown drains (while size) also use it.
+  // ADV4-3: inflightSlots is FIFO-by-insertion; releaseOldest releases the
+  // oldest entry. This is safe today because side-calls (searchWeb,
+  // analyzeImage, umans_vision) manage their own release via releaseSlot in a
+  // finally and NEVER add to inflightSlots — so the set holds at most one
+  // main-turn slot. But the invariant is structural, not enforced: if a future
+  // change adds a side-call's release to the set, releaseOldest at message_end
+  // could release the side-call's slot (acquired before the main turn) instead
+  // of the main turn's. Warn if size > 1 to catch such a regression.
   function releaseOldest(): void {
+    if (inflightSlots.size > 1) {
+      console.warn(`umans: inflightSlots has ${inflightSlots.size} entries (expected <= 1); a side-call may have been added to the set — check acquireSlot callers`);
+    }
     const oldest = inflightSlots.values().next().value;
     releaseSlot(oldest);
   }
