@@ -2340,4 +2340,60 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- CMP7-3: fetchUsage composes the turn signal into its AbortController ---
+// fetchUsage created an isolated AbortController per call + did NOT link the
+// user's signal (unlike analyzeImage/searchWeb), so a Ctrl-C mid capacity-poll
+// waited up to 3s for the in-flight /usage fetch to time out. It now accepts an
+// optional parentSignal + uses the addEventListener("abort", () => ctrl.abort())
+// bridge (Node 18+ compat, matching analyzeImage). fetchUsage is a closure
+// (not exported), so we unit-test the exact abort-bridge pattern: an
+// already-aborted parentSignal aborts ctrl immediately; a parentSignal that
+// aborts mid-fetch aborts ctrl; the listener is cleaned up in finally.
+{
+  // Replicate the fetchUsage abort-bridge shape (the closure's exact pattern).
+  async function fetchUsageBridge(timeoutMs: number, parentSignal?: AbortSignal): Promise<{ aborted: boolean; elapsedMs: number }> {
+    const ctrl = new AbortController();
+    const start = Date.now();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const onAbort = () => ctrl.abort();
+    if (parentSignal) {
+      if (parentSignal.aborted) ctrl.abort();
+      else parentSignal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      // Simulate an in-flight fetch that never resolves on its own (the abort
+      // is the only way out). Wait for ctrl.signal to abort.
+      await new Promise<void>((resolve) => {
+        if (ctrl.signal.aborted) resolve();
+        else ctrl.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { aborted: true, elapsedMs: Date.now() - start };
+    } finally {
+      clearTimeout(timer);
+      if (parentSignal) parentSignal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  // (1) An already-aborted parentSignal aborts ctrl immediately (not after 3s).
+  const ac = new AbortController();
+  ac.abort();
+  const r1 = await fetchUsageBridge(3_000, ac.signal);
+  assert(r1.aborted === true, "CMP7-3: already-aborted parentSignal aborts fetchUsage ctrl");
+  assert(r1.elapsedMs < 500, `CMP7-3: already-aborted signal aborts immediately (not after 3s) (took ${r1.elapsedMs}ms)`);
+
+  // (2) A parentSignal that aborts mid-fetch aborts ctrl (not after the 3s timeout).
+  const ac2 = new AbortController();
+  const p2 = fetchUsageBridge(3_000, ac2.signal);
+  await new Promise((r) => setTimeout(r, 50)); // mid-flight
+  ac2.abort();
+  const r2 = await p2;
+  assert(r2.aborted === true, "CMP7-3: mid-flight parent abort aborts fetchUsage ctrl");
+  assert(r2.elapsedMs < 500, `CMP7-3: mid-flight abort resolves immediately (not after 3s) (took ${r2.elapsedMs}ms)`);
+
+  // (3) No parentSignal — the timeout still fires (the bridge is a no-op).
+  const r3 = await fetchUsageBridge(50, undefined);
+  assert(r3.aborted === true, "CMP7-3: no parentSignal — timeout still aborts ctrl");
+  assert(r3.elapsedMs >= 40, `CMP7-3: timeout path honored when no parentSignal (took ${r3.elapsedMs}ms)`);
+}
+
 console.log("\nall checks passed");

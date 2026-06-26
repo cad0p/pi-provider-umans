@@ -827,12 +827,22 @@ export default async function (pi: ExtensionAPI) {
   // JSON-parse skeleton; this helper dedupes ~15 lines. Returns the parsed
   // { limits, usage } on a 2xx, or null on any failure (caller decides how to
   // handle — refreshUsage leaves cached values, fetchUsageSnapshot retries).
-  async function fetchUsage(apiKey: string, timeoutMs: number): Promise<{
+  // CMP7-3: accept an optional parentSignal (the turn's AbortSignal) + compose
+  // it into ctrl via the addEventListener("abort", ...) bridge already used in
+  // analyzeImage/searchWeb (not AbortSignal.any, for Node 18+ compat). So a
+  // Ctrl-C mid capacity-poll aborts the in-flight /usage fetch immediately
+  // instead of waiting up to 3s for the timeout.
+  async function fetchUsage(apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<{
     limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
     usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
   } | null> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const onAbort = () => ctrl.abort();
+    if (parentSignal) {
+      if (parentSignal.aborted) ctrl.abort();
+      else parentSignal.addEventListener("abort", onAbort, { once: true });
+    }
     try {
       const res = await fetch(`${baseUrl}/v1/usage`, {
         signal: ctrl.signal,
@@ -851,6 +861,7 @@ export default async function (pi: ExtensionAPI) {
       return null;
     } finally {
       clearTimeout(timer);
+      if (parentSignal) parentSignal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -890,13 +901,13 @@ export default async function (pi: ExtensionAPI) {
   // response doesn't stall the head-waiter poll; reads only the
   // capacity-decision fields (concurrent_sessions + limit + hard_cap +
   // priority). Returns null on any failure (caller retries).
-  async function fetchUsageSnapshot(apiKey: string): Promise<{
+  async function fetchUsageSnapshot(apiKey: string, parentSignal?: AbortSignal): Promise<{
     concurrentSessions: number | undefined;
     limit: number | undefined;
     hardCap: number | undefined;
     priority: PriorityState;
   } | null> {
-    const data = await fetchUsage(apiKey, 3000);
+    const data = await fetchUsage(apiKey, 3000, parentSignal);
     if (!data) return null;
     return {
       concurrentSessions: data.usage?.concurrent_sessions,
@@ -986,7 +997,7 @@ export default async function (pi: ExtensionAPI) {
         // propagates priority.low (5s refresh lag, or a transient gateway-side
         // blip not yet reflected in /usage). Without this, process B would see
         // priority.low === false and launch right into the 429 that A just hit.
-        const snap = await fetchUsageSnapshot(apiKey);
+        const snap = await fetchUsageSnapshot(apiKey, signal);
         const decision = isCapacityFree(snap, {
           limit,
           queuePaused: concurrencyQueue.snapshot().paused,
