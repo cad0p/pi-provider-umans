@@ -466,6 +466,49 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- C1 (HIGH): touchToken re-stamps ts while held; returns false when reaped ---
+// A poller that holds the token across a long capacity poll must call touchToken
+// each iteration so the 120s watchdog does not reap a legitimate wait. If the
+// token was reaped by a sibling's reapStale (id mismatch / absent), touchToken
+// returns false so the poller can re-join the queue instead of racing a send.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c1-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Claim the token by joining + waiting for launch.
+  const id = q.join()!;
+  await q.waitForLaunch(id);
+  assert(q.snapshot().tokenHeld === true, "C1: token held after waitForLaunch");
+  const before = JSON.parse(readFileSync(stateFile, "utf8"));
+  const tsBefore = before.token.ts;
+
+  // Sleep briefly so the re-stamp is observably later.
+  await new Promise((r) => setTimeout(r, 10));
+  const ok = q.touchToken(id);
+  assert(ok === true, "C1: touchToken returns true while we hold the token");
+  const after = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(after.token.ts > tsBefore, "C1: touchToken advanced state.token.ts");
+  assert(after.token.id === id, "C1: touchToken kept our id");
+
+  // Simulate a sibling's reapStale reaping our token: hand-edit the file to
+  // point the token at a different id, then touchToken(ourId) must return false.
+  const poisoned = JSON.parse(readFileSync(stateFile, "utf8"));
+  poisoned.token = { id: "someone-else", pid: process.pid, ts: Date.now() };
+  writeFileSync(stateFile, JSON.stringify(poisoned));
+  const ok2 = q.touchToken(id);
+  assert(ok2 === false, "C1: touchToken returns false when token id mismatches (reaped)");
+
+  // touchToken on an absent token (file cleared) returns false.
+  writeFileSync(stateFile, JSON.stringify({ waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 }));
+  const ok3 = q.touchToken(id);
+  assert(ok3 === false, "C1: touchToken returns false when token is absent");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- isPidDead: our own pid is alive; pid -1 / 999999 are dead ---
 assert(isPidDead(process.pid) === false, "isPidDead: own pid alive");
 assert(isPidDead(-1) === true, "isPidDead: invalid pid dead");

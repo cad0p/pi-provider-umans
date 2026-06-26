@@ -594,6 +594,19 @@ export interface ConcurrencyQueue {
    * command to un-wedge a poisoned pause without editing the JSON by hand).
    */
   clearPause(opts?: { force?: boolean }): void;
+  /**
+   * Re-stamp the launch token's `ts` to `now` while we still hold it, so the
+   * 120s watchdog (reapStale) does not reap a long capacity poll (a pause-
+   * bounded wait can legitimately exceed 120s — see CORR4-3). Returns `true` if
+   * `state.token?.id === ourId` (we still hold it) and the stamp was advanced;
+   * returns `false` if the token was reaped by a sibling's reapStale (id
+   * mismatch) or is absent. C1 (HIGH): a poller that holds the token across a
+   * long /usage poll MUST call this on every iteration; if it returns false,
+   * the poller must re-join the queue and wait its turn again (the sibling
+   * that reaped + claimed is now sending — re-joining serializes us behind
+   * it rather than racing a concurrent send that defeats the gate).
+   */
+  touchToken(ourId: string): boolean;
   /** Snapshot for status-bar display. */
   snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   /** Remove our waiter entry if still present (best-effort, used on abort). */
@@ -609,6 +622,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       waitForLaunch: () => Promise.resolve(() => {}),
       pauseUntil: () => {},
       clearPause: () => {},
+      touchToken: () => true,
       snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null }),
       cancel: () => {},
       reset: () => {},
@@ -806,6 +820,33 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         state.pausedReason = null;
         state.pausedTs = 0;
       });
+    },
+
+    touchToken(ourId: string): boolean {
+      // C1 (HIGH): the capacity-poll loop in acquireSlot holds the launch token
+      // across a long /usage poll (a pause-bounded wait can legitimately
+      // exceed 120s — see CORR4-3). reapStale reaps any token whose now -
+      // token.ts > staleTokenMs, regardless of liveness, so a poller that never
+      // re-stamps its token gets reaped at 120s while it keeps polling — a
+      // sibling claims and sends, the original poller breaks and sends too,
+      // and two processes send concurrently, defeating the gate (the exact
+      // 429 it exists to prevent). touchToken re-stamps state.token.ts to now
+      // on every poll iteration so the watchdog only reaps a TRULY hung poller.
+      // Returns false when the token was reaped (id mismatch) or absent — the
+      // caller must then re-join the queue and wait its turn.
+      try {
+        return mutate((now, state) => {
+          if (state.token && state.token.id === ourId) {
+            state.token.ts = now;
+            return true;
+          }
+          return false;
+        });
+      } catch {
+        // mutate throws on lock timeout / disk error — treat as not-our-token
+        // so the caller re-joins (safe default; the watchdog will clean up).
+        return false;
+      }
     },
 
     snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null } {

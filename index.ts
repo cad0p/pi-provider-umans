@@ -890,16 +890,33 @@ export default async function (pi: ExtensionAPI) {
   // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
   // waitForLaunch cancels the waiter entry and rejects immediately (C4/ADV-2).
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
-    const ourId = concurrencyQueue.join();
-    if (!ourId) return undefined; // queue disabled
+    const initialId = concurrencyQueue.join();
+    if (!initialId) return undefined; // queue disabled
+    // C1 (HIGH): ourId may be re-assigned below when touchToken returns false
+    // (token reaped by a sibling's reapStale) and we re-join the queue. join()
+    // returns null only when the queue is disabled, which is a creation-time
+    // flag — it cannot flip mid-loop — so the re-assignment is non-null.
+    let ourId: string = initialId;
     // Track whether we have already released our waiter entry so a throw
     // between join() and the return of a release fn cannot leak the waiter
     // for staleWaiterMs (5 min) (ADV-5). waitForLaunch itself cancels on
     // signal abort; this finally covers the non-abort throw paths (lock
-    // timeout, EACCES, ENOSPC).
+    // timeout, EACCES, ENOSPC) and the C1 token-reaped re-join path.
     let released = false;
+    // C1 (HIGH): if our launch token is reaped by a sibling's reapStale while
+    // we hold it across a long capacity poll (a pause-bounded wait can
+    // legitimately exceed 120s — see CORR4-3), touchToken returns false and
+    // we must re-join the queue + wait our turn again rather than race a
+    // concurrent send. Guarded re-entry: bail after a bounded number of
+    // re-joins so a pathological state (e.g. a sibling that reaps + crashes
+    // in a tight loop) cannot wedge us here forever — fall back to fail-open
+    // (the watchdog bounds the sibling's hold, and the hard_cap headroom
+    // absorbs one extra send, matching the /usage-unreachable stance).
+    const MAX_TOKEN_REJOINS = 3;
+    let releaseToken: () => void = () => {};
     try {
-      const releaseToken = await concurrencyQueue.waitForLaunch(ourId, signal);
+    tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
+      releaseToken = await concurrencyQueue.waitForLaunch(ourId, signal);
       // We are head + hold the launch token. Poll /usage until the server reports
       // a free slot (or the plan is unlimited) and the account isn't deprioritized.
       // The token stays held during the poll + the subsequent send so the next
@@ -952,13 +969,37 @@ export default async function (pi: ExtensionAPI) {
       // another 429 and extending the account-wide deprioritization — exactly
       // what the gate exists to prevent. Keep waiting when a known pause is
       // active; the pause has a bounded deadline (clamped to MAX_PAUSE_MS)
-      // and the 120s watchdog reaps the token if this process hangs.
+      // and C1's touchToken keeps the watchdog from reaping a legitimately
+      // long poll (the watchdog now only reaps a TRULY hung poller).
       const pollStart = Date.now();
       let stalled = false;
       // COV5-1: the branch logic lives in decideLaunch (pure, unit-tested). The
       // loop here drives the /usage fetch (capacityFree, I/O) and applies the
       // decision each iteration.
       for (;;) {
+        // C1 (HIGH): re-stamp our token's ts each iteration so the 120s
+        // watchdog does not reap a legitimately long capacity poll. If the
+        // token was already reaped by a sibling's reapStale (id mismatch or
+        // absent), touchToken returns false — bail out of this poll, cancel
+        // our (now-stale) waiter entry, re-join the queue, and wait our turn
+        // again. The sibling that reaped + claimed is now sending; re-joining
+        // serializes us behind it rather than racing a concurrent send that
+        // would defeat the gate.
+        if (!concurrencyQueue.touchToken(ourId)) {
+          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
+          if (rejoins >= MAX_TOKEN_REJOINS) {
+            // Pathological state: reaped + re-joined too many times. Fail
+            // open rather than loop forever (bounded by the watchdog + the
+            // hard_cap headroom, same stance as /usage-unreachable).
+            stalled = true;
+            break;
+          }
+          ourId = concurrencyQueue.join()!;
+          // join() returns null only when the queue is disabled, which is a
+          // creation-time flag — it cannot flip mid-loop. The non-null
+          // assertion mirrors the initial join() above.
+          continue tokenAcquire; // re-wait our turn
+        }
         const isFree = await capacityFree();
         const decision = decideLaunch({
           isFree,
@@ -994,6 +1035,9 @@ export default async function (pi: ExtensionAPI) {
         releaseToken();
         concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
       };
+    } // end tokenAcquire
+    // Unreachable: the loop above always either returns or throws. Defensive.
+    return undefined;
     } finally {
       // If we exited without returning a release fn (throw, abort, or a path
       // that didn't set `released`), cancel our waiter entry so it doesn't
