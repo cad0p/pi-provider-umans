@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -2582,6 +2582,206 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     }
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// --- COV7-3: concurrentSessions ?? 0 + full cap fallback chain ---
+// isCapacityFree's `cur = snap.concurrentSessions ?? 0` (undefined -> 0) and
+// `cap = snap.hardCap ?? snap.limit ?? inputs.limit` (full chain) were untested.
+// Pin: undefined concurrentSessions alone, + all caps undefined (falls to 0 /
+// inputs.limit).
+{
+  const okState = { low: false, until: 0, reason: null };
+  // concurrentSessions undefined, hard_cap present -> cap = hardCap, cur = 0 -> free.
+  assert(isCapacityFree(
+    { concurrentSessions: undefined, limit: 2, hardCap: 4, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === true, "COV7-3: undefined concurrentSessions -> 0 (cur 0 < cap 4 -> free)");
+  // concurrentSessions undefined, hardCap undefined, limit present -> cap = snap.limit.
+  assert(isCapacityFree(
+    { concurrentSessions: undefined, limit: 2, hardCap: undefined, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === true, "COV7-3: undefined concurrentSessions + undefined hardCap -> cap = snap.limit (cur 0 < 2 -> free)");
+  // ALL caps undefined (snap.limit + snap.hardCap undefined) -> cap = inputs.limit.
+  assert(isCapacityFree(
+    { concurrentSessions: undefined, limit: undefined, hardCap: undefined, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === true, "COV7-3: all snap caps undefined -> cap = inputs.limit (cur 0 < 2 -> free)");
+  // ALL caps undefined + inputs.limit undefined -> cap undefined -> free (unlimited).
+  assert(isCapacityFree(
+    { concurrentSessions: undefined, limit: undefined, hardCap: undefined, priority: okState },
+    { limit: undefined, queuePaused: false },
+  ).free === true, "COV7-3: all caps undefined + inputs.limit undefined -> cap undefined -> free (no cap to exceed)");
+}
+
+// --- COV7-4: disabled-mode stub methods are no-ops + snapshot stays empty ---
+// The disabled stub (touchToken/clearPause/cancel/pauseUntil/reset) was only
+// partially tested. Exercise every stub method + assert no throw + snapshot
+// stays empty.
+{
+  const q = createConcurrencyQueue({ disabled: true });
+  assert(q.join() === null, "COV7-4: disabled join returns null");
+  const r = await q.waitForLaunch("ignored");
+  assert(typeof r === "function", "COV7-4: disabled waitForLaunch resolves with noop release");
+  r();
+  // Every stub method must be a no-op (no throw).
+  let threw = false;
+  try {
+    assert(q.touchToken("ignored") === true, "COV7-4: disabled touchToken returns true");
+    q.clearPause();
+    q.clearPause({ force: true });
+    q.cancel("ignored");
+    q.pauseUntil(Date.now() + 10_000, "ignored");
+    q.reset();
+  } catch { threw = true; }
+  assert(!threw, "COV7-4: disabled stub methods do not throw");
+  const snap = q.snapshot();
+  assert(snap.queued === 0 && snap.tokenHeld === false && snap.paused === false &&
+    snap.pausedUntil === 0 && snap.pausedReason === null,
+    "COV7-4: disabled snapshot stays empty after every stub method");
+}
+
+// --- COV7-5: queuePaused takes precedence over priority.low ---
+// isCapacityFree checks queuePaused BEFORE priority.low. When both are true,
+// free===false AND repause===undefined (the queue pause wins; no repause pushed
+// because the shared pause is already active).
+{
+  const lowState = { low: true, until: 1_000_000, reason: "burst" };
+  const r = isCapacityFree(
+    { concurrentSessions: 0, limit: 2, hardCap: 4, priority: lowState },
+    { limit: 2, queuePaused: true },
+  );
+  assert(r.free === false, "COV7-5: queuePaused + priority.low -> not free");
+  assert(r.repause === undefined, "COV7-5: queuePaused precedence -> no repause (shared pause already active)");
+}
+
+// --- COV7-7: parsePriority non-boolean low + non-string reason ---
+// parsePriority accepts { low?: boolean | null }. A non-boolean low (string,
+// number) is coerced to false; a non-string reason is nulled. Previously only
+// strict booleans were tested.
+{
+  assert(parsePriority({ low: "true" }).low === false, "COV7-7: parsePriority low='true' (string) -> false");
+  assert(parsePriority({ low: 1 }).low === false, "COV7-7: parsePriority low=1 (number) -> false");
+  assert(parsePriority({ low: null }).low === false, "COV7-7: parsePriority low=null -> false");
+  const p = parsePriority({ low: true, reason: 123 });
+  assert(p.low === true && p.reason === null, "COV7-7: parsePriority non-string reason -> null");
+  const p2 = parsePriority({ low: true, reason: { obj: true } });
+  assert(p2.reason === null, "COV7-7: parsePriority object reason -> null");
+}
+
+// --- COV7-8: pauseUntil extension / shrink / undefined-reason ---
+// pauseUntil extends when the new deadline is later, ignores when earlier, and
+// an undefined reason leaves pausedReason null (not stale). Pin all three.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov7-8-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Set pause A (10s, "first").
+  const t0 = Date.now();
+  q.pauseUntil(t0 + 10_000, "first");
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === t0 + 10_000 && st.pausedReason === "first",
+    "COV7-8: pause A (10s, first) written");
+
+  // Set pause B (30s, "second") -> extended + reason "second".
+  q.pauseUntil(t0 + 30_000, "second");
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === t0 + 30_000 && st.pausedReason === "second",
+    "COV7-8: pause B (30s, second) extends + overwrites reason");
+
+  // Set pause C (5s, "shorter") -> deadline earlier -> unchanged + still "second".
+  q.pauseUntil(t0 + 5_000, "shorter");
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === t0 + 30_000 && st.pausedReason === "second",
+    "COV7-8: pause C (5s, shorter) ignored (deadline earlier, reason unchanged)");
+
+  // pauseUntil(until, undefined) on a fresh queue -> pausedReason === null.
+  q.clearPause({ force: true });
+  q.pauseUntil(t0 + 20_000, undefined);
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedReason === null, "COV7-8: pauseUntil with undefined reason -> pausedReason null");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- COV7-9: pickSearchModel (mirrors pickVisionModel coverage) ---
+// pickSearchModel is exported but was untested. Defaults to umans-flash when
+// present + non-deprecated; falls back to the first tool-capable model when
+// flash is absent/deprecated; returns the default id when no tool-capable model.
+{
+  const FLASH = { name: "umans-flash", capabilities: { supports_tools: true } };
+  const CODER = { name: "umans-coder", capabilities: { supports_tools: true } };
+  const NOTOOL = { name: "umans-notool", capabilities: { supports_tools: false } };
+  assert(pickSearchModel({ "umans-flash": FLASH as any }) === "umans-flash",
+    "COV7-9: default flash present -> umans-flash");
+  // flash deprecated -> first tool-capable.
+  assert(pickSearchModel({ "umans-flash": { ...FLASH, deprecation: "old" } as any, "umans-coder": CODER as any }) === "umans-coder",
+    "COV7-9: flash deprecated -> first tool-capable (umans-coder)");
+  // flash absent -> first tool-capable.
+  assert(pickSearchModel({ "umans-coder": CODER as any }) === "umans-coder",
+    "COV7-9: flash absent -> first tool-capable");
+  // no tool-capable -> returns default id.
+  assert(pickSearchModel({ "umans-notool": NOTOOL as any }) === "umans-flash",
+    "COV7-9: no tool-capable -> returns default id (umans-flash)");
+}
+
+// --- COV7-10: formatStatusText rendering (extracted pure helper) ---
+// statusText was a closure (not exported), so the status-bar rendering was
+// untested. formatStatusText is the pure seam: queued>0 + tokenHeld ->
+// `q N*`; paused -> `PAUSED Ns (reason)`; paused with elapsed pausedUntil ->
+// `PAUSED 0s` (not negative); empty -> no queue part.
+{
+  const now = 1_700_000_000_000;
+  // queued + tokenHeld -> q N*.
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 3, tokenHeld: true, paused: false, pausedUntil: 0, pausedReason: null },
+    now,
+  }).includes("q 3*"), "COV7-10: queued>0 + tokenHeld -> q N* part");
+  // queued + not tokenHeld -> q N (no star).
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 2, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
+    now,
+  }).includes("q 2") && !formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 2, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
+    now,
+  }).includes("q 2*"), "COV7-10: queued + not tokenHeld -> q N (no star)");
+  // paused -> PAUSED Ns (reason).
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now + 30_000, pausedReason: "HTTP 429 from gateway" },
+    now,
+  }).includes("PAUSED 30s (HTTP 429 from gateway)"), "COV7-10: paused -> PAUSED Ns (reason)");
+  // paused with elapsed pausedUntil -> PAUSED 0s (not negative).
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now - 5_000, pausedReason: null },
+    now,
+  }).includes("PAUSED 0s"), "COV7-10: elapsed pause -> PAUSED 0s (not negative)");
+  // empty queue (queued 0, not held, not paused) -> no queue part.
+  const empty = formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    queueSnap: { queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
+    now,
+  });
+  assert(!empty.includes("q ") && !empty.includes("PAUSED"),
+    "COV7-10: empty queue -> no q/PAUSED part");
+  assert(empty.startsWith("Umans ") && empty.includes("Conc 1/2"),
+    "COV7-10: base Umans + Conc current/guaranteed always present");
+  // concurrencyDisabled -> no queue part even if snap has queued.
+  const disabled = formatStatusText({
+    effectiveLimit: undefined, currentConcurrency: undefined,
+    queueSnap: { queued: 5, tokenHeld: true, paused: true, pausedUntil: now + 30_000, pausedReason: "x" },
+    concurrencyDisabled: true,
+    now,
+  });
+  assert(!disabled.includes("q ") && !disabled.includes("PAUSED"),
+    "COV7-10: concurrencyDisabled -> no queue/PAUSED part");
+  assert(disabled.includes("Conc ?/?"), "COV7-10: undefined limits render ?/?");
 }
 
 console.log("\nall checks passed");

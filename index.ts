@@ -420,6 +420,50 @@ export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string
   return defaultId;
 }
 
+/**
+ * COV7-10: pure formatter for the status-bar text, extracted from the
+ * `statusText` closure so the rendering (TTFT/TPS, Conc current/guaranteed,
+ * Req, q N*, PAUSED Ns (reason), elapsed-pause clamps to 0s not negative) is
+ * unit-testable without the pi runtime. The closure in index.ts builds the
+ * inputs (effectiveLimit, currentConcurrency, requestLimit/Used, the queue
+ * snapshot, concurrencyDisabled) + delegates to this helper.
+ */
+export function formatStatusText(opts: {
+  metrics?: { ttft?: number; tps?: number };
+  effectiveLimit?: number;
+  currentConcurrency?: number;
+  requestLimit?: number;
+  requestsUsed?: number;
+  queueSnap?: { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
+  concurrencyDisabled?: boolean;
+  now?: number;
+}): string {
+  const parts: string[] = [];
+  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, now } = opts;
+  if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
+  if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
+  const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
+  const current = currentConcurrency !== undefined ? String(currentConcurrency) : "?";
+  parts.push(`Conc ${current}/${guaranteed}`);
+  if (requestsUsed !== undefined && requestLimit !== undefined) {
+    parts.push(`Req ${requestsUsed}/${requestLimit}`);
+  }
+  if (!concurrencyDisabled && queueSnap) {
+    if (queueSnap.queued > 0 || queueSnap.tokenHeld) {
+      parts.push(`q ${queueSnap.queued}${queueSnap.tokenHeld ? "*" : ""}`);
+    }
+    if (queueSnap.paused) {
+      // Clamp to 0s so an elapsed pause (pausedUntil <= now) renders "PAUSED 0s",
+      // not a negative number (the closure re-checks paused via snapshot, but
+      // a racing tick between the check + the render could otherwise go negative).
+      const secs = Math.max(0, Math.round((queueSnap.pausedUntil - (now ?? Date.now())) / 1000));
+      const reason = queueSnap.pausedReason ? ` (${queueSnap.pausedReason})` : "";
+      parts.push(`PAUSED ${secs}s${reason}`);
+    }
+  }
+  return `Umans ${parts.join(" │ ")}`;
+}
+
 export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
@@ -761,39 +805,17 @@ export default async function (pi: ExtensionAPI) {
   }
 
   function statusText(metrics?: { ttft?: number; tps?: number }) {
-    const parts: string[] = [];
-    if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
-    if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
-    // The effective cap honors UMANS_CONCURRENCY_LIMIT over the live server
-    // value, so the bar reflects what the queue capacity check uses.
-    const effectiveLimit = concurrencyLimit();
-    const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
-    // Real account-wide conc from /v1/usage (includes other clients/machines).
-    // Refreshed only by the 5s poll; shows "?" until first poll lands.
-    const current = currentConcurrency !== undefined ? String(currentConcurrency) : "?";
-    parts.push(`Conc ${current}/${guaranteed}`);
-    // Only show request usage when the plan has a hard limit (e.g. the $20 tier).
-    if (requestsUsed !== undefined && requestLimit !== undefined) {
-      parts.push(`Req ${requestsUsed}/${requestLimit}`);
-    }
-    // Cross-process queue: queued waiters across all local pi processes, plus
-    // a launch/PAUSED indicator. `tokenHeld` means this process is polling
-    // /usage or mid-send; `queued` is the FIFO depth in the shared file.
-    if (!concurrencyDisabled) {
-      const snap = concurrencyQueue.snapshot();
-      if (snap.queued > 0 || snap.tokenHeld) {
-        parts.push(`q ${snap.queued}${snap.tokenHeld ? "*" : ""}`);
-      }
-      if (snap.paused) {
-        const secs = Math.max(0, Math.round((snap.pausedUntil - Date.now()) / 1000));
-        // CMP-LOW-4: surface the pause reason (e.g. "HTTP 429 from gateway", or
-        // the server's priority.reason) alongside the deadline so the user
-        // knows WHY the account is backed off, not just how long.
-        const reason = snap.pausedReason ? ` (${snap.pausedReason})` : "";
-        parts.push(`PAUSED ${secs}s${reason}`);
-      }
-    }
-    return `Umans ${parts.join(" │ ")}`;
+    // COV7-10: delegates to the pure formatStatusText helper so the rendering
+    // is unit-testable. The closure supplies the live inputs.
+    return formatStatusText({
+      metrics,
+      effectiveLimit: concurrencyLimit(),
+      currentConcurrency,
+      requestLimit,
+      requestsUsed,
+      queueSnap: concurrencyQueue.snapshot(),
+      concurrencyDisabled,
+    });
   }
 
   function setWidget(ctx: any, text?: string) {
