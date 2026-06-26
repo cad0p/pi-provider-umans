@@ -362,7 +362,14 @@ export function readState(path: string, now: number): QueueState {
       waiters,
       token,
       pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
-      pausedReason: parsed.pausedReason ?? null,
+      // COV6-1 / SEC6-1: sanitize pausedReason on the READ boundary too. SEC5-1
+      // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
+      // but readState passed parsed.pausedReason straight through → snapshot() →
+      // status bar/notify render raw. A hand-edited file, a compromised sibling
+      // writing JSON directly, or a file poisoned by an earlier unfixed build
+      // surfaces the raw string. The write-boundary sanitize is the primary
+      // guard; this closes the hand-edited-file gap (defense-in-depth).
+      pausedReason: sanitizeReason(parsed.pausedReason ?? null),
       pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
     };
   } catch {

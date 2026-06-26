@@ -333,6 +333,47 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV6-1 / SEC6-1: readState sanitizes pausedReason on the READ boundary ---
+// SEC5-1 sanitizes at the write boundary (pauseUntil) + parse path, but a
+// hand-edited file, a compromised sibling writing JSON directly, or a file
+// poisoned by an earlier unfixed build surfaces the raw string via readState
+// → snapshot() → status bar. readState must run pausedReason through
+// sanitizeReason too (defense-in-depth, the other half of SEC5-1's claim).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov6-1-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync } = await import("node:fs");
+
+  // Poison the file directly with an ANSI-escape + 200-char payload, bypassing
+  // every write-boundary sanitize. A pausedUntil in the future keeps the pause
+  // "active" so snapshot() surfaces pausedReason (the render path).
+  const poisoned = "\x1b[31mBOGUS\x1b[0m " + "X".repeat(200);
+  const future = Date.now() + 60_000;
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    pausedUntil: future, pausedReason: poisoned, pausedTs: Date.now(),
+  }));
+
+  // readState must return a capped, control-char-free string.
+  const st = readState(stateFile, Date.now());
+  assert(st.pausedReason !== null && st.pausedReason.length <= 64,
+    "COV6-1/SEC6-1: readState caps poisoned pausedReason to <= 64 chars");
+  assert(!/[\x00-\x1f\x7f]/.test(st.pausedReason ?? ""),
+    "COV6-1/SEC6-1: readState strips control/ANSI-escape chars from poisoned pausedReason");
+  assert(!st.pausedReason!.includes("\x1b"),
+    "COV6-1/SEC6-1: readState removes the ESC byte from poisoned pausedReason");
+
+  // snapshot() (the render path) must surface the same clean string.
+  const q = createConcurrencyQueue({ stateFile });
+  const snap = q.snapshot();
+  assert(snap.pausedReason !== null && snap.pausedReason.length <= 64,
+    "COV6-1/SEC6-1: snapshot().pausedReason is capped after read sanitize");
+  assert(!/[\x00-\x1f\x7f]/.test(snap.pausedReason ?? ""),
+    "COV6-1/SEC6-1: snapshot().pausedReason has no control/ANSI-escape chars after read sanitize");
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV-HIGH-3: readState corrupt-input fixtures ---
 // readState guards waiters (Array.isArray + per-entry shape), pausedUntil/pausedTs
 // (typeof number), token (shape), and falls back to empty on JSON throw.
