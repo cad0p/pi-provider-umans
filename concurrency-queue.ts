@@ -132,6 +132,22 @@ export const PRIORITY_BACKOFF_MS = 30_000;
 export const MAX_PAUSE_MS = 5 * 60 * 60 * 1000; // 18,000,000 ms
 
 /**
+ * Tighter ceiling for a 429-sourced pause (5 × PRIORITY_BACKOFF_MS = 2.5 min).
+ * ADV4-2: a server returning 429 forever (e.g. a misconfigured UMANS_BASE_URL)
+ * writes a fresh pausedUntil on every turn, each extending the shared pause up
+ * to the 5h MAX_PAUSE_MS ceiling — wedging all local pi processes for the real
+ * Umans account-pause duration even though the 429 source is non-account-wide.
+ * A 429 without a server-pushed boxed_until is capped tighter (2.5 min) so a
+ * misconfigured base URL cannot wedge the account for hours; the server's
+ * priority.low pause (a real account-wide deprio) still uses the 5h ceiling.
+ * The 2.5 min cap is still >> the 30s PRIORITY_BACKOFF_MS floor, so a real 429
+ * with a short Retry-After is honored, and repeated 429s extend up to 2.5 min
+ * before the gate re-tries (better to re-try into a possibly-recovered account
+ * than wedge for 5h on a misconfigured URL).
+ */
+export const MAX_PAUSE_429_MS = 5 * PRIORITY_BACKOFF_MS; // 150,000 ms (2.5 min)
+
+/**
  * Reason tag written by the 429 handler (index.ts after_provider_response).
  * CORR4-1: /usage LAGS a 429 (the design acknowledges this at the capacityFree
  * doc-comment), so a stale 5s refreshUsage tick reporting priority.low===false
@@ -144,13 +160,14 @@ export const MAX_PAUSE_MS = 5 * 60 * 60 * 1000; // 18,000,000 ms
 export const PAUSE_REASON_429 = "HTTP 429 from gateway";
 
 /**
- * Clamp a candidate pause deadline to now + MAX_PAUSE_MS so a poisoned or
+ * Clamp a candidate pause deadline to now + MAX_PAUSE_MS (or a tighter ceiling
+ * when passed — e.g. MAX_PAUSE_429_MS for a 429-sourced pause) so a poisoned or
  * over-large Retry-After/boxed_until cannot wedge the queue for centuries.
  * Exported so the provider (index.ts) can clamp its Retry-After parse to the
  * same ceiling.
  */
-export function clampPauseUntil(until: number, now: number = Date.now()): number {
-  const ceiling = now + MAX_PAUSE_MS;
+export function clampPauseUntil(until: number, now: number = Date.now(), ceilingMs: number = MAX_PAUSE_MS): number {
+  const ceiling = now + ceilingMs;
   return until > ceiling ? ceiling : until;
 }
 
@@ -671,7 +688,15 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     pauseUntil(until: number, reason?: string | null): void {
       mutate((now, state) => {
-        const clamped = clampPauseUntil(until, now);
+        // ADV4-2: a 429-sourced pause (tagged PAUSE_REASON_429) is clamped to
+        // the tighter MAX_PAUSE_429_MS (2.5 min) ceiling so a misconfigured
+        // UMANS_BASE_URL returning 429 forever cannot wedge the account for the
+        // full 5h MAX_PAUSE_MS. A server priority.low pause (the other caller)
+        // keeps the 5h ceiling (a real account-wide deprio). The 2.5 min cap is
+        // still >> the 30s PRIORITY_BACKOFF_MS floor, so a real 429 with a short
+        // Retry-After is honored.
+        const ceilingMs = reason === PAUSE_REASON_429 ? MAX_PAUSE_429_MS : MAX_PAUSE_MS;
+        const clamped = clampPauseUntil(until, now, ceilingMs);
         if (clamped > state.pausedUntil) {
           state.pausedUntil = clamped;
           state.pausedReason = reason ?? state.pausedReason ?? null;

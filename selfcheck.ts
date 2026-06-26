@@ -20,6 +20,7 @@ import {
   parseConcurrencyLimit,
   MAX_PAUSE_MS,
   PAUSE_REASON_429,
+  MAX_PAUSE_429_MS,
 } from "./concurrency-queue.ts";
 
 function vision(name: string, v: boolean | "via-handoff" = true, deprecation?: unknown) {
@@ -387,6 +388,52 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(parseRetryAfter(" -5 ") === now + 30_000, "Retry-After negative-with-spaces rejected -> 30s floor");
   assert(parseRetryAfter("") === now + 30_000, "Retry-After empty -> 30s floor");
   assert(parseRetryAfter("99999999") === now + MAX_PAUSE_MS, "Retry-After huge int clamped to now + MAX_PAUSE_MS");
+}
+
+// --- ADV4-2: a 429-sourced pause is clamped tighter than the 5h ceiling ---
+// A server returning 429 forever (e.g. a misconfigured UMANS_BASE_URL) writes
+// a fresh pausedUntil on every turn, each extending the shared pause up to the
+// 5h MAX_PAUSE_MS ceiling — wedging all local pi processes for the real Umans
+// account-pause duration even though the 429 source is non-account-wide.
+// pauseUntil now clamps a 429-origin pause (tagged PAUSE_REASON_429) to the
+// tighter MAX_PAUSE_429_MS (2.5 min = 5 × PRIORITY_BACKOFF_MS) ceiling, while a
+// server priority.low pause keeps the 5h ceiling. The 2.5 min cap is still >>
+// the 30s floor, so a real 429 with a short Retry-After is honored.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+  const { readFileSync } = await import("node:fs");
+
+  // A 429 with a huge Retry-After (5h+) is clamped to MAX_PAUSE_429_MS (2.5 min),
+  // NOT the 5h MAX_PAUSE_MS ceiling.
+  const before = Date.now();
+  q.pauseUntil(before + 10 * 60 * 60 * 1000, PAUSE_REASON_429); // 10h requested
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil <= before + MAX_PAUSE_429_MS + 1000, // +1s slack
+    "ADV4-2: 429-sourced pause clamped to MAX_PAUSE_429_MS (2.5 min), not 5h");
+  assert(st.pausedUntil < before + MAX_PAUSE_MS,
+    "ADV4-2: 429 pause is tighter than the 5h ceiling");
+  assert(st.pausedReason === PAUSE_REASON_429, "ADV4-2: 429 pause tagged with PAUSE_REASON_429");
+
+  // A non-429 pause (priority.low-origin) keeps the 5h ceiling.
+  q.clearPause({ force: true });
+  const beforeLow = Date.now();
+  q.pauseUntil(beforeLow + 10 * 60 * 60 * 1000, "priority.low from /usage"); // 10h requested
+  const stLow = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stLow.pausedUntil <= beforeLow + MAX_PAUSE_MS + 1000 && stLow.pausedUntil > beforeLow + MAX_PAUSE_429_MS,
+    "ADV4-2: priority.low pause keeps the 5h ceiling (not the tighter 429 cap)");
+
+  // clampPauseUntil with the tighter ceiling is also used by the 429 handler
+  // in index.ts for the Retry-After parse.
+  const now = 1_700_000_000_000;
+  assert(clampPauseUntil(now + 10 * 60 * 60 * 1000, now, MAX_PAUSE_429_MS) === now + MAX_PAUSE_429_MS,
+    "ADV4-2: clampPauseUntil(until, now, MAX_PAUSE_429_MS) clamps to the 2.5 min ceiling");
+  assert(clampPauseUntil(now + 60_000, now, MAX_PAUSE_429_MS) === now + 60_000,
+    "ADV4-2: clampPauseUntil sub-2.5min pause unchanged");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // --- S2: reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---

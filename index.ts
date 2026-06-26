@@ -44,6 +44,7 @@ import {
   parseConcurrencyLimit,
   PRIORITY_BACKOFF_MS,
   PAUSE_REASON_429,
+  MAX_PAUSE_429_MS,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -1389,11 +1390,14 @@ export default async function (pi: ExtensionAPI) {
         // an HTTP-date. We only accept the integer form: Number() accepts
         // hex ("0x10"=16), scientific notation ("1e10"=1e10), and other
         // misparses that can wedge the queue (S2/S4). Parse strictly and cap
-        // the resulting deadline at now + MAX_PAUSE_MS via clampPauseUntil.
+        // the resulting deadline at now + MAX_PAUSE_429_MS via clampPauseUntil
+        // (ADV4-2: a 429-sourced pause is clamped tighter than the 5h ceiling
+        // so a misconfigured UMANS_BASE_URL returning 429 forever cannot wedge
+        // the account for hours; pauseUntil also enforces this ceiling).
         const trimmed = String(retryAfter).trim();
         if (/^\d+$/.test(trimmed)) {
           const secs = parseInt(trimmed, 10);
-          if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000);
+          if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000, Date.now(), MAX_PAUSE_429_MS);
         }
       }
       // COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS).
