@@ -1260,7 +1260,7 @@ export default async function (pi: ExtensionAPI) {
   }
   // CLN2-L5: message_end and turn_end both release the oldest inflight slot
   // (one-per-turn, FIFO order). Dedupe the two-line body into a helper. The
-  // agent_end drain loop is a different shape (while size) and stays as-is.
+  // agent_end and session_shutdown drains (while size) also use it.
   function releaseOldest(): void {
     const oldest = inflightSlots.values().next().value;
     releaseSlot(oldest);
@@ -1435,10 +1435,9 @@ export default async function (pi: ExtensionAPI) {
     if (ctx.model?.provider !== "umans") return;
     liveRequest = undefined;
     // Drain any slots still held (e.g. aborted turns that never reached
-    // turn_end / after_provider_response) so the gate never deadlocks.
+    // message_end / turn_end) so the gate never deadlocks.
     while (inflightSlots.size) {
-      const oldest = inflightSlots.values().next().value;
-      releaseSlot(oldest);
+      releaseOldest();
     }
     updateStatus(ctx);
   });
