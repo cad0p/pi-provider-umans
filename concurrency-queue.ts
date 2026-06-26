@@ -747,10 +747,12 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // safe — token release is closure-captured per waitForLaunch — but a Set is
   // used here because waiters accumulate.
   const ourWaiterIds: Set<string> = new Set();
-  // Kept as the most-recent id for the cancel(ourId) hot path (release in
-  // acquireSlot passes the specific id it joined with, so the Set is the
-  // source of truth; this is just a convenience handle).
-  let ourWaiterId: string | null = null;
+  // CLN7-1: ourWaiterIds (Set) is the sole source of truth for this process's
+  // waiter ids. The dead `let ourWaiterId` single-slot (leftover from the
+  // COV6-2 Set refactor) was written in join() and cleared in release/cancel/
+  // reset but NEVER read to drive any behavior — cancel takes ourId as a
+  // parameter and consults the Set. Deleted. The ourTokenId single-slot is
+  // safe (token release is closure-captured per waitForLaunch) — kept.
   // CORR7-2: a per-instance AbortController that reset() aborts to stop any
   // in-flight waitForLaunch poll loop on the same queue instance. Without it,
   // reset() splices our waiter id from the file, but a concurrent poll loop's
@@ -783,7 +785,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         state.waiters.push({ id, pid: ourPid(), ts: now });
       });
       ourWaiterIds.add(id);
-      ourWaiterId = id;
       return id;
     },
 
@@ -877,9 +878,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
                   ourTokenId = null;
                 }
                 ourWaiterIds.delete(ourId);
-                if (ourWaiterId === ourId) {
-                  ourWaiterId = null;
-                }
               });
             });
             return;
@@ -1005,9 +1003,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           ourTokenId = null;
         }
         ourWaiterIds.delete(ourId);
-        if (ourWaiterId === ourId) {
-          ourWaiterId = null;
-        }
       });
     },
 
@@ -1030,7 +1025,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // (the watchdog reaps stale token/waiter entries) and stale-lockfile
       // recovery. Matches the scope of `cancel`.
       // COV5-5 / ADV5-4: also splice out a queued-but-not-launched waiter
-      // (ourTokenId === null, ourWaiterId set). Without this, a process that
+      // (ourTokenId === null, ourWaiterIds non-empty). Without this, a process that
       // join()ed but is still queued has reset() as a no-op, leaking the
       // waiter for staleWaiterMs (5 min) if the process doesn't exit —
       // blocking siblings behind a dead-PID entry.
@@ -1055,7 +1050,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       holdsToken = false;
       ourTokenId = null;
       ourWaiterIds.clear();
-      ourWaiterId = null;
     },
   };
 }
