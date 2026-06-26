@@ -374,7 +374,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   const id2 = q.join()!;
   // Manually claim the token for id1 by waiting for launch.
   await q.waitForLaunch(id1);
-  assert(q.holdsToken() === true, "COV-HIGH-4: id1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "COV-HIGH-4: id1 holds the token");
 
   // cancel a non-existent id → no-op (id1, id2, and token all unchanged).
   q.cancel("does-not-exist");
@@ -395,7 +395,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.token === null, "COV-HIGH-4: cancel token-holder releases the token");
   assert(st.waiters.length === 0, "COV-HIGH-4: cancel token-holder removes its waiter");
-  assert(q.holdsToken() === false, "COV-HIGH-4: holdsToken false after cancel");
+  assert(q.snapshot().tokenHeld === false, "COV-HIGH-4: holdsToken false after cancel");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -613,7 +613,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   let r1!: () => void;
   const p1 = q.waitForLaunch(id1!).then((r) => { r1 = r; return r; });
   await p1;
-  assert(q.holdsToken() === true, "first waiter holds the launch token");
+  assert(q.snapshot().tokenHeld === true, "first waiter holds the launch token");
 
   // Second waiter joins but must NOT claim the token (held by 1).
   const id2 = q.join();
@@ -628,7 +628,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   r1();
   await p2;
   assert(got2, "second waiter claims token after 1 releases");
-  assert(q.holdsToken() === true, "second waiter now holds token");
+  assert(q.snapshot().tokenHeld === true, "second waiter now holds token");
   r2();
   assert(q.snapshot().queued === 0, "queue drains after both release");
 
@@ -648,7 +648,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // 1 claims the token.
   const id1 = q.join()!;
   const r1 = await q.waitForLaunch(id1);
-  assert(q.holdsToken() === true, "COV-HIGH-5: w1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: w1 holds the token");
 
   // 2 + 3 queue behind 1.
   const id2 = q.join()!;
@@ -664,7 +664,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   r1();
   await p2;
   assert(typeof got2 === "function", "COV-HIGH-5: w2 claims after w1 releases");
-  assert(q.holdsToken() === true, "COV-HIGH-5: w2 now holds token");
+  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: w2 now holds token");
   await new Promise((r) => setTimeout(r, 80));
   assert(!got3, "COV-HIGH-5: w3 still blocked while w2 holds token");
 
@@ -679,7 +679,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // long-running poller. idHolder claims first; idLate joins behind it.
   const idHolder = q.join()!;
   const rHolder = await q.waitForLaunch(idHolder);
-  assert(q.holdsToken() === true, "COV-HIGH-5: late-joiner setup — holder holds token");
+  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: late-joiner setup — holder holds token");
   const idLate = q.join()!;
   let gotLate = false;
   const pLate = q.waitForLaunch(idLate).then((r) => { gotLate = true; return r; });
@@ -1051,7 +1051,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // staleTokenMs defaults to 120s, so it survives the test window.
   const idHolder = q.join()!;
   const rHolder = await q.waitForLaunch(idHolder);
-  assert(q.holdsToken() === true, "COV4-4: token held by the holder");
+  assert(q.snapshot().tokenHeld === true, "COV4-4: token held by the holder");
 
   // Waiter 1 joins → becomes head (behind the held token).
   const id1 = q.join()!;
@@ -1133,7 +1133,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const r = await q.waitForLaunch("ignored");
   assert(typeof r === "function", "disabled: waitForLaunch resolves with noop release");
   r();
-  assert(q.snapshot().queued === 0 && q.holdsToken() === false, "disabled: snapshot empty");
+  assert(q.snapshot().queued === 0 && q.snapshot().tokenHeld === false, "disabled: snapshot empty");
 }
 
 // --- reset() does not wipe a sibling's queue state (S1) ---
@@ -1235,7 +1235,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // First waiter holds the token so the second one blocks in waitForLaunch.
   const id1 = q.join()!;
   const r1 = await q.waitForLaunch(id1);
-  assert(q.holdsToken() === true, "abort test: first waiter holds the token");
+  assert(q.snapshot().tokenHeld === true, "abort test: first waiter holds the token");
 
   // Second waiter joins and blocks — its entry is now queued in the file.
   const id2 = q.join()!;
@@ -1262,7 +1262,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // (its promise already rejected; this proves no token leak).
   r1();
   await new Promise((r) => setTimeout(r, 80));
-  assert(q.holdsToken() === false, "abort test: no orphan claimed the token");
+  assert(q.snapshot().tokenHeld === false, "abort test: no orphan claimed the token");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1320,7 +1320,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     try {
       const release = await q.waitForLaunch(id, signal);
       // While the side-call is in-flight, THIS process holds the token.
-      assert(q.holdsToken() === true, "COV2-H2: side-call holds the token during work");
+      assert(q.snapshot().tokenHeld === true, "COV2-H2: side-call holds the token during work");
       // Simulate the side-request body (no actual HTTP).
       await new Promise((r) => setTimeout(r, 10));
       release();
@@ -1332,7 +1332,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   await sideCall();
   // After the side-call, the token is free and no waiters remain.
-  assert(q.holdsToken() === false, "COV2-H2: token released after side-call completes");
+  assert(q.snapshot().tokenHeld === false, "COV2-H2: token released after side-call completes");
   assert(q.snapshot().queued === 0, "COV2-H2: no leaked waiter after side-call");
 
   q.reset();
@@ -1354,22 +1354,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Main turn acquires (before_provider_request).
   const id1 = q.join()!;
   const r1 = await q.waitForLaunch(id1);
-  assert(q.holdsToken() === true, "COV2-H1: main turn holds token after acquire");
+  assert(q.snapshot().tokenHeld === true, "COV2-H1: main turn holds token after acquire");
 
   // message_end fires (stream complete): release the slot.
   r1();
-  assert(q.holdsToken() === false, "COV2-H1: token freed at message_end");
+  assert(q.snapshot().tokenHeld === false, "COV2-H1: token freed at message_end");
 
   // A sibling turn can now acquire immediately (the slot was freed during
   // this turn's tool execution, not held to turn_end).
   const id2 = q.join()!;
   const r2 = await q.waitForLaunch(id2);
-  assert(q.holdsToken() === true, "COV2-H1: sibling acquires immediately after message_end release");
+  assert(q.snapshot().tokenHeld === true, "COV2-H1: sibling acquires immediately after message_end release");
 
   // turn_end safety net on the first turn is a no-op (already released).
   // r1 was already called; calling its underlying cancel is a no-op.
   q.cancel(id1);
-  assert(q.holdsToken() === true, "COV2-H1: turn_end safety net after message_end is a no-op (token held by sibling)");
+  assert(q.snapshot().tokenHeld === true, "COV2-H1: turn_end safety net after message_end is a no-op (token held by sibling)");
 
   r2();
   q.reset();
@@ -1439,7 +1439,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile });
   const id1 = q.join()!;
   await q.waitForLaunch(id1);
-  assert(q.holdsToken() === true, "ADV4-1: waiter 1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "ADV4-1: waiter 1 holds the token");
 
   // Waiter 2 joins + starts polling. Its FIRST poll runs synchronously inside
   // the Promise executor: it sees the token held by 1, returns false, and arms

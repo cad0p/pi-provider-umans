@@ -370,7 +370,16 @@ export function readState(path: string, now: number): QueueState {
   }
 }
 
-/** True if a PID is not currently alive. Never throws. */
+/**
+ * True if a PID is not currently alive. Never throws.
+ *
+ * CLN5-3: this is one of the module's pure-helper exports
+ * (readState / reapStale / isPidDead / MAX_PAUSE_MS) — pure, side-effect-free
+ * functions exposed so external consumers (and selfcheck) can build on the
+ * queue's primitives. They are not used by index.ts (the provider goes through
+ * the ConcurrencyQueue handle), but are a defensible small public API for a
+ * standalone queue module.
+ */
 export function isPidDead(pid: number): boolean {
   if (!pid || pid <= 0) return true;
   try {
@@ -591,8 +600,6 @@ export interface ConcurrencyQueue {
   cancel(ourId: string): void;
   /** Best-effort shutdown cleanup: clear this process's own waiter/token entry. Does NOT unlink the shared state file (siblings may still be queued). */
   reset(): void;
-  /** True if this process currently holds the launch token. */
-  holdsToken(): boolean;
 }
 
 export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean }): ConcurrencyQueue {
@@ -605,7 +612,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null }),
       cancel: () => {},
       reset: () => {},
-      holdsToken: () => false,
     };
   }
 
@@ -857,10 +863,6 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       holdsToken = false;
       ourTokenId = null;
       ourWaiterId = null;
-    },
-
-    holdsToken(): boolean {
-      return holdsToken;
     },
   };
 }
