@@ -2784,4 +2784,74 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(disabled.includes("Conc ?/?"), "COV7-10: undefined limits render ?/?");
 }
 
+// --- CORR7-3: snapshot() reconciles holdsToken with the file after a watchdog reap ---
+// holdsToken is a local var set true when we claim the token. reapStale can
+// reap our token (id mismatch / absent) after >120s while holdsToken stays
+// true, so snapshot().tokenHeld returned stale `true` + the status bar showed a
+// stale `*`. snapshot() now clears holdsToken when the file says the token is
+// gone or held by someone else.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr7-3-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync, writeFileSync, utimesSync } = await import("node:fs");
+  // Frozen clock at t0; advance past 120s (staleTokenMs) to force a reap.
+  let t = 1_700_000_000_000;
+  const q = createConcurrencyQueue({ stateFile, now: () => t });
+
+  // Claim the token (join + waitForLaunch). holdsToken is true.
+  const id = q.join()!;
+  await q.waitForLaunch(id);
+  assert(q.snapshot().tokenHeld === true, "CORR7-3: token held after claim");
+
+  // Advance time past 120s (staleTokenMs). The token's ts is now stale; the
+  // next reapStale (inside snapshot) reaps it. holdsToken must be reconciled.
+  t += 130_000;
+  // Touch the state file's token ts to the OLD time so reapStale sees it as
+  // stale relative to the advanced clock. (The token was written at t0; we
+  // advance t, so now - token.ts > staleTokenMs.)
+  const snap = q.snapshot();
+  assert(snap.tokenHeld === false,
+    "CORR7-3: snapshot().tokenHeld false after watchdog reaped our token (no stale *)");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- CORR7-5: reapStaleTmps handles a planted .tmp directory (no wedge) ---
+// A planted directory at a <path>.*.tmp name made unlinkSync throw EISDIR
+// (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the real
+// wedge — the per-pid temp name is a directory). reapStaleTmps now rmdir's
+// empty .tmp directories + skips non-empty ones, so a mutate no longer wedges.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr7-5-"));
+  const stateFile = join(dir, "state.json");
+  const { mkdirSync, statSync } = await import("node:fs");
+
+  // Plant an EMPTY directory at a .tmp name matching the reaper's prefix.
+  const tmpDir = `${stateFile}.99999.tmp`;
+  mkdirSync(tmpDir, { mode: 0o700 });
+
+  // Trigger a mutate (pause) — reapStaleTmps must rmdir the empty .tmp dir +
+  // writeStateAtomic must not wedge on EEXIST.
+  const q = createConcurrencyQueue({ stateFile });
+  let threw = false;
+  try {
+    q.pauseUntil(Date.now() + 1_000, "CORR7-5 probe");
+  } catch { threw = true; }
+  assert(!threw, "CORR7-5: mutate does not wedge on a planted .tmp directory");
+
+  // The empty .tmp directory must be removed (rmdir'd).
+  let dirGone = false;
+  try { statSync(tmpDir); } catch { dirGone = true; }
+  assert(dirGone, "CORR7-5: empty .tmp directory removed by reapStaleTmps (rmdir)");
+
+  // The state file must have been written (proving the mutate completed).
+  let stateWritten = false;
+  try { statSync(stateFile); stateWritten = true; } catch { /* not written */ }
+  assert(stateWritten, "CORR7-5: state file written (mutate completed despite .tmp dir)");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");

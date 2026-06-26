@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, lstatSync, readdirSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, lstatSync, readdirSync, rmdirSync } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -650,6 +650,14 @@ function reapStaleTmps(path: string, now: number): void {
     const full = `${dir}/${name}`;
     try {
       const st = statSync(full);
+      // CORR7-5: a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
+      // (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the
+      // real wedge — the per-pid temp name is a directory). rmdir it if empty
+      // (best-effort) + skip; a non-empty dir is left for the operator.
+      if (st.isDirectory()) {
+        try { rmdirSync(full); } catch { /* non-empty or gone — skip */ }
+        continue;
+      }
       if (now - st.mtimeMs > STALE_TMP_MS) unlinkSync(full);
     } catch { /* race: gone or unreadable — ignore */ }
   }
@@ -1010,6 +1018,15 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // Read without mutating; still reap for an accurate view.
       const now = cfg.now();
       const state = reapStale(readState(cfg.stateFile), cfg, now);
+      // CORR7-3: reconcile holdsToken with the file. reapStale may have reaped
+      // our token (id mismatch / absent) — e.g. the watchdog reaped it after
+      // >120s while this process still believes it holds it. Without this,
+      // snapshot().tokenHeld returns the stale local `holdsToken` (true) and the
+      // status bar shows a stale `*`. If the file says the token is gone or
+      // held by someone else, clear the local flag.
+      if (holdsToken && state.token?.id !== ourTokenId) {
+        holdsToken = false;
+      }
       return {
         queued: state.waiters.length,
         tokenHeld: holdsToken,
