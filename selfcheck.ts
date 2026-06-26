@@ -784,6 +784,35 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV6-3: pauseUntil with a past `until` writes nothing (no stale reason) ---
+// A past `clamped` is still > 0 when no pause is active, so the old code wrote
+// a stale pausedUntil + pausedReason to disk. Display was safe (pausedUntil >
+// now is false) but the on-disk pausedReason lingered as stale data. Early-
+// return when clamped <= now so nothing is written.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov6-3-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // A past deadline with a reason — must NOT write pausedUntil/pausedReason.
+  const past = Date.now() - 60_000;
+  q.pauseUntil(past, "stale reason that should not persist");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === 0, "COV6-3: past pauseUntil leaves pausedUntil at 0");
+  assert(st.pausedReason === null, "COV6-3: past pauseUntil leaves pausedReason null");
+
+  // Sanity: a FUTURE deadline still writes (the happy path is unchanged).
+  const future = Date.now() + 30_000;
+  q.pauseUntil(future, "real pause");
+  const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st2.pausedUntil === future, "COV6-3: future pauseUntil still writes pausedUntil");
+  assert(st2.pausedReason === "real pause", "COV6-3: future pauseUntil still writes pausedReason");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- S2: reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---
 {
   const now = 1_700_000_000_000;

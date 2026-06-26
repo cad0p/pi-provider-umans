@@ -824,6 +824,13 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         // Retry-After is honored.
         const ceilingMs = reason === PAUSE_REASON_429 ? MAX_PAUSE_429_MS : MAX_PAUSE_MS;
         const clamped = clampPauseUntil(until, now, ceilingMs);
+        // COV6-3: a past `clamped` is still > 0 when no pause is active, so the
+        // write below would proceed — display is safe (pausedUntil > now is
+        // false), but the on-disk pausedReason lingers as stale data. Early-
+        // return when the pause is already elapsed (nothing to write).
+        if (clamped <= now) {
+          return;
+        }
         if (clamped > state.pausedUntil) {
           state.pausedUntil = clamped;
           // SEC5-1 / ADV5-5: sanitize at the write boundary too (defense-in-
