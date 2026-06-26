@@ -352,7 +352,7 @@ function isTokenState(t: unknown): t is TokenState {
 }
 
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
-export function readState(path: string, now: number): QueueState {
+export function readState(path: string): QueueState {
   try {
     const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw) as Partial<QueueState>;
@@ -698,7 +698,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
   function mutate<T>(fn: (now: number, state: QueueState) => T): T {
     return withLock(cfg, lockFile, (now) => {
-      const state = reapStale(readState(cfg.stateFile, now), cfg, now);
+      const state = reapStale(readState(cfg.stateFile), cfg, now);
       const result = fn(now, state);
       writeStateAtomic(cfg.stateFile, state);
       return result;
@@ -894,7 +894,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null } {
       // Read without mutating; still reap for an accurate view.
       const now = cfg.now();
-      const state = reapStale(readState(cfg.stateFile, now), cfg, now);
+      const state = reapStale(readState(cfg.stateFile), cfg, now);
       return {
         queued: state.waiters.length,
         tokenHeld: holdsToken,

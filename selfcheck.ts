@@ -248,10 +248,10 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
-  const s1 = readState(stateFile, Date.now());
+  const s1 = readState(stateFile);
   assert(s1.waiters.length === 0 && s1.token === null && s1.pausedUntil === 0,
     "readState: absent file -> empty state");
-  const s2 = readState(stateFile, Date.now());
+  const s2 = readState(stateFile);
   assert(s2.waiters.length === 0, "readState: corrupt/missing -> empty (no throw)");
   rmSync(dir, { recursive: true, force: true });
 }
@@ -355,7 +355,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   }));
 
   // readState must return a capped, control-char-free string.
-  const st = readState(stateFile, Date.now());
+  const st = readState(stateFile);
   assert(st.pausedReason !== null && st.pausedReason.length <= 64,
     "COV6-1/SEC6-1: readState caps poisoned pausedReason to <= 64 chars");
   assert(!/[\x00-\x1f\x7f]/.test(st.pausedReason ?? ""),
@@ -388,26 +388,26 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
   // Truncated JSON → throws → caught → empty state.
   writeFileSync(stateFile, '{"waiters":[');
-  const truncated = readState(stateFile, Date.now());
+  const truncated = readState(stateFile);
   assert(truncated.waiters.length === 0 && truncated.token === null,
     "COV-HIGH-3: readState truncated JSON -> empty state (no throw)");
 
   // Garbage waiters array (entries lack id/pid/ts) → dropped by the shape
   // guard (SEC5-2); reapStale/isPidDead never see a non-number pid.
   writeFileSync(stateFile, JSON.stringify({ waiters: [{ foo: 1 }, { bar: 2 }] }));
-  const garbage = readState(stateFile, Date.now());
+  const garbage = readState(stateFile);
   assert(garbage.waiters.length === 0,
     "COV-HIGH-3: readState garbage waiters entries dropped (shape-validated)");
 
   // Non-object token (a string) → null (shape guard rejects it, SEC5-2).
   writeFileSync(stateFile, JSON.stringify({ token: "not-an-object" }));
-  const badTok = readState(stateFile, Date.now());
+  const badTok = readState(stateFile);
   assert(badTok.token === null,
     "COV-HIGH-3: readState non-object token -> null (shape-validated)");
 
   // String pausedUntil → typeof !== number → falls to 0.
   writeFileSync(stateFile, JSON.stringify({ pausedUntil: "123", pausedTs: "456" }));
-  const strPause = readState(stateFile, Date.now());
+  const strPause = readState(stateFile);
   assert(strPause.pausedUntil === 0 && strPause.pausedTs === 0,
     "COV-HIGH-3: readState string pausedUntil/pausedTs -> 0 (typeof guard)");
 
@@ -442,7 +442,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   }));
   let poisoned: ReturnType<typeof readState>;
   try {
-    poisoned = readState(stateFile, Date.now());
+    poisoned = readState(stateFile);
   } catch (e) {
     poisoned = { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
     assert(false, "SEC5-2: readState threw on poisoned waiters (should drop silently)");
@@ -453,7 +453,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
   // Poisoned token: pid is a string. Must be null (shape guard rejects it).
   writeFileSync(stateFile, JSON.stringify({ token: { id: "tok", pid: "not-a-number", ts: Date.now() } }));
-  const badToken = readState(stateFile, Date.now());
+  const badToken = readState(stateFile);
   assert(badToken.token === null, "SEC5-2: readState drops poisoned token (non-number pid)");
 
   // reapStale on the poisoned state must not throw (entries already dropped).
