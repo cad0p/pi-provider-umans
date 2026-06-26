@@ -50,7 +50,7 @@ PI_BIN=pi
 # Resolve API key (env or auth.json — pi does this, but we need it for /v1/usage polling).
 API_KEY="${UMANS_API_KEY:-}"
 if [ -z "$API_KEY" ]; then
-  API_KEY=$(node -e "try{const a=require('/Users/piercarlocadoppi/.pi/agent/auth.json');console.log(a.umans&&a.umans.access||'')}catch(e){}" 2>/dev/null || echo "")
+  API_KEY=$(node -e "try{const a=process.env.PI_AUTH_FILE||((require('os').homedir())+'/.pi/agent/auth.json');const j=require(a);console.log(j.umans&&j.umans.access||'')}catch(e){}" 2>/dev/null || echo "")
 fi
 if [ -z "$API_KEY" ]; then
   echo "FATAL: no UMANS_API_KEY and no umans entry in auth.json" >&2
