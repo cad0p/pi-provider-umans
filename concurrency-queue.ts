@@ -451,6 +451,46 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
 }
 
 /**
+ * C2/CMP6-1: feature-detect Atomics.wait for a non-CPU-burning sync sleep.
+ * Exported (alongside decideLaunch / shouldReleaseOnMessageEnd) so the code
+ * path is unit-testable. Returns true when Atomics.wait + SharedArrayBuffer are
+ * available (the acquireLock spin uses it); false when the runtime lacks them
+ * (older Node, or SAB disabled via --no-harmony-sharedarraybuffer) and the
+ * caller must fall back to a busy-spin.
+ */
+export function canAtomicsWait(): boolean {
+  return typeof Atomics !== "undefined" && typeof Atomics.wait === "function" &&
+    typeof SharedArrayBuffer !== "undefined";
+}
+
+/**
+ * C2/CMP6-1: synchronous sleep that does NOT spin the CPU. Under lock
+ * contention the old busy-spin (while (cfg.now() < target) {}) burned CPU and
+ * starved the lock holder's event loop on a single-core VM, racing the 2s
+ * lock timeout. Atomics.wait blocks the calling thread (it yields the core)
+ * without spinning — the holder can make progress. It blocks the event loop
+ * (a sync sleep), which is acceptable here because mutate is already
+ * synchronous + blocking. Falls back to the busy-spin when Atomics.wait /
+ * SharedArrayBuffer are unavailable.
+ */
+function syncSleep(ms: number, cfg: Required<QueueConfig>): void {
+  if (canAtomicsWait() && ms > 0) {
+    // Atomics.wait returns 'timed-out' on timeout, 'ok' if notified, 'not-equal'
+    // if the initial value mismatches. We pass 0 as the expected value (an
+    // Int32Array starts zeroed) and never notify, so it always times out after
+    // `ms`. The buffer is throwaway — allocated once per call; the cost is
+    // negligible vs the lock retry cadence (5ms).
+    const buf = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(buf, 0, 0, ms);
+    return;
+  }
+  // Fallback: busy-spin (the old behavior). Only used when Atomics is
+  // unavailable; bounded by cfg.lockRetryMs (5ms default).
+  const target = cfg.now() + ms;
+  while (cfg.now() < target) { /* busy spin */ }
+}
+
+/**
  * Open an exclusive lockfile (O_EXCL), spinning until acquired or timeout.
  * Returns a release function. Used to guard the read-modify-write critical
  * section on the state file.
@@ -497,8 +537,18 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
         throw new Error(`concurrency-queue: timed out acquiring lock ${lockFile}`);
       }
       // Spin briefly. Use a synchronous sleep to avoid timers in the hot path.
-      const target = cfg.now() + cfg.lockRetryMs;
-      while (cfg.now() < target) { /* busy spin */ }
+      // C2/CMP6-1: prefer Atomics.wait over a CPU-burning busy-spin. Under
+      // contention each process busy-spins 5ms per retry, burning CPU AND
+      // blocking the event loop of the process that currently holds the lock —
+      // the holder cannot make progress on writeStateAtomic/renameSync while a
+      // spinner hogs the scheduler on a single-core VM, and the 2s lock
+      // timeout can then fire on the holder's next mutate. Atomics.wait blocks
+      // the calling thread WITHOUT spinning the CPU (it yields the core), so
+      // the holder can run. It blocks the event loop (sync sleep), but that is
+      // acceptable here — mutate is already synchronous + blocking. Guard with
+      // a feature check (Atomics + SharedArrayBuffer available) and fall back
+      // to the busy-spin if unavailable (older runtimes / disabled SAB).
+      syncSleep(cfg.lockRetryMs, cfg);
     }
   }
   return () => {

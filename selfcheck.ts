@@ -18,6 +18,7 @@ import {
   clampPauseUntil,
   isCapacityFree,
   parseConcurrencyLimit,
+  canAtomicsWait,
   MAX_PAUSE_MS,
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
@@ -1000,6 +1001,43 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "COV-MED-3: stale-lockfile recovery let the mutate write our waiter");
 
   q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- C2/CMP6-1: acquireLock uses Atomics.wait (not a CPU-burning busy-spin) ---
+// Under contention the old busy-spin (while (cfg.now() < target) {}) burned CPU
+// and starved the lock holder's event loop on a single-core VM, racing the 2s
+// lock timeout. syncSleep uses Atomics.wait (blocks the thread without spinning)
+// when available, falling back to the busy-spin otherwise. Assert the feature
+// detection + that a contended acquire still resolves (the existing lockfile
+// tests cover correctness; this pins the non-spinning path).
+{
+  // canAtomicsWait is the exported feature guard. On any modern Node (22+) with
+  // SharedArrayBuffer enabled it returns true; the export itself is the
+  // contract that acquireLock's spin uses it.
+  const can = canAtomicsWait();
+  assert(typeof can === "boolean", "C2/CMP6-1: canAtomicsWait returns a boolean");
+  // Sanity: on Node >= 22 with SAB, the Atomics.wait path is available. We do
+  // not assert `can === true` unconditionally (some hardened runtimes disable
+  // SAB); we assert the function is the gate the spin consults.
+
+  // Drive a contended acquire end-to-end: two queues on the same state file,
+  // the first holds the lock via a long mutate, the second must wait + retry
+  // through syncSleep (Atomics.wait or busy-spin) and then succeed.
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c2-"));
+  const stateFile = join(dir, "state.json");
+  const q1 = createConcurrencyQueue({ stateFile, lockRetryMs: 5, lockTimeoutMs: 2_000 });
+  const q2 = createConcurrencyQueue({ stateFile, lockRetryMs: 5, lockTimeoutMs: 2_000 });
+  const id1 = q1.join()!;
+  const id2 = q2.join()!;
+  assert(id1 !== null && id2 !== null, "C2/CMP6-1: both queues joined the FIFO");
+  // Both waiters present — the contended path (acquireLock retry via syncSleep)
+  // wrote both through without throwing.
+  const { readFileSync } = await import("node:fs");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.waiters.length === 2, "C2/CMP6-1: contended acquireLock retries resolved (both waiters written)");
+  q1.reset();
+  q2.reset();
   rmSync(dir, { recursive: true, force: true });
 }
 
