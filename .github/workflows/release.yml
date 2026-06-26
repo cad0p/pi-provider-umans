@@ -82,9 +82,15 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         run: npm install
 
-      - name: Build
+      - name: Verify (tsc + selfcheck)
         if: steps.version.outputs.skip != 'true'
-        run: npm run build
+        run: |
+          npm run check
+          npm test
+
+      - name: Dry-run publish
+        if: steps.version.outputs.skip != 'true'
+        run: npm pack --dry-run
 
       - name: Publish to npm
         if: steps.version.outputs.skip != 'true'
