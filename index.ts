@@ -1159,7 +1159,6 @@ export default async function (pi: ExtensionAPI) {
       // and C1's touchToken keeps the watchdog from reaping a legitimately
       // long poll (the watchdog now only reaps a TRULY hung poller).
       const pollStart = Date.now();
-      let stalled = false;
       // CMP6-3: exponential backoff on the poll interval when capacity is
       // steadily full. Start at 300ms, grow by 1.5× on each "wait" decision,
       // cap at 2000ms; reset to 300ms on "launch" / "failOpen". Reduces /usage
@@ -1184,7 +1183,6 @@ export default async function (pi: ExtensionAPI) {
             // Pathological state: reaped + re-joined too many times. Fail
             // open rather than loop forever (bounded by the watchdog + the
             // hard_cap headroom, same stance as /usage-unreachable).
-            stalled = true;
             break;
           }
           ourId = concurrencyQueue.join()!;
@@ -1218,7 +1216,6 @@ export default async function (pi: ExtensionAPI) {
           // CORR4-3: only fail open when no known pause is active. A known
           // pause means the gate has a positive deprio signal; keep waiting
           // (bounded by the pause deadline + the 120s token watchdog).
-          stalled = true;
           break; // fail open below
         }
         // decision === "wait"
@@ -1226,8 +1223,7 @@ export default async function (pi: ExtensionAPI) {
         // CMP6-3: back off the next poll interval (grows 1.5×, caps at 2000ms).
         pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
       }
-      // ADV-3: fail-open after the cap (CLN7-4: the `if (stalled)` wrapper was
-      // empty — dropped). The turn proceeds ungated; the watchdog still bounds
+      // ADV-3: fail-open after the cap. The turn proceeds ungated; the watchdog still bounds
       // the token hold. We deliberately do not throw — a wedged /usage should
       // not break the user's turn, only the gate. The status bar's `q <queued>*`
       // already reflects the wait; the launch itself is silent so as not to
