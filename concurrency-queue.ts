@@ -519,10 +519,19 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   while (fd === undefined) {
     try {
       fd = openSync(lockFile, "wx", 0o600);
+      // CMP7-1: write the holder PID + a short nonce into the lockfile so the
+      // stale-lock decision can distinguish "holder is dead" from "lockfile is
+      // merely old". A slow-but-legitimate mutate (disk pressure) holding >2s
+      // used to have its lockfile yanked mid-write; now a live holder PID keeps
+      // the lock until the mtime ceiling (the 2s bound still applies as the
+      // fallback). readFileSync is guarded by the SEC7-1 lstatSync fix above
+      // (a symlink lockfile is reclaimed without being followed). Malformed/
+      // empty content falls back to the mtime check.
+      writeFileSync(fd, JSON.stringify({ pid: cfg.pid(), nonce: Math.random().toString(36).slice(2) }), { encoding: "utf8" });
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
-      // Lock is held by another process — or stale from a crash. If the
-      // lockfile is older than the lock timeout, reclaim it.
+      // Lock is held by another process — or stale from a crash. Reclaim if the
+      // holder PID is dead OR the lockfile is older than the lock timeout.
       // SEC7-1: use lstatSync (not statSync) so the mtime check reads the
       // lockfile entry itself, NOT a symlink target. An attacker who can write
       // to ~/.pi/agent plants a symlink at ${stateFile}.lock -> any old file;
@@ -533,7 +542,24 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       // without ever being followed.
       try {
         const st = lstatSync(lockFile);
-        if (!st.isFile() || cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
+        if (!st.isFile()) {
+          unlinkSync(lockFile);
+          continue; // retry the O_EXCL immediately
+        }
+        // CMP7-1: fast-path reclaim if the holder PID is dead. Read the
+        // lockfile content (lstat already confirmed it's a regular file, so
+        // readFileSync does not follow a symlink here). Malformed/empty content
+        // falls back to the mtime check below.
+        let holderPid: number | undefined;
+        try {
+          const raw = readFileSync(lockFile, "utf8");
+          const parsed = JSON.parse(raw) as { pid?: unknown };
+          if (typeof parsed.pid === "number" && Number.isFinite(parsed.pid)) {
+            holderPid = parsed.pid;
+          }
+        } catch { /* malformed/empty — fall back to mtime */ }
+        const holderDead = holderPid !== undefined && isPidDead(holderPid);
+        if (holderDead || cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }
