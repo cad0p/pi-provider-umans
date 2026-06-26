@@ -105,6 +105,46 @@ const SEARCH_MAX_TOKENS = 2048;
 // hostile/misbehaving /usage that always reports full.
 const CAPACITY_POLL_TIMEOUT_MS = 60_000;
 
+/**
+ * COV5-1: pure decision extracted from acquireSlot's capacity-poll loop so the
+ * branch logic (free-first-poll, poll-then-free, timeout-fail-open, timeout-
+ * but-paused-keeps-waiting, mid-poll-abort) is unit-testable without the full
+ * pi runtime. The loop in acquireSlot drives capacityFree() (I/O) and applies
+ * this decision each iteration.
+ *
+ * - `launch`: capacity is free — proceed with the send.
+ * - `abort`: the turn's AbortSignal fired mid-poll — cancel + reject.
+ * - `failOpen`: the poll cap elapsed AND no known pause is active — launch
+ *   ungated (ADV-3) so a wedged /usage doesn't block forever. CORR4-3: a
+ *   known active pause keeps the gate waiting (bounded by the pause deadline
+ *   + the 120s watchdog) — fail-open for a POSITIVE deprio signal would launch
+ *   into a still-deprioritized account.
+ * - `wait`: keep polling (300ms + jitter).
+ */
+export type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
+export function decideLaunch(opts: {
+  isFree: boolean;
+  elapsedMs: number;
+  queuePaused: boolean;
+  signalAborted: boolean;
+}): LaunchDecision {
+  if (opts.isFree) return "launch";
+  if (opts.signalAborted) return "abort";
+  if (opts.elapsedMs >= CAPACITY_POLL_TIMEOUT_MS && !opts.queuePaused) return "failOpen";
+  return "wait";
+}
+
+/**
+ * COV5-2: pure decision extracted from the message_end handler's release guard
+ * so the "release only on an Umans assistant message" invariant is unit-
+ * testable. The handler calls releaseMainTurn() only when this returns true;
+ * user messages, tool results, and non-Umans providers are no-ops (the slot is
+ * not held for them, or the turn_end/agent_end safety nets cover them).
+ */
+export function shouldReleaseOnMessageEnd(msg: { role?: string; provider?: string } | undefined, provider: string | undefined): boolean {
+  return provider === "umans" && msg?.role === "assistant";
+}
+
 // Static fallback when /v1/models/info cannot be reached. Keep in sync with the
 // public model list from https://api.code.umans.ai/v1/models
 const STATIC_CATALOG: Record<string, UmansModelInfo> = {
@@ -915,19 +955,31 @@ export default async function (pi: ExtensionAPI) {
       // and the 120s watchdog reaps the token if this process hangs.
       const pollStart = Date.now();
       let stalled = false;
-      while (!(await capacityFree())) {
-        if (signal?.aborted) {
+      // COV5-1: the branch logic lives in decideLaunch (pure, unit-tested). The
+      // loop here drives the /usage fetch (capacityFree, I/O) and applies the
+      // decision each iteration.
+      for (;;) {
+        const isFree = await capacityFree();
+        const decision = decideLaunch({
+          isFree,
+          elapsedMs: Date.now() - pollStart,
+          queuePaused: concurrencyQueue.snapshot().paused,
+          signalAborted: !!signal?.aborted,
+        });
+        if (decision === "launch") break; // capacity free — proceed to send
+        if (decision === "abort") {
           concurrencyQueue.cancel(ourId);
           released = true;
           throw new Error("concurrency-queue: acquireSlot aborted mid-poll");
         }
-        if (Date.now() - pollStart >= CAPACITY_POLL_TIMEOUT_MS && !concurrencyQueue.snapshot().paused) {
+        if (decision === "failOpen") {
           // CORR4-3: only fail open when no known pause is active. A known
           // pause means the gate has a positive deprio signal; keep waiting
           // (bounded by the pause deadline + the 120s token watchdog).
           stalled = true;
           break; // fail open below
         }
+        // decision === "wait"
         await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 100)));
       }
       if (stalled) {
@@ -952,10 +1004,6 @@ export default async function (pi: ExtensionAPI) {
         try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
       }
     }
-  }
-
-  function isActiveUmans(ctx: any, msg?: any) {
-    return (msg?.provider ?? ctx.model?.provider) === "umans";
   }
 
   async function resolveApiKey(ctx?: any): Promise<string | undefined> {
@@ -1553,8 +1601,10 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("message_end", async (event, ctx) => {
     const msg = event.message as any;
-    if (!isActiveUmans(ctx, msg)) return;
-    if (msg?.role !== "assistant") return;
+    // COV5-2: the release guard is a pure decision (shouldReleaseOnMessageEnd)
+    // so the "release only on an Umans assistant message" invariant is unit-
+    // testable. User messages, tool results, and non-Umans providers are no-ops.
+    if (!shouldReleaseOnMessageEnd(msg, msg?.provider ?? ctx.model?.provider)) return;
     // Primary release path (D2): the assistant response stream completed, freeing
     // the slot for this turn's tool execution (tools don't consume a server
     // concurrency slot). NOTE: message_end fires at CLIENT-side stream

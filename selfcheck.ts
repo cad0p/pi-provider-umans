@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -178,6 +178,71 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     { limit: 2, queuePaused: false },
   ).free === false, "CORR2-1: server hard_cap (1) < local limit (2) → at cap");
 }
+
+// --- COV5-1: decideLaunch capacity-poll branch logic (extracted from acquireSlot) ---
+// The 5 fix commits that hardened acquireSlot's branches (ADV-3, CORR4-3,
+// ADV4-2, COV4-2, ADV4-4) shipped without a regression test pinning the actual
+// decision. decideLaunch is the pure seam: given a capacity-free result +
+// elapsed time + pause state + signal, decide launch / wait / failOpen / abort.
+{
+  // free-first-poll: capacity is free on the first check → launch immediately.
+  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: false }) === "launch",
+    "COV5-1: free on first poll → launch");
+  // poll-then-free: after waiting, capacity frees → launch.
+  assert(decideLaunch({ isFree: true, elapsedMs: 5_000, queuePaused: false, signalAborted: false }) === "launch",
+    "COV5-1: free after polling → launch");
+  // not free, under the cap, not aborted → wait.
+  assert(decideLaunch({ isFree: false, elapsedMs: 1_000, queuePaused: false, signalAborted: false }) === "wait",
+    "COV5-1: not free under cap → wait");
+  // not free, cap elapsed, no pause → failOpen (ADV-3).
+  assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: false, signalAborted: false }) === "failOpen",
+    "COV5-1: cap elapsed + no pause → failOpen");
+  assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: false, signalAborted: false }) === "failOpen",
+    "COV5-1: well past cap + no pause → failOpen");
+  // CORR4-3: cap elapsed BUT a known pause is active → keep waiting (do not
+  // fail open into a still-deprioritized account).
+  assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: false }) === "wait",
+    "COV5-1: cap elapsed but paused → wait (CORR4-3 no fail-open during pause)");
+  assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: true, signalAborted: false }) === "wait",
+    "COV5-1: well past cap but paused → wait (CORR4-3)");
+  // mid-poll abort: signal fired → abort (cancel + reject), even if cap elapsed.
+  assert(decideLaunch({ isFree: false, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "abort",
+    "COV5-1: signal aborted → abort");
+  assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: false, signalAborted: true }) === "abort",
+    "COV5-1: signal aborted overrides failOpen → abort");
+  assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: true }) === "abort",
+    "COV5-1: signal aborted overrides wait-during-pause → abort");
+  // isFree takes precedence over signalAborted (a freed slot launches even if
+  // the signal fired concurrently — the launch is safe, the abort is moot).
+  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "launch",
+    "COV5-1: isFree takes precedence over signalAborted");
+}
+
+// --- COV5-2: shouldReleaseOnMessageEnd release guard (extracted from message_end) ---
+// The message_end handler releases the main-turn slot only for an Umans
+// assistant message. User messages, tool results, and non-Umans providers are
+// no-ops (the slot is not held for them, or turn_end/agent_end safety nets cover
+// them). shouldReleaseOnMessageEnd is the pure seam tested here.
+{
+  assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "umans" }, "umans") === true,
+    "COV5-2: umans assistant message → release");
+  assert(shouldReleaseOnMessageEnd({ role: "user", provider: "umans" }, "umans") === false,
+    "COV5-2: umans user message → no release");
+  assert(shouldReleaseOnMessageEnd({ role: "toolResult", provider: "umans" }, "umans") === false,
+    "COV5-2: umans tool result → no release");
+  assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "openai" }, "openai") === false,
+    "COV5-2: non-umans provider (resolved from msg.provider) → no release");
+  // ctx.model.provider is the fallback when msg.provider is unset.
+  assert(shouldReleaseOnMessageEnd({ role: "assistant" }, "umans") === true,
+    "COV5-2: ctx.model.provider=umans, msg.provider unset → release");
+  assert(shouldReleaseOnMessageEnd({ role: "assistant" }, "anthropic") === false,
+    "COV5-2: ctx.model.provider=anthropic → no release");
+  assert(shouldReleaseOnMessageEnd(undefined, "umans") === false,
+    "COV5-2: undefined message → no release");
+  assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "umans" }, undefined) === false,
+    "COV5-2: undefined provider → no release");
+}
+
 
 // --- readState: absent/corrupt file -> empty ---
 {
