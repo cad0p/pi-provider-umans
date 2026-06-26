@@ -836,6 +836,14 @@ export default async function (pi: ExtensionAPI) {
   // undefined when the queue is disabled (fire-and-forget). The `apiKey` is
   // used for the head-waiter poll.
   //
+  // CLN4-4: this function BLOCKS until the slot is acquired — it is NOT a fast
+  // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
+  // contention) + the /usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
+  // 60s fail-open, or longer while a known pause is active per CORR4-3). All
+  // callers (before_provider_request + the two side-call sites) await it inline
+  // on the critical path of the turn — by design, the whole point is to
+  // serialize launches so the account stays under its soft cap.
+  //
   // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
   // any token held >120s (or whose PID died) is reclaimed by the next acquirer,
   // so a crashed/aborted turn can stall the queue for at most 120s. For an
