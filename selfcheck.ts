@@ -2273,6 +2273,113 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- CORR8-3: mainTurnRelease guarded against same-turn retry clobber ---
+// If pi fires before_provider_request twice without an intervening
+// message_end/turn_end (a retry), the second acquireSlot must release the first
+// slot before overwriting mainTurnRelease — otherwise the first token leaks
+// until the 120s watchdog. Driven through the real factory wiring.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-corr8-3-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any, _init?: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const pi: any = {
+      on(event: string, handler: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool() { /* no-op */ },
+      registerCommand() { /* no-op */ },
+      registerProvider() { /* no-op */ },
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal,
+        mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: () => {},
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" },
+        sessionManager: {},
+      };
+    }
+    async function dispatch(event: string): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h({ type: event, payload: {} }, makeCtx());
+    }
+    await umansFactory(pi as any);
+
+    // First before_provider_request acquires a slot.
+    await dispatch("before_provider_request");
+    await new Promise((r) => setTimeout(r, 50));
+    const probe1 = createConcurrencyQueue({ stateFile });
+    const s1 = probe1.snapshot();
+    assert(s1.tokenHeld === true || s1.queued >= 1,
+      "CORR8-3: first before_provider_request acquired a slot");
+    probe1.reset();
+
+    // Second before_provider_request WITHOUT message_end — the guard must
+    // release the first slot before overwriting. After this, exactly one slot
+    // is outstanding (not two).
+    await dispatch("before_provider_request");
+    await new Promise((r) => setTimeout(r, 150));
+    const probe2 = createConcurrencyQueue({ stateFile });
+    // The structural invariant: at most one waiter entry for this process's
+    // pid. A clobber would orphan the first slot's waiter entry (still in the
+    // FIFO with no release fn) AND add a second, leaving two. The token-holder's
+    // own waiter entry remains in the FIFO by design (removed at release), so
+    // entries=1 + token held by the same id is the normal single-slot state.
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    const ourEntries = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).length;
+    assert(ourEntries <= 1,
+      `CORR8-3: retry did not orphan a waiter (our entries=${ourEntries}, expected <=1)`);
+    // And if a token is held by us, it must be the SAME id as our single waiter
+    // entry (not a stale first-acquire token orphaned alongside the second).
+    if (parsed.token && parsed.token.pid === process.pid) {
+      const ourWaiterIds = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).map((w: any) => w.id);
+      assert(ourWaiterIds.includes(parsed.token.id),
+        "CORR8-3: held token matches our waiter entry (no orphaned first-acquire token)");
+    }
+    probe2.reset();
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- CORR7-2: reset() aborts an in-flight waitForLaunch poll loop ---
 // reset() clears ourWaiterIds/ourTokenId + splices entries from the file, but a
 // concurrently-running waitForLaunch poll loop on the same queue instance

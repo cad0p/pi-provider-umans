@@ -1727,6 +1727,16 @@ export default async function (pi: ExtensionAPI) {
       // future throw in the registration path.)
       let registered = false;
       try {
+        // CORR8-3: guard against same-turn retry clobber. If pi fires
+        // before_provider_request twice for the same turn without an
+        // intervening message_end/turn_end (a retry), the second acquireSlot
+        // would overwrite mainTurnRelease, orphaning the first release fn +
+        // leaking its token until the 120s watchdog. Release the prior slot
+        // before overwriting to keep the single-slot invariant structural.
+        if (mainTurnRelease) {
+          releaseSlot(mainTurnRelease);
+          mainTurnRelease = undefined;
+        }
         mainTurnRelease = release;
         registered = true;
         updateStatus(ctx);
