@@ -893,9 +893,13 @@ export default async function (pi: ExtensionAPI) {
         }
         return decision.free;
       };
-      // Poll at 300ms while full/deprioritized. If the turn is aborted
-      // mid-poll, `signal` cancels the waiter; otherwise the watchdog reaps
-      // the token after >120s and session_shutdown clears the waiter on exit.
+      // Poll at 300ms + up to 100ms jitter while full/deprioritized. If the turn
+      // is aborted mid-poll, `signal` cancels the waiter; otherwise the watchdog
+      // reaps the token after >120s and session_shutdown clears the waiter on exit.
+      // CORR5-4 / ADV5-2: the ±100ms jitter breaks phase-locking across machines —
+      // D1 designs for multiple machines each running their own local queue and
+      // polling /usage; without jitter, N machines' head waiters synchronize on
+      // the same 300ms tick and amplify /usage load N× per cycle.
       // ADV-3: cap the total poll elapsed at CAPACITY_POLL_TIMEOUT_MS so a
       // hostile/misbehaving /usage (always reports full, or an account stuck
       // at the cap) cannot wedge the queue forever. After the cap, fail open
@@ -924,7 +928,7 @@ export default async function (pi: ExtensionAPI) {
           stalled = true;
           break; // fail open below
         }
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 100)));
       }
       if (stalled) {
         // ADV-3: fail-open after the cap. The turn proceeds ungated; the
