@@ -218,10 +218,12 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 }
 
 // --- COV-HIGH-3: readState corrupt-input fixtures ---
-// readState guards waiters (Array.isArray), pausedUntil/pausedTs (typeof number),
-// and falls back to empty on JSON throw. Previously only the absent-file case
-// was tested. Exercise: truncated JSON, garbage waiters, non-object token,
-// string pausedUntil.
+// readState guards waiters (Array.isArray + per-entry shape), pausedUntil/pausedTs
+// (typeof number), token (shape), and falls back to empty on JSON throw.
+// Previously only the absent-file case was tested. Exercise: truncated JSON,
+// garbage waiters, non-object token, string pausedUntil. SEC5-2: malformed
+// waiter/token entries are dropped (not passed through) so isPidDead/reapStale
+// never receive a non-number pid that would throw a synchronous TypeError.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
@@ -233,26 +235,75 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   assert(truncated.waiters.length === 0 && truncated.token === null,
     "COV-HIGH-3: readState truncated JSON -> empty state (no throw)");
 
-  // Garbage waiters array (entries lack id/pid/ts) → returned as-is; reapStale
-  // would later filter them via isPidDead(undefined)=true. readState itself does
-  // not validate entry shape, only that waiters is an array.
+  // Garbage waiters array (entries lack id/pid/ts) → dropped by the shape
+  // guard (SEC5-2); reapStale/isPidDead never see a non-number pid.
   writeFileSync(stateFile, JSON.stringify({ waiters: [{ foo: 1 }, { bar: 2 }] }));
   const garbage = readState(stateFile, Date.now());
-  assert(garbage.waiters.length === 2,
-    "COV-HIGH-3: readState garbage waiters array returned as-is (shape validated by reapStale)");
+  assert(garbage.waiters.length === 0,
+    "COV-HIGH-3: readState garbage waiters entries dropped (shape-validated)");
 
-  // Non-object token (a string) → parsed.token ?? null passes it through;
-  // reapStale reads state.token.pid (undefined) → isPidDead(undefined)=true → reaped.
+  // Non-object token (a string) → null (shape guard rejects it, SEC5-2).
   writeFileSync(stateFile, JSON.stringify({ token: "not-an-object" }));
   const badTok = readState(stateFile, Date.now());
-  assert(badTok.token === "not-an-object",
-    "COV-HIGH-3: readState non-object token passed through (reaped later by reapStale)");
+  assert(badTok.token === null,
+    "COV-HIGH-3: readState non-object token -> null (shape-validated)");
 
   // String pausedUntil → typeof !== number → falls to 0.
   writeFileSync(stateFile, JSON.stringify({ pausedUntil: "123", pausedTs: "456" }));
   const strPause = readState(stateFile, Date.now());
   assert(strPause.pausedUntil === 0 && strPause.pausedTs === 0,
     "COV-HIGH-3: readState string pausedUntil/pausedTs -> 0 (typeof guard)");
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- SEC5-2: readState drops poisoned waiter/token entries without throwing ---
+// A hand-edited or compromised-sibling state file can put arbitrary objects
+// into `waiters` (e.g. { pid: "not-a-number" }). Without shape validation,
+// isPidDead would call process.kill("not-a-number", 0) which throws a
+// synchronous TypeError (not an errno-coded error) that the catch in isPidDead
+// does not filter — crashing the reader's mutate. readState now validates each
+// entry's shape and drops malformed ones, so reapStale operates on well-typed
+// input.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
+  const stateFile = join(dir, "state.json");
+  const { writeFileSync } = await import("node:fs");
+
+  // Poisoned waiters: pid is a string / boolean / object / missing. All must
+  // be dropped without throwing.
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [
+      { id: "ok", pid: 12345, ts: Date.now() },           // well-formed -> kept
+      { id: "bad-str", pid: "not-a-number", ts: Date.now() },
+      { id: "bad-bool", pid: true, ts: Date.now() },
+      { id: "bad-obj", pid: {}, ts: Date.now() },
+      { id: "bad-missing-pid", ts: Date.now() },
+      { id: "bad-missing-ts", pid: 1 },
+      { pid: 1, ts: 1 },                                     // missing id
+    ],
+  }));
+  let poisoned: ReturnType<typeof readState>;
+  try {
+    poisoned = readState(stateFile, Date.now());
+  } catch (e) {
+    poisoned = { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+    assert(false, "SEC5-2: readState threw on poisoned waiters (should drop silently)");
+  }
+  assert(poisoned.waiters.length === 1, "SEC5-2: readState drops poisoned waiters, keeps well-formed");
+  assert(poisoned.waiters[0].id === "ok" && typeof poisoned.waiters[0].pid === "number",
+    "SEC5-2: surviving waiter is the well-formed entry");
+
+  // Poisoned token: pid is a string. Must be null (shape guard rejects it).
+  writeFileSync(stateFile, JSON.stringify({ token: { id: "tok", pid: "not-a-number", ts: Date.now() } }));
+  const badToken = readState(stateFile, Date.now());
+  assert(badToken.token === null, "SEC5-2: readState drops poisoned token (non-number pid)");
+
+  // reapStale on the poisoned state must not throw (entries already dropped).
+  const q = createConcurrencyQueue({ stateFile, now: () => Date.now(), pid: () => process.pid });
+  q.snapshot(); // drives a readState + reapStale
+  assert(q.snapshot().queued === 0, "SEC5-2: reapStale on poisoned state does not throw");
+  q.reset();
 
   rmSync(dir, { recursive: true, force: true });
 }

@@ -303,14 +303,40 @@ function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Shape guard for a WaiterEntry. SEC5-2: a poisoned/hand-edited state file can
+ * put arbitrary objects into `waiters` (e.g. { pid: "not-a-number" }). Without
+ * validation, `isPidDead(w.pid)` would call `process.kill("not-a-number", 0)`
+ * which throws a synchronous TypeError (not an errno-coded error) that the
+ * catch in isPidDead does not filter — crashing the reader's mutate. Mirror
+ * the defensive parsing already applied to the scalar fields: drop malformed
+ * entries so reapStale/isPidDead operate on well-typed input.
+ */
+function isWaiterEntry(w: unknown): w is WaiterEntry {
+  return typeof w === "object" && w !== null &&
+    typeof (w as WaiterEntry).id === "string" &&
+    typeof (w as WaiterEntry).pid === "number" &&
+    typeof (w as WaiterEntry).ts === "number";
+}
+
+/** Shape guard for a TokenState (same rationale as isWaiterEntry). */
+function isTokenState(t: unknown): t is TokenState {
+  return typeof t === "object" && t !== null &&
+    typeof (t as TokenState).id === "string" &&
+    typeof (t as TokenState).pid === "number" &&
+    typeof (t as TokenState).ts === "number";
+}
+
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string, now: number): QueueState {
   try {
     const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw) as Partial<QueueState>;
+    const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
+    const token = isTokenState(parsed.token) ? parsed.token : null;
     return {
-      waiters: Array.isArray(parsed.waiters) ? parsed.waiters as WaiterEntry[] : [],
-      token: parsed.token ?? null,
+      waiters,
+      token,
       pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
       pausedReason: parsed.pausedReason ?? null,
       pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
