@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, lstatSync, readdirSync, rmdirSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -726,7 +726,13 @@ function reapStaleTmps(path: string, now: number): void {
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
     try {
-      const st = statSync(full);
+      // SEC8-2/SEC9-6: use lstatSync (not statSync) so a symlink .tmp →
+      // /etc/passwd is detected as non-regular + unlinked directly without
+      // following the link (matching the lockfile's SEC7-1 posture). statSync
+      // would follow the symlink, read the TARGET's mtime, and unlinkSync
+      // (which removes the symlink itself, safe) but the mtime leak is
+      // inconsistent with the hardened posture.
+      const st = lstatSync(full);
       // CORR7-5: a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
       // (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the
       // real wedge — the per-pid temp name is a directory). rmdir it if empty

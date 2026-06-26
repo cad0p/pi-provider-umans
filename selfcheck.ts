@@ -3347,4 +3347,33 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- SEC8-2/SEC9-6: reapStaleTmps uses lstatSync (symlink .tmp unlinked, not followed) ---
+// A symlink .tmp → /etc/passwd must be unlinked directly without following the
+// link (matching the lockfile's SEC7-1 posture). lstatSync detects non-regular
+// files; unlinkSync removes the symlink itself, leaving the target untouched.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sec8-2-"));
+  const stateFile = join(dir, "state.json");
+  const { symlinkSync, readFileSync, lstatSync, lutimesSync } = await import("node:fs");
+  const target = join(dir, "secret-target");
+  writeFileSync(target, "secret", { mode: 0o600 });
+  const tmpPath = join(dir, "state.json.symlink.tmp");
+  symlinkSync(target, tmpPath);
+  // Drive a mutate (pauseUntil) which calls reapStaleTmps. The symlink .tmp's
+  // own mtime (via lstatSync) must be stale. Use lutimesSync to set the LINK's
+  // mtime (utimesSync would follow the symlink + set the target's mtime).
+  const stale = (Date.now() / 1000) - 10_000;
+  lutimesSync(tmpPath, stale, stale);
+  const q = createConcurrencyQueue({ stateFile });
+  q.pauseUntil(Date.now() + 1_000, "SEC8-2 probe");
+  // The symlink .tmp must be gone (unlinked, not followed).
+  let symlinkGone = false;
+  try { lstatSync(tmpPath); } catch { symlinkGone = true; }
+  assert(symlinkGone, "SEC8-2/SEC9-6: symlink .tmp unlinked (not followed)");
+  // The target must be untouched.
+  assert(readFileSync(target, "utf8") === "secret", "SEC8-2/SEC9-6: symlink target untouched");
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log("\nall checks passed");
