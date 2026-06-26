@@ -135,6 +135,36 @@ export function decideLaunch(opts: {
 }
 
 /**
+ * CMP6-3: pure helper for the /usage poll interval under steady-full backoff.
+ * With N local pi processes each running their own head waiter, a saturated
+ * queue drives N×3.3 RPS to /usage continuously. Exponential backoff on the
+ * poll interval when capacity is steadily full reduces RPS from ~3.3/s to
+ * ~0.5/s during a sustained pause. Mirrors the decideLaunch /
+ * shouldReleaseOnMessageEnd pattern: pure + exported so it is unit-testable
+ * without the pi runtime.
+ *
+ * - "launch" / "failOpen": reset to BASE (the gate is about to release the
+ *   token or fail open — no further polling, but if it does poll again it
+ *   starts fresh at the fast cadence).
+ * - "wait": grow by GROWTH (1.5×), capped at CAP (2000ms). The ±100ms jitter
+ *   is applied by the caller, not here (keeps this pure + deterministic).
+ */
+export const POLL_INTERVAL_BASE_MS = 300;
+export const POLL_INTERVAL_CAP_MS = 2_000;
+export const POLL_INTERVAL_GROWTH = 1.5;
+export function nextPollInterval(currentMs: number, decision: LaunchDecision, opts?: { base?: number; cap?: number; growth?: number }): number {
+  const base = opts?.base ?? POLL_INTERVAL_BASE_MS;
+  const cap = opts?.cap ?? POLL_INTERVAL_CAP_MS;
+  const growth = opts?.growth ?? POLL_INTERVAL_GROWTH;
+  if (decision === "wait") {
+    const next = Math.round(currentMs * growth);
+    return Math.min(next > 0 ? next : base, cap);
+  }
+  // launch / failOpen / abort: reset to base.
+  return base;
+}
+
+/**
  * COV5-2: pure decision extracted from the message_end handler's release guard
  * so the "release only on an Umans assistant message" invariant is unit-
  * testable. The handler calls releaseMainTurn() only when this returns true;
@@ -990,6 +1020,12 @@ export default async function (pi: ExtensionAPI) {
       // long poll (the watchdog now only reaps a TRULY hung poller).
       const pollStart = Date.now();
       let stalled = false;
+      // CMP6-3: exponential backoff on the poll interval when capacity is
+      // steadily full. Start at 300ms, grow by 1.5× on each "wait" decision,
+      // cap at 2000ms; reset to 300ms on "launch" / "failOpen". Reduces /usage
+      // RPS from ~3.3/s to ~0.5/s during a sustained pause. The ±100ms jitter
+      // breaks phase-locking across machines (CORR5-4 / ADV5-2).
+      let pollIntervalMs = POLL_INTERVAL_BASE_MS;
       // COV5-1: the branch logic lives in decideLaunch (pure, unit-tested). The
       // loop here drives the /usage fetch (capacityFree, I/O) and applies the
       // decision each iteration.
@@ -1046,7 +1082,9 @@ export default async function (pi: ExtensionAPI) {
           break; // fail open below
         }
         // decision === "wait"
-        await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 100)));
+        await new Promise((r) => setTimeout(r, pollIntervalMs + Math.floor(Math.random() * 100)));
+        // CMP6-3: back off the next poll interval (grows 1.5×, caps at 2000ms).
+        pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
       }
       if (stalled) {
         // ADV-3: fail-open after the cap. The turn proceeds ungated; the

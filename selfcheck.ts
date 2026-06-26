@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -217,6 +217,32 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   // the signal fired concurrently — the launch is safe, the abort is moot).
   assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "launch",
     "COV5-1: isFree takes precedence over signalAborted");
+}
+
+// --- CMP6-3: nextPollInterval exponential backoff on /usage poll under steady-full ---
+// A saturated queue drives N×3.3 RPS to /usage continuously. Exponential backoff
+// on the poll interval when capacity is steadily full reduces RPS from ~3.3/s
+// to ~0.5/s during a sustained pause. Start at 300ms, grow by 1.5× on "wait",
+// cap at 2000ms; reset to 300ms on "launch" / "failOpen".
+{
+  // wait grows by 1.5×, capped at 2000ms.
+  assert(nextPollInterval(300, "wait") === 450, "CMP6-3: 300 -> 450 on wait (1.5×)");
+  assert(nextPollInterval(450, "wait") === 675, "CMP6-3: 450 -> 675 on wait (1.5×)");
+  assert(nextPollInterval(675, "wait") === 1013, "CMP6-3: 675 -> 1013 on wait (1.5×, rounded)");
+  assert(nextPollInterval(1333, "wait") === 2000, "CMP6-3: 1333 -> 2000 on wait (capped at 2000)");
+  assert(nextPollInterval(2000, "wait") === 2000, "CMP6-3: 2000 -> 2000 on wait (cap holds)");
+  // launch / failOpen / abort reset to base (300ms).
+  assert(nextPollInterval(2000, "launch") === 300, "CMP6-3: launch resets to base (300)");
+  assert(nextPollInterval(2000, "failOpen") === 300, "CMP6-3: failOpen resets to base (300)");
+  assert(nextPollInterval(2000, "abort") === 300, "CMP6-3: abort resets to base (300)");
+  // A simulated sustained-pause sequence: 300 -> 450 -> 675 -> 1013 -> 1520 -> 2000 -> 2000.
+  let ms = 300;
+  const seq: number[] = [ms];
+  for (let i = 0; i < 6; i++) { ms = nextPollInterval(ms, "wait"); seq.push(ms); }
+  assert(seq[0] === 300 && seq[1] === 450 && seq[2] === 675 && seq[3] === 1013 && seq[4] === 1520 && seq[5] === 2000 && seq[6] === 2000,
+    "CMP6-3: sustained-wait sequence backs off 300→450→675→1013→1520→2000→2000");
+  // A launch mid-sequence resets to base.
+  assert(nextPollInterval(2000, "launch") === 300, "CMP6-3: launch after sustained wait resets to base");
 }
 
 // --- COV5-2: shouldReleaseOnMessageEnd release guard (extracted from message_end) ---
