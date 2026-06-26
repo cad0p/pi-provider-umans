@@ -2403,7 +2403,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // Plant a lockfile with a STALE mtime (past the 2s ceiling). The holder PID
   // is dead (99999999) but that no longer matters — the mtime ceiling reclaims.
-  writeFileSync(lockFile, JSON.stringify({ pid: 99_999_999, nonce: "abc" }), { mode: 0o600, encoding: "utf8" });
+  writeFileSync(lockFile, JSON.stringify({ pid: 99_999_999 }), { mode: 0o600, encoding: "utf8" });
   const staleTime0 = (Date.now() / 1000) - 10; // 10s ago — past 2s ceiling
   utimesSync(lockFile, staleTime0, staleTime0);
 
@@ -2422,7 +2422,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // Plant a lockfile with a LIVE holder PID (this process) + a FRESH mtime.
   // The fresh mtime means NOT stale, so acquire spins until the mtime ceiling.
-  writeFileSync(lockFile, JSON.stringify({ pid: process.pid, nonce: "xyz" }), { mode: 0o600, encoding: "utf8" });
+  writeFileSync(lockFile, JSON.stringify({ pid: process.pid }), { mode: 0o600, encoding: "utf8" });
   const freshTime = Date.now() / 1000;
   utimesSync(lockFile, freshTime, freshTime);
   const q2 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 300, lockRetryMs: 5 });
