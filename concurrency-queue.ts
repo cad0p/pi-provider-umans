@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, readdirSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, statSync, lstatSync, readdirSync } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -523,9 +523,17 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. If the
       // lockfile is older than the lock timeout, reclaim it.
+      // SEC7-1: use lstatSync (not statSync) so the mtime check reads the
+      // lockfile entry itself, NOT a symlink target. An attacker who can write
+      // to ~/.pi/agent plants a symlink at ${stateFile}.lock -> any old file;
+      // statSync follows it, reads the TARGET's old mtime, concludes stale,
+      // and unlinkSync removes the SYMLINK — then O_EXCL succeeds, racing a
+      // sibling mid-mutate (lost write). lstatSync never follows the link;
+      // a symlink (or any non-regular file) is treated as stale + unlinked
+      // without ever being followed.
       try {
-        const st = statSync(lockFile);
-        if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
+        const st = lstatSync(lockFile);
+        if (!st.isFile() || cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }

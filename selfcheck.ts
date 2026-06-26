@@ -2213,4 +2213,66 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- SEC7-1: lockfile stale-recovery uses lstatSync (does not follow a symlink) ---
+// statSync(lockFile) followed a symlink planted at ${stateFile}.lock -> any old
+// file; the stale-recovery read the TARGET's old mtime, concluded stale, and
+// unlinkSync removed the SYMLINK — then O_EXCL succeeded, racing a sibling
+// mid-mutate. lstatSync reads the lockfile entry itself; a symlink (or any
+// non-regular file) is treated as stale + unlinked without ever being followed.
+{
+  if (process.platform !== "win32") {
+    const dir = mkdtempSync(join(tmpdir(), "umans-q-sec7-1-"));
+    const stateFile = join(dir, "state.json");
+    const lockFile = `${stateFile}.lock`;
+    const { symlinkSync, writeFileSync, readFileSync, utimesSync } = await import("node:fs");
+
+    // Plant a symlink at the lockfile path pointing at a CANARY file with an
+    // OLD mtime (past lockTimeoutMs). statSync would follow the symlink, read
+    // the canary's old mtime, conclude stale, and unlinkSync the symlink.
+    const canary = join(dir, "canary.txt");
+    writeFileSync(canary, "ORIGINAL", { mode: 0o600 });
+    const oldTime = (Date.now() / 1000) - 10; // 10s ago — past lockTimeoutMs (2s)
+    utimesSync(canary, oldTime, oldTime);
+    symlinkSync(canary, lockFile);
+
+    // join() -> mutate -> acquireLock must reclaim the symlink (lstat sees a
+    // non-regular file -> stale -> unlink the SYMLINK, not the target) + retry
+    // O_EXCL successfully.
+    const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
+    const id = q.join()!;
+    assert(id !== null, "SEC7-1: join succeeds despite a planted symlink at the lockfile");
+
+    // The canary must be untouched (symlink was not followed).
+    assert(readFileSync(canary, "utf8") === "ORIGINAL",
+      "SEC7-1: symlink target not unlinked (canary intact — lstat did not follow)");
+
+    // The state file must have been written (the critical section ran after
+    // reclaiming the symlink).
+    const st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.waiters.length === 1 && st.waiters[0].id === id,
+      "SEC7-1: stale-symlink lockfile reclaimed + mutate wrote through");
+
+    q.reset();
+    rmSync(dir, { recursive: true, force: true });
+  } else {
+    // Windows: symlinks require elevated privileges; skip the planted-symlink
+    // fixture but assert the non-regular-file guard via a pre-existing regular
+    // lockfile with an old mtime is still reclaimed (the lstat path).
+    const dir = mkdtempSync(join(tmpdir(), "umans-q-sec7-1-"));
+    const stateFile = join(dir, "state.json");
+    const lockFile = `${stateFile}.lock`;
+    const { writeFileSync, readFileSync, utimesSync } = await import("node:fs");
+    writeFileSync(lockFile, "", { mode: 0o600 });
+    const oldTime = (Date.now() / 1000) - 10;
+    utimesSync(lockFile, oldTime, oldTime);
+    const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
+    const id = q.join()!;
+    assert(id !== null, "SEC7-1: join reclaims a stale regular lockfile (lstat path)");
+    const st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.waiters.length === 1, "SEC7-1: stale regular lockfile reclaimed + mutate wrote through");
+    q.reset();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log("\nall checks passed");
