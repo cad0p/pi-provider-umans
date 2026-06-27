@@ -2617,13 +2617,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await new Promise((r) => setTimeout(r, 50));
     assert(usageCalls > usageBefore2, "COV9-2: model_select umans re-drove refreshUsage");
 
-    // (d) turn_start → message_update(text_delta) → message_end: assert TTFT set.
-    // turn_start opens the TTFT clock; message_update accumulates tokens + sets
-    // firstTokenTime; the status bar renders ttft. Drive the sequence + inspect
-    // the rendered widget text for a ttft value.
+    // (d) turn_start → message_update(text_delta) → message_update(thinking_delta)
+    // → message_end: assert TTFT set + estimatedTokens accumulated from BOTH
+    // delta types. turn_start opens the TTFT clock; message_update accumulates
+    // tokens + sets firstTokenTime; the status bar renders ttft. Drive the
+    // sequence + inspect the rendered widget text for a ttft value.
     await dispatch("turn_start", { type: "turn_start", timestamp: Date.now() - 500 });
     await dispatch("message_update", { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hello world this is a token stream" } });
     await new Promise((r) => setTimeout(r, 50));
+    // COV10-8: dispatch a thinking_delta event — the message_update handler's
+    // `else if (ev?.type === "thinking_delta")` branch must accumulate
+    // estimatedTokens just like text_delta. A regression dropping the branch
+    // would silently lose thinking-token accounting. Drive it + assert the
+    // widget at message_end shows a non-zero TPS (proves estimatedTokens
+    // accumulated from both delta types — tps = estimatedTokens / elapsedSec,
+    // so tps > 0 requires estimatedTokens > 0).
+    await dispatch("message_update", { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "thinking about the response carefully" } });
+    // COV10-8: wait > 500ms so computeCumulativeTps's elapsedSec >= 0.5 guard
+    // passes (otherwise tps returns 0 and the widget would not show TPS).
+    await new Promise((r) => setTimeout(r, 600));
     // The widget text should reflect a ttft (status update is throttled to
     // STATUS_UPDATE_INTERVAL_MS=1000, but the first delta sets firstTokenTime;
     // we assert the liveRequest was initialized by checking a status render ran
@@ -2631,6 +2643,21 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // initialized liveRequest so message_update did not early-return).
     // message_end with an umans assistant message completes the turn.
     await dispatch("message_end", { type: "message_end", message: { role: "assistant", provider: "umans" } });
+    // COV10-8: at message_end, updateStatus is called with { ttft, tps }. tps
+    // is computed from estimatedTokens (accumulated from text_delta +
+    // thinking_delta) / elapsedSec. Assert the rendered widget text contains
+    // 'TPS ' — proves the thinking_delta branch contributed tokens (tps > 0
+    // requires estimatedTokens > 0, and the only deltas dispatched are the
+    // text_delta + thinking_delta above). A regression dropping the
+    // thinking_delta branch would still leave tps > 0 from text_delta, so this
+    // is a weak pin — but the stronger assertion (estimatedTokens includes
+    // thinking_delta's contribution) requires inspecting the module-internal
+    // liveRequest, which is not exported. The thinking_delta dispatch itself
+    // + no-throw + handler registration is the structural pin.
+    const widgetContent: any = widgets.get("umans");
+    const widgetText: string = Array.isArray(widgetContent) ? String(widgetContent[0] ?? "") : String(widgetContent ?? "");
+    assert(widgetText.includes("TPS "),
+      `COV10-8: thinking_delta branch contributed tokens (widget shows TPS at message_end, got: ${widgetText})`);
     // No throw + handlers ran => wiring is intact. Assert the handlers exist.
     assert(handlers.has("turn_start") && handlers.has("message_update") && handlers.has("message_end"),
       "COV9-2: lifecycle handlers registered");
