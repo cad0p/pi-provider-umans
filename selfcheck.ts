@@ -3153,6 +3153,38 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "CORR11-2: clear documented with CORR11-2 citation");
 }
 
+// --- CORR11-3: queuePaused read once per poll iteration (no unlocked TOCTOU) ---
+// Each capacity-poll iteration previously read concurrencyQueue.snapshot()
+// .paused twice: once inside capacityFree + once in the decideLaunch call
+// (after the await fetchUsageSnapshot). A sibling writing pausedUntil
+// between the two reads could let capacityFree see queuePaused:true then
+// decideLaunch see queuePaused:false + elapsedMs >= 60s -> failOpen into a
+// pause. The fix reads queuePaused once into a local const + passes the same
+// value to both. Pin the single-read structure by source inspection.
+{
+  const src = readFileSync("index.ts", "utf8");
+  // capacityFree now takes queuePaused as a parameter (no internal snapshot read).
+  assert(src.includes("const capacityFree = async (queuePaused: boolean): Promise<boolean> =>"),
+    "CORR11-3: capacityFree takes queuePaused as a parameter (no internal snapshot read)");
+  // The call site reads queuePaused once into a local const + passes it to both.
+  const callIdx = src.indexOf("const queuePaused = concurrencyQueue.snapshot().paused;");
+  assert(callIdx >= 0, "CORR11-3: queuePaused read once into a local const before capacityFree");
+  // The same const is passed to capacityFree + decideLaunch (no second snapshot read).
+  assert(src.includes("const isFree = await capacityFree(queuePaused);"),
+    "CORR11-3: same queuePaused const passed to capacityFree");
+  const decideIdx = src.indexOf("const decision = decideLaunch({");
+  assert(decideIdx > callIdx, "CORR11-3: decideLaunch call follows the single queuePaused read");
+  const decideBlock = src.slice(decideIdx, src.indexOf("});", decideIdx) + 3);
+  assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("concurrencyQueue.snapshot().paused"),
+    "CORR11-3: decideLaunch receives the same queuePaused const (no second snapshot read)");
+  // No remaining `concurrencyQueue.snapshot().paused` inside capacityFree's body.
+  const capIdx = src.indexOf("const capacityFree = async (queuePaused: boolean):");
+  const capEnd = src.indexOf("return decision.free;", capIdx);
+  const capBody = src.slice(capIdx, capEnd);
+  assert(!capBody.includes("concurrencyQueue.snapshot().paused"),
+    "CORR11-3: capacityFree body no longer reads concurrencyQueue.snapshot().paused");
+}
+
 // --- COV7-3: concurrentSessions ?? 0 + full cap fallback chain ---
 // isCapacityFree's `cur = snap.concurrentSessions ?? 0` (undefined -> 0) and
 // `cap = snap.hardCap ?? snap.limit ?? inputs.limit` (full chain) were untested.

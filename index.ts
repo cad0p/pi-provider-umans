@@ -1132,7 +1132,15 @@ export default async function (pi: ExtensionAPI) {
       // head polls a /usage that already reflects our in-flight request.
       const limit = concurrencyLimit();
       // Unlimited plan: skip the capacity check (still honor priority.low).
-      const capacityFree = async (): Promise<boolean> => {
+      // CORR11-3: read queuePaused ONCE per poll iteration into a local const
+      // + pass the same value to capacityFree + decideLaunch. Previously
+      // capacityFree read concurrencyQueue.snapshot().paused inside itself
+      // + decideLaunch read it again after the await — two unlocked snapshot
+      // reads straddling an await, so a sibling writing pausedUntil between
+      // them could let capacityFree see queuePaused:true then decideLaunch see
+      // queuePaused:false + elapsedMs >= 60s -> failOpen into a pause. Reading
+      // once makes the fail-open-during-pause guard structural.
+      const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
         // C2: consult the SHARED pause before launching. A 429 observed by any
         // local process writes pausedUntil to the shared file; reading it here
         // makes every sibling back off immediately, even before /usage
@@ -1142,7 +1150,7 @@ export default async function (pi: ExtensionAPI) {
         const snap = await fetchUsageSnapshot(apiKey, signal);
         const decision = isCapacityFree(snap, {
           limit,
-          queuePaused: concurrencyQueue.snapshot().paused,
+          queuePaused,
         });
         if (decision.repause) {
           // COV4-2: pauseUntil runs mutate -> writeStateAtomic -> renameSync,
@@ -1220,11 +1228,14 @@ export default async function (pi: ExtensionAPI) {
           // assertion mirrors the initial join() above.
           continue tokenAcquire; // re-wait our turn
         }
-        const isFree = await capacityFree();
+        // CORR11-3: read queuePaused ONCE here, pass the same value to
+        // capacityFree + decideLaunch (see capacityFree def for rationale).
+        const queuePaused = concurrencyQueue.snapshot().paused;
+        const isFree = await capacityFree(queuePaused);
         const decision = decideLaunch({
           isFree,
           elapsedMs: Date.now() - pollStart,
-          queuePaused: concurrencyQueue.snapshot().paused,
+          queuePaused,
           signalAborted: !!signal?.aborted,
         });
         if (decision === "launch") break; // capacity free — proceed to send
