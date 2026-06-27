@@ -2073,24 +2073,23 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(gone, { recursive: true, force: true });
 }
 
-// --- ADV3-1: drain loop resilient to a throwing release fn ---
+// --- ADV3-1: releaseSlot resilient to a throwing release fn (single-slot shape) ---
 // releaseSlot wraps release() in try/catch/finally so a throw (e.g. O_EXCL
-// lock timeout after 2s, EACCES, ENOSPC) is swallowed and the drain continues;
-// the Set.delete + updateStatus live in a finally so the slot is removed even
-// on throw (prevents an infinite drain loop). releaseSlot is a closure in
-// index.ts (not exported), so this probe replicates the exact drain shape
-// (while (size) releaseOldest() over a Set<Release>) and asserts: (1) every
-// slot is removed even when release() throws, (2) the drain terminates, (3)
-// a non-throwing slot interspersed with throwing ones is still released. This
-// pins the contract the closure must satisfy; if the closure's shape is later
-// regressed (e.g. delete moved before try, or catch omitted), this probe still
-// encodes the required invariant.
+// lock timeout after 2s, EACCES, ENOSPC) is swallowed and the release
+// completes; the mainTurnRelease clear + updateStatus live in a finally so
+// the slot is cleared even on throw (prevents a stuck slot). releaseSlot is
+// a closure in index.ts (not exported) operating on a SINGLE mainTurnRelease
+// slot (CORR5-3 dropped the dead Set+FIFO-by-insertion design). This probe
+// mirrors the actual single-slot shape: assert releaseSlot(release) swallows
+// a throw from release(), clears mainTurnRelease when it matches, and still
+// calls updateStatus in finally. Drops the Set/releaseOldest/"drain terminates"
+// assertions that pinned a contract the production code no longer satisfies.
 {
   type Release = () => void;
-  const inflightSlots = new Set<Release>();
-  let released: string[] = [];
+  // Mirror the single-slot shape from index.ts (CORR5-3 + ADV3-1).
+  let mainTurnRelease: Release | undefined;
   let updateCount = 0;
-  // Mirror the releaseSlot shape from index.ts (ADV3-1).
+  function updateStatus() { updateCount++; }
   function releaseSlot(release: Release | undefined): void {
     if (!release) return;
     try {
@@ -2098,34 +2097,45 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
         release();
       } catch (err) {
         // Transient (lock timeout) or environmental; the watchdog reaps.
-        console.warn("umans: concurrency release threw (drain continues):", err instanceof Error ? err.message : err);
+        console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
       }
     } finally {
-      inflightSlots.delete(release);
-      updateCount++;
+      if (mainTurnRelease === release) mainTurnRelease = undefined;
+      updateStatus();
     }
   }
-  function releaseOldest(): void {
-    const oldest = inflightSlots.values().next().value;
-    releaseSlot(oldest);
-  }
 
-  // Slot A throws, slot B is clean, slot C throws — all must be drained.
-  const A: Release = () => { throw new Error("A: lock timeout"); };
-  const B: Release = () => { released.push("B"); };
-  const C: Release = () => { throw new Error("C: EACCES"); };
-  inflightSlots.add(A);
-  inflightSlots.add(B);
-  inflightSlots.add(C);
+  // (1) releaseSlot swallows a throw from release() (does not re-throw).
+  let releasedA = false;
+  const A: Release = () => { releasedA = true; throw new Error("A: lock timeout"); };
+  mainTurnRelease = A;
+  let threw = false;
+  try { releaseSlot(A); } catch { threw = true; }
+  assert(!threw, "ADV3-1: releaseSlot swallows a throw from release() (no re-throw)");
+  assert(releasedA, "ADV3-1: release() was invoked before throwing");
+  // The matching slot was cleared in finally (mainTurnRelease === A → undefined).
+  assert(mainTurnRelease === undefined, "ADV3-1: matching mainTurnRelease cleared in finally even on throw");
+  // updateStatus ran once (in finally) despite the throw.
+  assert(updateCount === 1, "ADV3-1: updateStatus ran once in finally despite throw");
 
-  // The drain must terminate (not loop forever) and remove all slots.
-  let guard = 0;
-  while (inflightSlots.size && guard++ < 100) releaseOldest();
+  // (2) releaseSlot on a release that does NOT match mainTurnRelease leaves
+  // mainTurnRelease intact (a side-call release must not clear the main-turn
+  // slot — CORR5-3 invariant). updateStatus still runs in finally.
+  const main: Release = () => {};
+  const sideCall: Release = () => {};
+  mainTurnRelease = main;
+  updateCount = 0;
+  releaseSlot(sideCall);
+  assert(mainTurnRelease === main, "ADV3-1: non-matching release does not clear mainTurnRelease (side-call invariant)");
+  assert(updateCount === 1, "ADV3-1: updateStatus ran in finally for non-matching release");
 
-  assert(inflightSlots.size === 0, "ADV3-1: drain removes all slots even when release() throws");
-  assert(guard < 100, "ADV3-1: drain terminates (no infinite loop on a throwing slot)");
-  assert(released.length === 1 && released[0] === "B", "ADV3-1: clean slot still released between throwing ones");
-  assert(updateCount === 3, "ADV3-1: updateStatus ran once per drained slot (in finally)");
+  // (3) releaseSlot(undefined) is a no-op (the safety-net path when no slot
+  // is held — must not throw, must not call updateStatus).
+  mainTurnRelease = undefined;
+  updateCount = 0;
+  releaseSlot(undefined);
+  assert(updateCount === 0, "ADV3-1: releaseSlot(undefined) is a no-op (no updateStatus call)");
+  assert(mainTurnRelease === undefined, "ADV3-1: releaseSlot(undefined) leaves mainTurnRelease undefined");
 }
 
 // --- CORR7-1: preserve 429-origin tag when priority.low extends pause ---
