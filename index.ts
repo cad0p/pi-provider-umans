@@ -53,8 +53,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 // CLN11-1: Derive USER_AGENT from package.json so the version doesn't drift on
-// release. ESM JSON import (Node 22+; the engines floor is Node 20.3, but pi
-// runs on Node 22+ which supports `with { type: "json" }`).
+// release. ESM JSON import attribute `with { type: "json" }` is stable in
+// Node 20.10+ (the engines floor is >=20.10.0, matching this requirement).
 import pkg from "./package.json" with { type: "json" };
 
 type ReasoningInfo = {
@@ -607,11 +607,11 @@ function readRetryAfter(headers: Headers | Record<string, string> | undefined | 
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
 // CLN2-L2: ConcurrencyQueue is imported directly and used at the
-// factory call site. CLN4-1: the speculative type exports (QueueState /
-// WaiterEntry / TokenState / QueueConfig / CapacitySnapshot / CapacityInputs)
-// had no in-repo consumer (not even tests). External consumers should import
-// from concurrency-queue.ts directly.
-// Local type alias for the release function returned by acquireSlot.
+// factory call site. CLN4-1: WaiterEntry / TokenState / CapacitySnapshot /
+// CapacityInputs are intentionally private (shape guards / internal
+// decision inputs); QueueState + QueueConfig are the exported types (see
+// concurrency-queue.ts). Local type alias for the release function returned
+// by acquireSlot.
 type Release = () => void;
 
 // Session-scoped cache of image bytes keyed by a content hash. Lets the
@@ -1030,7 +1030,7 @@ export default async function (pi: ExtensionAPI) {
     // Reconcile the shared pause window with the server's priority state.
     // priority.low is account-wide, so any pi process seeing it pauses all of
     // them via the shared queue file; clearing it when low===false lets the
-    // queue drain as soon as the server says traffic is healthy again.
+    // queue unpauses as soon as the server says traffic is healthy again.
     // CLN2-L1: priorityState is a local const here (it was a module-level let
     // read only by this writer — no other handler or the status bar reads it;
     // the status bar reads concurrencyQueue.snapshot() for paused state).
@@ -1708,7 +1708,7 @@ export default async function (pi: ExtensionAPI) {
   // CORR5-3: the main-turn release is tracked in a SINGLE slot
   // (mainTurnRelease), not a Set. The design guarantees at most one main-turn
   // slot is outstanding (side-calls manage their own release in a finally and
-  // never register here), so a Set + FIFO-by-insertion releaseOldest was a
+  // never register here), so a Set + FIFO-by-insertion release design was a
   // latent footgun: if a future change ever added a second entry, message_end
   // would release the oldest (possibly a side-call acquired before the main
   // turn) instead of the main turn's slot, leaking the token until the safety
@@ -1933,7 +1933,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("agent_end", async (_event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
     liveRequest = undefined;
-    // Drain any slot still held (e.g. aborted turns that never reached
+    // Release any slot still held (e.g. aborted turns that never reached
     // message_end / turn_end) so the gate never deadlocks. CORR5-3: at most one
     // main-turn slot is outstanding, so a single release is sufficient.
     releaseMainTurn();

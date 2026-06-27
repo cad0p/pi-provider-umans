@@ -46,12 +46,13 @@ The gateway base URL defaults to `https://api.code.umans.ai`; override it with `
 
 Models and capabilities are fetched live from `/v1/models/info` at load time, so new Umans models appear automatically — no extension update needed. If the gateway is unreachable, a built-in fallback catalog still lets the provider register.
 
-Current catalog:
+Representative catalog (live list fetched from /v1/models/info):
 
 | ID | Name | Vision | Reasoning | Context |
 |---|---|---|---|---|
 | `umans-kimi-k2.6` | Umans Kimi K2.6 | native | ✅ | 256K |
 | `umans-kimi-k2.7` | Umans Kimi K2.7 Code | native | ✅ (always on) | 256K |
+| `umans-glm-5.1` | Umans GLM 5.1 | via-handoff | ✅ | 202K |
 | `umans-glm-5.2` | Umans GLM 5.2 | via-handoff | ✅ | 406K |
 | `umans-coder` | Umans Coder | native | ✅ (always on) | 256K |
 | `umans-flash` | Umans Flash | native | ✅ | 256K |
@@ -102,7 +103,7 @@ This provider ships a **cross-process FIFO queue** to keep you under the soft ca
 - **Unlimited plans** (Code Max, `limit === undefined`): the queue still serializes launches + honors `priority.low`, but skips the capacity check.
 - **Operator reset**: `/umans-concurrency status` shows the queue depth + pause state; `/umans-concurrency reset` force-clears a poisoned pause (incl. a 429-origin pause) and drops this process's own waiter/token entry — useful for un-wedging without editing `~/.pi/agent/umans-concurrency.json` by hand.
 - **Local filesystem required**: the queue state file lives at `~/.pi/agent/umans-concurrency.json` and must be on a local filesystem (not NFS / iCloud / Dropbox) — `O_EXCL` locking is broken on network filesystems, and a network-synced home can lose writes.
-- **2s lockfile ceiling is a hard correctness bound (CMP6-2)**: the `O_EXCL` lockfile is created once at acquire time and never touched while held. A legitimately-slow writer (disk pressure, NFS) exceeding the 2s `lockTimeoutMs` will have its lockfile yanked mid-write, racing two writers (lost write). The current critical section (read-modify-write of the JSON) is sub-ms on local APFS, so the 2s ceiling has ~1000× headroom. If the queue is ever pointed at non-local storage, implement mtime-refresh-while-held (a `setInterval` that touches the lockfile mtime every 500ms while the lock is held, cleared on release) to decouple liveness from this correctness bound.
+- **2s lockfile ceiling is a hard correctness bound (CMP-MED-2)**: the `O_EXCL` lockfile is created once at acquire time and never touched while held. A legitimately-slow writer (disk pressure, NFS) exceeding the 2s `lockTimeoutMs` will have its lockfile yanked mid-write, racing two writers (lost write). The current critical section (read-modify-write of the JSON) is sub-ms on local APFS, so the 2s ceiling has ~1000× headroom. If the queue is ever pointed at non-local storage, implement mtime-refresh-while-held (a `setInterval` that touches the lockfile mtime every 500ms while the lock is held, cleared on release) to decouple liveness from this correctness bound.
 
 The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`) are documented in the table below; the general Configuration table links back here to avoid duplicating them.
 

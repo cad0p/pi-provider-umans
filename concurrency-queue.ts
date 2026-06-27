@@ -495,12 +495,15 @@ export function readState(path: string): QueueState {
 /**
  * True if a PID is not currently alive. Never throws.
  *
- * CLN5-3: this is one of the module's pure-helper exports
- * (readState / reapStale / isPidDead / MAX_PAUSE_MS) — pure, side-effect-free
- * functions exposed so external consumers (and selfcheck) can build on the
- * queue's primitives. They are not used by index.ts (the provider goes through
- * the ConcurrencyQueue handle), but are a defensible small public API for a
- * standalone queue module.
+ * CLN5-3: this is one of the module's pure-helper exports — pure,
+ * side-effect-free functions exposed so external consumers (and selfcheck)
+ * can build on the queue's primitives. They are not used by index.ts (the
+ * provider goes through the ConcurrencyQueue handle), but are a defensible
+ * small public API for a standalone queue module. See the export list at
+ * the top of this module for the full set (readState / reapStale / isPidDead
+ * / parsePriority / parseConcurrencyLimit / isCapacityFree / clampPauseUntil
+ * / sanitizeReason / MAX_PAUSE_MS / PAUSE_REASON_429 / MAX_LOCK_FUTURE_MS /
+ * SANITIZE_CTRL_RE / MAX_STATE_BYTES).
  */
 export function isPidDead(pid: number): boolean {
   // SEC7-3: defensive guard for non-numeric / non-finite input. The shape
@@ -891,10 +894,13 @@ export interface ConcurrencyQueue {
    * CORR4-1: by default this REFUSES to clear a 429-origin pause (tagged
    * PAUSE_REASON_429) — /usage lags a 429 by 1-5s, so a stale tick reporting
    * priority.low===false must not wipe a sibling's freshly-written 429 pause.
-   * The 429 pause survives until it naturally elapses OR /usage reports
-   * priority.low===true (confirming the server caught up). Pass {force:true}
-   * to clear unconditionally (used by the /umans-concurrency reset operator
-   * command to un-wedge a poisoned pause without editing the JSON by hand).
+   * clearPause refuses purely on the PAUSE_REASON_429 + pausedUntil > now
+   * condition; it does NOT itself inspect /usage. The priority.low===true
+   * confirmation happens at the caller (refreshUsage routes low===true to
+   * pauseUntil, not clearPause, so the 429 pause survives until it naturally
+   * elapses). Pass {force:true} to clear unconditionally (used by the
+   * /umans-concurrency reset operator command to un-wedge a poisoned pause
+   * without editing the JSON by hand).
    */
   clearPause(opts?: { force?: boolean }): void;
   /**

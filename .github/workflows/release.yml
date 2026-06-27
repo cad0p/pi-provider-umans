@@ -20,10 +20,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # CLN11-6: pin to 20.3 (the engines floor in package.json, required
-          # for AbortSignal.any used in concurrency-queue.ts). "20" alone is
-          # looser + a 20.0/20.1 setup-node image would fail at runtime.
-          node-version: "20.3"
+          # CLN11-6/CLN12-8: pin to 20.10 (the engines floor in package.json,
+          # required for AbortSignal.any used in concurrency-queue.ts AND the
+          # `with { type: "json" }` ESM import attribute used for USER_AGENT
+          # derivation in index.ts). "20" alone is looser + a 20.0/20.1
+          # setup-node image would fail at runtime.
+          node-version: "20.10"
           registry-url: "https://registry.npmjs.org"
 
       - name: Determine next version
