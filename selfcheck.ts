@@ -4615,6 +4615,158 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV11-2: !visionModelId early-return + message_end notify branch driven ---
+// transformMessageImages returns undefined early when !visionModelId
+// (index.ts: `if (!visionModelId) return undefined;`), + the message_end
+// handler has a sibling notify branch ("Umans vision handoff skipped: no vision
+// model...") that fires when a via-handoff model is selected + an image is
+// present but visionModelId is unset. Neither path was driven through the real
+// factory (the static fallback catalog always has a native-vision model, so
+// visionModelId is never undefined in normal load). Drive it by providing a
+// /v1/models/info catalog with a via-handoff model but NO native-vision model
+// (so pickVisionModel returns undefined) + asserting the warning notify fires,
+// no /v1/messages fetch fires (no analyzeImage side-call), + no state file is
+// written (no acquireSlot).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov11-2-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  // Crucially, do NOT set UMANS_VISION_MODEL — pickVisionModel must return
+  // undefined (no native-vision model in the catalog below + no env override).
+  savedEnv.UMANS_VISION_MODEL = process.env.UMANS_VISION_MODEL;
+  delete process.env.UMANS_VISION_MODEL;
+  savedEnv.UMANS_VISION_DISABLE = process.env.UMANS_VISION_DISABLE;
+  delete process.env.UMANS_VISION_DISABLE;
+  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
+  delete process.env.UMANS_SEARCH_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  let messagesCalls = 0;
+  let usageCalls = 0;
+  let modelsInfoCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/models/info")) {
+      modelsInfoCalls++;
+      // Flat catalog keyed by model id (fetchModelCatalog rejects wrapper
+      // shapes like { models: [...] } + falls back to STATIC_CATALOG). Provide
+      // a via-handoff model (umans-glm-5.2) but NO native-vision model — so
+      // pickVisionModel returns undefined (no native-vision entry, no
+      // umans-kimi-k2.7 default, no env override).
+      return Promise.resolve(new Response(JSON.stringify({
+        "umans-glm-5.2": { name: "umans-glm-5.2", display_name: "GLM 5.2", capabilities: { supports_vision: "via-handoff", supports_tools: true } },
+        "umans-flash": { name: "umans-flash", display_name: "Flash", capabilities: { supports_vision: false, supports_tools: true } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      messagesCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "analysis result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let result: any;
+      for (const h of hs) {
+        const r = await h(payload, ctx ?? makeCtx());
+        if (r !== undefined && result === undefined) result = r;
+      }
+      return result;
+    }
+    await umansFactory(pi as any);
+    assert(modelsInfoCalls > 0, "COV11-2: /v1/models/info fetched (catalog with no native-vision model)");
+
+    // Dispatch message_end with an image block + a via-handoff model selected.
+    // The message_end handler: provider is umans ✓, isViaHandoffUmans(glm-5.2)
+    // ✓, message role user ✓, content has an image ✓, visionDisabled false ✓,
+    // then !visionModelId → the notify branch fires + returns early (no
+    // transformMessageImages, no acquireSlot, no /v1/messages fetch).
+    messagesCalls = 0;
+    usageCalls = 0;
+    notifications.length = 0;
+    const result = await dispatch("message_end", {
+      type: "message_end",
+      message: {
+        role: "user",
+        provider: "umans",
+        content: [
+          { type: "text", text: "look at this" },
+          { type: "image", data: "aGk=", mimeType: "image/png" }, // "hi"
+        ],
+      },
+    }, makeCtx({ provider: "umans", id: "umans-glm-5.2" })); // via-handoff model
+
+    // The "no vision model" warning notify fired.
+    const skipNotes = notifications.filter((n) => n.msg.includes("Umans vision handoff skipped: no vision model"));
+    assert(skipNotes.length === 1, `COV11-2: "no vision model" warning notify fired once (got ${skipNotes.length})`);
+    assert(skipNotes[0].type === "warning", `COV11-2: skip notify is a warning (got ${skipNotes[0].type})`);
+    // No analyzeImage side-call fired (transformMessageImages returned early
+    // before any acquireSlot / fetch).
+    assert(messagesCalls === 0, `COV11-2: no /v1/messages fetch fired (no side-call) (got ${messagesCalls})`);
+    // No state file written (no acquireSlot → no queue mutation).
+    assert(!existsSync(stateFile), "COV11-2: no state file written (!visionModelId early-return)");
+    // The handler returned undefined (no transformed message — the image is
+    // left as-is for the text model / gateway-side handoff).
+    assert(result === undefined, "COV11-2: message_end returned undefined (no transformation, no acquireSlot)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV10-7: concurrencyDisabled mode driven through real factory wiring ---
 // When UMANS_CONCURRENCY_DISABLE=1, the factory wires concurrencyDisabled=true
 // and 4 handlers short-circuit via an explicit `if (concurrencyDisabled)`
