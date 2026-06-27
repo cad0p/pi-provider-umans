@@ -3605,6 +3605,48 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- SEC11-2: handle429 guards readRetryAfter against a throwing Headers.get ---
+// readRetryAfter calls headers.get("retry-after"). A malformed pi event (or a
+// buggy/Headers-like object whose .get throws) used to propagate out of handle429
+// as an unhandled extension error — only pauseUntil was wrapped in try/catch.
+// The fix wraps the readRetryAfter call + falls back to the PRIORITY_BACKOFF_MS
+// deadline on throw. Drive it directly: a headers object whose .get throws must
+// not crash handle429 + must land a PAUSE_REASON_429 pause at the default backoff.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sec11-2-"));
+  const stateFile = join(dir, "state.json");
+  const { readFileSync } = await import("node:fs");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // A Headers-like object whose .get throws (simulating a malformed pi event
+  // / a hostile wrapper). Duck-typed: readRetryAfter sees typeof .get ===
+  // "function" + calls it.
+  const throwingHeaders = {
+    get(_name: string): string {
+      throw new Error("malformed headers: .get exploded");
+    },
+  };
+  let threw = false;
+  let until = 0;
+  try {
+    until = handle429({ status: 429, headers: throwingHeaders as any }, q);
+  } catch (e) {
+    threw = true;
+  }
+  assert(!threw, "SEC11-2: handle429 does not throw when headers.get throws (guarded)");
+  // Falls back to the PRIORITY_BACKOFF_MS deadline (~30s), not a throw.
+  assert(until > 0 && until <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
+    "SEC11-2: throwing .get falls back to PRIORITY_BACKOFF_MS deadline (~30s)");
+  // A pause still landed + is tagged PAUSE_REASON_429 (the pauseUntil call is
+  // independent of the header parse + still fires).
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil === until, "SEC11-2: pause written at the fallback deadline");
+  assert(st.pausedReason === PAUSE_REASON_429, "SEC11-2: pause tagged PAUSE_REASON_429 despite throwing .get");
+
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- SEC7-5: state file + lockfile created with mode 0600 (regression guard) ---
 // The 0o600 mode (no PID leakage, no world-readable queue state) was not
 // asserted in selfcheck beyond the S3 block. Add an explicit, deterministic

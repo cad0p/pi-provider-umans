@@ -517,7 +517,19 @@ export function handle429(
   source: { status: number; headers?: Headers | Record<string, string> | undefined | null },
   concurrencyQueue: { pauseUntil(until: number, reason?: string | null): void },
 ): number {
-  const retryAfter = readRetryAfter(source.headers);
+  // SEC11-2: readRetryAfter calls headers.get("retry-after") which could
+  // throw on a malformed pi event (a buggy/Headers-like object whose .get
+  // throws). The surrounding handle429 only wrapped pauseUntil in try/catch,
+  // so a throwing .get propagated out as an unhandled extension error. Wrap
+  // the header parse + fall back to the PRIORITY_BACKOFF_MS deadline on throw,
+  // mirroring the pauseUntil guard below.
+  let retryAfter: string | undefined;
+  try {
+    retryAfter = readRetryAfter(source.headers);
+  } catch (err) {
+    console.warn("umans: readRetryAfter threw in 429 handler (falling back to default backoff):", err instanceof Error ? err.message : err);
+    retryAfter = undefined;
+  }
   let until = Date.now() + PRIORITY_BACKOFF_MS;
   if (retryAfter) {
     // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or an
