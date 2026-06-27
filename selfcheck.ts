@@ -2800,7 +2800,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const dir = mkdtempSync(join(tmpdir(), "umans-q-cmp7-1-"));
   const stateFile = join(dir, "state.json");
   const lockFile = `${stateFile}.lock`;
-  const { writeFileSync, readFileSync, utimesSync, symlinkSync, lstatSync } = await import("node:fs");
+  const { writeFileSync, readFileSync, utimesSync, symlinkSync, lstatSync, unlinkSync } = await import("node:fs");
 
   // Plant a lockfile with a STALE mtime (past the 2s ceiling). The holder PID
   // is dead (99999999) but that no longer matters — the mtime ceiling reclaims.
@@ -5315,12 +5315,12 @@ if (process.platform !== "win32") {
     utimesSync(lockFile, future, future);
     const cfg: Required<QueueConfig> = {
       stateFile,
-      pollIntervalMs: 50,
       staleTokenMs: 120_000,
       staleWaiterMs: 300_000,
       lockTimeoutMs: 2_000,
       lockRetryMs: 5,
       now: () => Date.now(),
+      pid: () => process.pid,
     };
     const q = createConcurrencyQueue(cfg);
     const id = q.join();
@@ -5328,7 +5328,7 @@ if (process.platform !== "win32") {
       "ADV12-1: far-future (1h) lockfile mtime is reclaimed (join succeeds, not wedged)");
     assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
       "ADV12-1: far-future lockfile is either gone (released) or freshly created (~now)");
-    q.cancel(id);
+    q.cancel(id!);
   } finally {
     try { rmSync(tmp1, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -5343,12 +5343,12 @@ if (process.platform !== "win32") {
     utimesSync(lockFile, future, future);
     const cfg: Required<QueueConfig> = {
       stateFile,
-      pollIntervalMs: 50,
       staleTokenMs: 120_000,
       staleWaiterMs: 300_000,
       lockTimeoutMs: 2_000,
       lockRetryMs: 5,
       now: () => Date.now(),
+      pid: () => process.pid,
     };
     const q = createConcurrencyQueue(cfg);
     // Before SEC13-1, this threw "timed out acquiring lock" because 30s is
@@ -5359,7 +5359,7 @@ if (process.platform !== "win32") {
       "SEC13-1: near-future (30s) lockfile mtime is reclaimed (join succeeds, not wedged)");
     assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
       "SEC13-1: near-future lockfile is either gone (released) or freshly created (~now)");
-    q.cancel(id);
+    q.cancel(id!);
   } finally {
     try { rmSync(tmp2, { recursive: true, force: true }); } catch { /* ignore */ }
   }
