@@ -5,7 +5,7 @@
 // - createConcurrencyQueue: FIFO + launch-token + pause (file-backed, temp dir)
 //
 // Run: node --experimental-strip-types selfcheck.ts
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody, handle429 } from "./index.ts";
@@ -4309,6 +4309,124 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     probe.reset();
 
     await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- COV10-7: concurrencyDisabled mode driven through real factory wiring ---
+// When UMANS_CONCURRENCY_DISABLE=1, the factory wires concurrencyDisabled=true
+// and 5 handlers short-circuit: before_provider_request (no acquireSlot),
+// after_provider_response 429 (no handle429), message_end (no releaseMainTurn),
+// turn_end/agent_end (no releaseMainTurn), session_shutdown (no reset). The
+// disabled mode was never driven through the real factory (only unit-tested
+// at the queue level). A regression dropping a `if (concurrencyDisabled) return`
+// guard, or writing state despite the flag, would not be caught. Run the
+// COV7-1 harness with UMANS_CONCURRENCY_DISABLE=1; dispatch before_provider_
+// request + after_provider_response(429) + message_end + session_shutdown;
+// assert no state file is written, no /usage poll fires, and mainTurnRelease
+// stays undefined (no slot acquired).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-7-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_CONCURRENCY_DISABLE: "1", // disable the queue for this harness
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  // UMANS_CONCURRENCY_DISABLE=1 is set above (envOverrides).
+
+  const realFetch = globalThis.fetch;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let last: any;
+      for (const h of hs) last = await h(payload ?? { type: event }, makeCtx());
+      return last;
+    }
+    await umansFactory(pi as any);
+
+    assert(handlers.has("before_provider_request"), "COV10-7: before_provider_request handler registered");
+    assert(handlers.has("after_provider_response"), "COV10-7: after_provider_response handler registered");
+    assert(handlers.has("message_end"), "COV10-7: message_end handler registered");
+    assert(handlers.has("session_shutdown"), "COV10-7: session_shutdown handler registered");
+
+    // (a) before_provider_request: concurrencyDisabled short-circuits BEFORE
+    // acquireSlot — no /usage poll, no state file written, no token acquired.
+    usageCalls = 0;
+    await dispatch("before_provider_request", { type: "before_provider_request", payload: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert(usageCalls === 0, "COV10-7: concurrencyDisabled before_provider_request did not poll /v1/usage");
+    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled before_provider_request wrote no state file");
+
+    // (b) after_provider_response 429: concurrencyDisabled short-circuits BEFORE
+    // handle429 — no shared pause written, no notify. The 429 is invisible to
+    // the queue (fire-and-forget mode).
+    await dispatch("after_provider_response", { type: "after_provider_response", status: 429, headers: { "retry-after": "60" } });
+    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled after_provider_response 429 wrote no state file");
+    const pauseNotes = notifications.filter((n) => n.msg.includes("Umans 429"));
+    assert(pauseNotes.length === 0, "COV10-7: concurrencyDisabled after_provider_response 429 did not notify a pause");
+
+    // (c) message_end: concurrencyDisabled short-circuits BEFORE releaseMainTurn
+    // — but mainTurnRelease was never set (no acquireSlot in (a)), so this is a
+    // no-op either way. Assert no state file appears (no reset path writes).
+    await dispatch("message_end", { type: "message_end", message: { role: "assistant", provider: "umans" } });
+    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled message_end wrote no state file");
+
+    // (d) session_shutdown: the handler runs stopRefreshLoop + releaseMainTurn
+    // + concurrencyQueue.reset(). reset() on a disabled queue is a no-op (no
+    // state file). The refresh loop never started (session_start wasn't
+    // dispatched), so stopRefreshLoop is a no-op. Assert no state file appears.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled session_shutdown wrote no state file");
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
