@@ -1130,7 +1130,7 @@ export default async function (pi: ExtensionAPI) {
           // is a best-effort coordination signal (the server's priority.low +
           // the 120s watchdog bound it); it must not abort a turn that already
           // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
-          // ADV3-1 drain-resilience pattern.
+          // ADV3-1 release-resilience pattern.
           try {
             concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
           } catch (err) {

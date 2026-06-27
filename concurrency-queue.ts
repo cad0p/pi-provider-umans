@@ -992,9 +992,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // pending + the waiter leaked for staleWaiterMs = 5 min, stalling
           // siblings). Wrap the body so a throw on any re-entry clears the
           // timer, best-effort cancels our waiter entry, and rejects the
-          // waitForLaunch promise — mirroring releaseSlot's drain-resilience
+          // waitForLaunch promise — mirroring releaseSlot's release-resilience
           // pattern (ADV3-1) so the poll loop is as resilient to lock/disk
-          // errors as the drain loop already is.
+          // errors as the release loop already is.
           let got: boolean;
           try {
             got = mutate((now, state) => {
