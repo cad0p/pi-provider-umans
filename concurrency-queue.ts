@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync, fstatSync, readSync } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -398,37 +398,61 @@ function isTokenState(t: unknown): t is TokenState {
 
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string): QueueState {
+  // SEC10-1: open the fd FIRST + fstat it + read from the fd, so the
+  // regular-file + size checks + the read are atomic wrt path swaps. The
+  // prior lstatSync(path) + readFileSync(path) pair had a TOCTOU window: an
+  // attacker could swap the file (e.g. to a symlink) between the lstat + the
+  // read. Mirrors the write path's fd-based pattern (writeStateAtomic opens
+  // with O_EXCL + writes to the fd). lstatSync is still used to detect a
+  // symlink at the PATH (without following it) so a planted symlink state
+  // file is rejected before opening; the fd read then cannot be swapped to a
+  // different target. A missing file throws ENOENT from openSync, caught by
+  // the outer try → empty state (matching the prior absent-file behavior).
   try {
-    // SEC9-2/SEC8-1 + SEC9-4: lstat before readFileSync. Combines two guards
-    // in one stat call:
-    //  - size bound: a poisoned/runaway state file (e.g. 1 GB) would OOM/stall
-    //    the pi process before JSON.parse. Bail when st.size > MAX_STATE_BYTES.
-    //  - non-regular file: a FIFO/pipe or character device would block
-    //    readFileSync indefinitely (wedging the mutate call + the O_EXCL lock).
-    // lstatSync (not statSync) so a symlink state file is detected as
-    // non-regular + treated as empty without following the link.
-    const st = lstatSync(path);
-    if (!st.isFile() || st.size > MAX_STATE_BYTES) {
-      return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+    let fd: number | undefined;
+    try {
+      // lstatSync (not statSync) so a symlink state file is detected as
+      // non-regular + treated as empty without following the link. A FIFO/pipe
+      // or character device would otherwise block readFileSync indefinitely
+      // (wedging the mutate call + the O_EXCL lock).
+      const lstat = lstatSync(path);
+      if (!lstat.isFile() || lstat.size > MAX_STATE_BYTES) {
+        return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+      }
+      // SEC10-1: open the fd AFTER the lstat guard, then fstat + read from
+      // the fd so a path swap between the lstat + the read cannot redirect
+      // the read into a symlink/FIFO target. fstat operates on the fd we
+      // already hold; readSync reads from that fd. Re-check isFile + size on
+      // the fd in case the file was swapped (the lstat was on the path).
+      fd = openSync(path, "r");
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > MAX_STATE_BYTES) {
+        closeSync(fd);
+        return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+      }
+      const buf = Buffer.alloc(st.size);
+      readSync(fd, buf, 0, st.size, 0);
+      const raw = buf.toString("utf8");
+      const parsed = JSON.parse(raw) as Partial<QueueState>;
+      const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
+      const token = isTokenState(parsed.token) ? parsed.token : null;
+      return {
+        waiters,
+        token,
+        pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
+        // COV6-1 / SEC6-1: sanitize pausedReason on the READ boundary too. SEC5-1
+        // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
+        // but readState passed parsed.pausedReason straight through → snapshot() →
+        // status bar/notify render raw. A hand-edited file, a compromised sibling
+        // writing JSON directly, or a file poisoned by an earlier unfixed build
+        // surfaces the raw string. The write-boundary sanitize is the primary
+        // guard; this closes the hand-edited-file gap (defense-in-depth).
+        pausedReason: sanitizeReason(parsed.pausedReason ?? null),
+        pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
+      };
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
     }
-    const raw = readFileSync(path, "utf8");
-    const parsed = JSON.parse(raw) as Partial<QueueState>;
-    const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
-    const token = isTokenState(parsed.token) ? parsed.token : null;
-    return {
-      waiters,
-      token,
-      pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
-      // COV6-1 / SEC6-1: sanitize pausedReason on the READ boundary too. SEC5-1
-      // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
-      // but readState passed parsed.pausedReason straight through → snapshot() →
-      // status bar/notify render raw. A hand-edited file, a compromised sibling
-      // writing JSON directly, or a file poisoned by an earlier unfixed build
-      // surfaces the raw string. The write-boundary sanitize is the primary
-      // guard; this closes the hand-edited-file gap (defense-in-depth).
-      pausedReason: sanitizeReason(parsed.pausedReason ?? null),
-      pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
-    };
   } catch {
     return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
   }

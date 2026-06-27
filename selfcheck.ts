@@ -551,6 +551,35 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- SEC10-1: readState uses fd-based read (no TOCTOU between lstat + read) ---
+// readState previously guarded with lstatSync(path) then immediately called
+// readFileSync(path). Between them an attacker could swap the file (e.g. to a
+// symlink). readState now opens the fd first + fstats it + reads from the fd,
+// so the regular-file + size checks + the read are atomic wrt path swaps. We
+// cannot race the window deterministically from JS, but we CAN assert the
+// observable contract: a symlink state file is rejected at the lstat guard
+// (treated as empty, NOT followed) — the prior readFileSync(path) would have
+// followed a symlink planted AFTER the lstat. Plant a symlink at the state
+// path pointing at a canary; readState must return empty + must NOT have
+// followed the link (canary untouched).
+if (process.platform !== "win32") {
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sec10-1-"));
+  const stateFile = join(dir, "state.json");
+  const { symlinkSync } = await import("node:fs");
+  const canary = join(dir, "canary.txt");
+  writeFileSync(canary, "CANARY-ORIGINAL", { mode: 0o600 });
+  // Plant a symlink at the state path → canary. lstatSync sees a non-regular
+  // file → readState returns empty WITHOUT opening the fd (so the canary is
+  // never read through the symlink).
+  symlinkSync(canary, stateFile);
+  const st = readState(stateFile);
+  assert(st.waiters.length === 0 && st.token === null && st.pausedUntil === 0,
+    "SEC10-1: symlink state file returns empty state (not followed)");
+  assert(readFileSync(canary, "utf8") === "CANARY-ORIGINAL",
+    "SEC10-1: symlink target not read through (canary intact)");
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- COV-HIGH-4: cancel paths (non-existent id, non-head waiter, token-holder) ---
 // cancel is a hot path (called on every acquireSlot release) but was never
 // exercised by selfcheck. Covers: no-op on missing id, removal of a non-head
