@@ -4977,42 +4977,30 @@ if (process.platform !== "win32") {
     "COV10-3: acquireLock timeout message present in source (Windows skip)");
 }
 
-// --- CORR11-1: acquireLock closes fd + unlinks lockfile when writeFileSync throws ---
-// acquireLock does openSync(lockFile, "wx") then writeFileSync(fd, ...). If
-// writeFileSync throws a non-EEXIST error (ENOSPC, EIO, EROFS), the old code
-// re-threw without closing fd or unlinking the lockfile — fd leaked for the
-// process lifetime + the lockfile blocked siblings until stale-lockfile
-// recovery (2s) reaped it. The fix wraps the openSync+writeFileSync pair in a
-// try/finally that closes fd + unlinks the lockfile on throw. Forcing
-// writeFileSync to throw while openSync("wx") succeeds requires a read-only
-// filesystem / ENOSPC, which is not portable in a selfcheck; pin the cleanup
-// structure by source inspection + assert the fd is closed + lockfile unlinked
-// (not left behind) on the throw path.
+// --- CORR11-1/SEC13-2: acquireLock opens a zero-byte O_EXCL sentinel (no writeFileSync) ---
+// acquireLock previously did openSync(lockFile, "wx") then writeFileSync(fd,
+// {pid}). CORR11-1 wrapped the writeFileSync in try/catch to close fd + unlink
+// the lockfile on throw. SEC13-2 dropped the PID write entirely (dead code —
+// the read-back was dropped in SEC9-3, so the PID was never read back). The
+// lockfile is now a zero-byte O_EXCL sentinel; no writeFileSync follows the
+// openSync, so there is no throw to catch + no fd to leak. The mtime ceiling
+// is the sole authoritative reclaim bound. Pin the new structure.
 {
   const src = readFileSync("concurrency-queue.ts", "utf8");
   const acquireIdx = src.indexOf("function acquireLock(");
   assert(acquireIdx >= 0, "CORR11-1: acquireLock defined in concurrency-queue.ts");
   const acquireEnd = src.indexOf("\n}\n", acquireIdx);
   const body = src.slice(acquireIdx, acquireEnd);
-  // The writeFileSync call must be wrapped in an inner try/catch (the
-  // CORR11-1 cleanup) that closes fd + unlinks the lockfile + resets fd +
-  // re-throws.
-  assert(body.includes("writeFileSync(fd, JSON.stringify({ pid: cfg.pid() })"),
-    "CORR11-1: acquireLock writes the holder PID via writeFileSync(fd, ...)");
-  assert(body.includes("try {\n        writeFileSync(fd,"),
-    "CORR11-1: writeFileSync wrapped in inner try (cleanup guard present)");
-  // The catch must close fd + unlink the lockfile + reset fd to undefined +
-  // re-throw — pin each step so a regression dropping one is caught.
-  assert(body.includes("} catch (e2: any) {"),
-    "CORR11-1: inner catch (e2) for writeFileSync throw present");
-  assert(body.includes("try { closeSync(fd); } catch"),
-    "CORR11-1: fd closed on writeFileSync throw (no fd leak)");
-  assert(body.includes("try { unlinkSync(lockFile); } catch"),
-    "CORR11-1: lockfile unlinked on writeFileSync throw (no stale lockfile)");
-  assert(body.includes("fd = undefined;"),
-    "CORR11-1: fd reset to undefined on throw (no stale fd reference)");
-  assert(body.includes("throw e2;"),
-    "CORR11-1: writeFileSync error re-thrown after cleanup (fail-loud, not swallowed)");
+  // SEC13-2: the lockfile is a zero-byte O_EXCL sentinel — no writeFileSync
+  // of a PID object after openSync.
+  assert(!body.includes("writeFileSync(fd, JSON.stringify"),
+    "SEC13-2: acquireLock does NOT write the holder PID (dead code dropped)");
+  // The openSync("wx") call must still be present (O_EXCL sentinel).
+  assert(body.includes('openSync(lockFile, "wx", 0o600)'),
+    "CORR11-1: acquireLock opens lockfile with O_EXCL (wx) + 0o600 mode");
+  // The release fn must close fd + unlink the lockfile.
+  assert(body.includes("closeSync(fd)") && body.includes("unlinkSync(lockFile)"),
+    "CORR11-1: release fn closes fd + unlinks lockfile");
 }
 
 // --- COV10-5: side-call tool execute early-return paths driven through real wiring ---
@@ -5312,13 +5300,16 @@ if (process.platform !== "win32") {
 // lock is never reclaimed — wedging every mutate until the wall clock catches
 // up. An attacker with write access to ~/.pi/agent/ can `touch -t` the
 // lockfile to a future date + wedge every local pi process indefinitely.
+// SEC13-1: the prior MAX_LOCK_FUTURE_MS=60s ceiling left a 1-60s gap where a
+// near-future-dated lockfile (small NTP skew) was NOT reclaimed. The fix
+// reclaims ANY future-dated mtime (st.mtimeMs > cfg.now()).
 {
-  const tmp = `/tmp/adv12-1-${process.pid}-${Date.now()}`;
+  // Test 1: far-future (1h) — the original ADV12-1 case.
+  const tmp1 = `/tmp/adv12-1-far-${process.pid}-${Date.now()}`;
   try {
-    const stateFile = `${tmp}/state.json`;
+    const stateFile = `${tmp1}/state.json`;
     const lockFile = `${stateFile}.lock`;
-    mkdirSync(tmp, { recursive: true });
-    // Plant a lockfile with a future-dated mtime (1h in the future).
+    mkdirSync(tmp1, { recursive: true });
     writeFileSync(lockFile, "planted");
     const future = new Date(Date.now() + 60 * 60 * 1000); // +1h
     utimesSync(lockFile, future, future);
@@ -5332,21 +5323,45 @@ if (process.platform !== "win32") {
       now: () => Date.now(),
     };
     const q = createConcurrencyQueue(cfg);
-    // join() → mutate → acquireLock should reclaim the future-dated lockfile
-    // + succeed (not throw "timed out acquiring lock"). Before ADV12-1, this
-    // threw because the future-dated mtime made the stale condition negative.
     const id = q.join();
     assert(typeof id === "string" && id.length > 0,
-      "ADV12-1: future-dated lockfile mtime is reclaimed (join succeeds, not wedged)");
-    // The future-dated lockfile was unlinked + replaced; join() cleaned up
-    // after itself (release unlinks the lockfile). So the lockfile should NOT
-    // exist after join completes. (If the reclaim failed, join would have
-    // thrown before reaching here.)
+      "ADV12-1: far-future (1h) lockfile mtime is reclaimed (join succeeds, not wedged)");
     assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
-      "ADV12-1: lockfile is either gone (released) or freshly created (~now, not future-dated)");
+      "ADV12-1: far-future lockfile is either gone (released) or freshly created (~now)");
     q.cancel(id);
   } finally {
-    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { rmSync(tmp1, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  // Test 2: near-future (30s) — the SEC13-1 gap case.
+  const tmp2 = `/tmp/sec13-1-near-${process.pid}-${Date.now()}`;
+  try {
+    const stateFile = `${tmp2}/state.json`;
+    const lockFile = `${stateFile}.lock`;
+    mkdirSync(tmp2, { recursive: true });
+    writeFileSync(lockFile, "planted");
+    const future = new Date(Date.now() + 30_000); // +30s (in the old 1-60s gap)
+    utimesSync(lockFile, future, future);
+    const cfg: Required<QueueConfig> = {
+      stateFile,
+      pollIntervalMs: 50,
+      staleTokenMs: 120_000,
+      staleWaiterMs: 300_000,
+      lockTimeoutMs: 2_000,
+      lockRetryMs: 5,
+      now: () => Date.now(),
+    };
+    const q = createConcurrencyQueue(cfg);
+    // Before SEC13-1, this threw "timed out acquiring lock" because 30s is
+    // in the old 1-60s gap (not >60s, not <now). After SEC13-1, any future
+    // mtime is reclaimed.
+    const id = q.join();
+    assert(typeof id === "string" && id.length > 0,
+      "SEC13-1: near-future (30s) lockfile mtime is reclaimed (join succeeds, not wedged)");
+    assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
+      "SEC13-1: near-future lockfile is either gone (released) or freshly created (~now)");
+    q.cancel(id);
+  } finally {
+    try { rmSync(tmp2, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 

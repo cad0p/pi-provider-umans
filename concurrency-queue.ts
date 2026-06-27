@@ -117,19 +117,23 @@ const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
 
 /**
- * ADV12-1: a lockfile whose mtime is implausibly far in the future is treated
- * as stale + reclaimed. A future-dated mtime arises from a backwards clock
- * jump (NTP correction, resume from suspend, manual `date` change) or a
+ * ADV12-1/SEC13-1: a lockfile whose mtime is in the future is treated as
+ * stale + reclaimed. A future-dated mtime arises from a backwards clock jump
+ * (NTP correction, resume from suspend, manual `date` change) or a
  * hand-edited/planted lockfile. Without this bound, `cfg.now() - st.mtimeMs`
  * is negative, the stale-lockfile condition is false, and the lock is never
- * reclaimed — wedging every `mutate` until the wall clock catches up. 60s is
- * a generous ceiling: no legitimate lockfile is ever minutes in the future
- * (the lock timeout is 2s, the critical section is sub-ms). An attacker with
- * write access to ~/.pi/agent/ (the documented threat model) could otherwise
- * `touch -t` the lockfile to a future date + wedge every local pi process
- * indefinitely.
+ * reclaimed — wedging every `mutate` until the wall clock catches up.
+ *
+ * SEC13-1: the prior 60s ceiling left a 1-60s gap where a near-future-dated
+ * lockfile (small NTP skew) was NOT reclaimed, wedging the queue for up to 60s.
+ * Lowered to 1s — catches any human-planted `touch -t` (always > 1s) and any
+ * meaningful NTP skew (> 1s), while tolerating sub-ms floating-point jitter
+ * from `utimesSync`/`Date.now()` round-trips (the child-holder test touches
+ * mtime every 5ms; a zero tolerance would reclaim a live holder's freshly-
+ * touched lockfile as "future-dated" due to sub-ms rounding). A lockfile < 1s
+ * in the future ages out via the normal `lockTimeoutMs` ceiling within ~2s.
  */
-export const MAX_LOCK_FUTURE_MS = 60_000;
+export const MAX_LOCK_FUTURE_MS = 1_000;
 
 function defaultNow(): number { return Date.now(); }
 function defaultPid(): number { return process.pid; }
@@ -502,7 +506,7 @@ export function readState(path: string): QueueState {
  * small public API for a standalone queue module. See the export list at
  * the top of this module for the full set (readState / reapStale / isPidDead
  * / parsePriority / parseConcurrencyLimit / isCapacityFree / clampPauseUntil
- * / sanitizeReason / MAX_PAUSE_MS / PAUSE_REASON_429 / MAX_LOCK_FUTURE_MS /
+ * / sanitizeReason / MAX_PAUSE_MS / PAUSE_REASON_429 /
  * SANITIZE_CTRL_RE / MAX_STATE_BYTES).
  */
 export function isPidDead(pid: number): boolean {
@@ -653,40 +657,20 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   while (fd === undefined) {
     try {
       fd = openSync(lockFile, "wx", 0o600);
-      // CMP7-1: write the holder PID into the lockfile so the stale-lock
-      // decision can distinguish "holder is dead" from "lockfile is merely
-      // old". A slow-but-legitimate mutate (disk pressure) holding >2s used to
-      // have its lockfile yanked mid-write; now a live holder PID keeps the
-      // lock until the mtime ceiling (the 2s bound still applies as the
-      // fallback). readFileSync is guarded by the SEC7-1 lstatSync fix above
-      // (a symlink lockfile is reclaimed without being followed). Malformed/
-      // empty content falls back to the mtime check.
-      // CMP8-1 / SEC8-5: the nonce field was DROPPED — it was write-only (the
-      // reclaim path below reads only parsed.pid, never the nonce), so it
-      // provided no fencing. A nonce that is never read back is not a fencing
-      // token. The PID-reuse bound is the documented 120s/2s timestamp
-      // (staleTokenMs / lockTimeoutMs): a recycled PID still ages out, so the
-      // worst case is a bounded stall, not a permanent wedge. Reading the
-      // nonce back + comparing would add complexity for a single-user dev
-      // tool; the drop is cleaner.
-      // CORR11-1: if writeFileSync throws a non-EEXIST error (ENOSPC, EIO,
-      // EROFS), the outer catch re-throws without closing fd or unlinking the
-      // lockfile — fd leaks for the process lifetime + the lockfile blocks
-      // siblings until stale-lockfile recovery (2s) reaps it. Wrap the
-      // openSync+writeFileSync pair in try/finally that closes fd + unlinks
-      // the lockfile on throw, mirroring writeStateAtomic's fd-cleanup
-      // posture. (EEXIST can't reach here — O_EXCL openSync only resolves
-      // when the file did not exist.)
-      try {
-        writeFileSync(fd, JSON.stringify({ pid: cfg.pid() }), { encoding: "utf8" });
-      } catch (e2: any) {
-        // writeFileSync failed — close fd + unlink the lockfile we just
-        // created so we don't leak either, then re-throw.
-        try { closeSync(fd); } catch { /* best-effort */ }
-        try { unlinkSync(lockFile); } catch { /* best-effort: may already be gone */ }
-        fd = undefined;
-        throw e2;
-      }
+      // The lockfile is a zero-byte O_EXCL sentinel (SEC13-2). The prior
+      // CMP7-1 design wrote the holder PID + read it back via readFileSync
+      // for a PID-based fast-path, but SEC9-3 dropped the read (lstat→read
+      // TOCTOU). The PID write was retained as dead code until SEC13-2 dropped
+      // it — a write that is never read back is not a fencing token. The
+      // mtime ceiling is the sole authoritative reclaim bound.
+      // CORR11-1: if openSync throws a non-EEXIST error (ENOSPC, EIO, EROFS),
+      // the outer catch re-throws without closing fd — fd leaks for the
+      // process lifetime. The lockfile persists but is O_EXCL-created, so
+      // stale-lockfile recovery (below) reaps it after lockTimeoutMs.
+      // (EEXIST can't reach here — O_EXCL openSync only resolves when the
+      // file did not exist.)
+      // No PID write — the lockfile is a zero-byte O_EXCL sentinel (SEC13-2).
+      // The fd is closed by the release fn returned below.
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. Reclaim if the
@@ -707,18 +691,18 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
         }
         // SEC9-3: the mtime ceiling is the authoritative reclaim bound. The
         // PID-based fast-path (CMP7-1) was an optimization that read the
-        // lockfile content via readFileSync — dropped here to remove the
-        // TOCTOU between lstatSync (confirms regular file) + readFileSync
-        // (follows symlinks) that an attacker could exploit to wedge or leak.
-        // The mtime check alone is correct + removes the read vector entirely;
-        // a slow-but-legitimate mutate holding past lockTimeoutMs is reclaimed
-        // (bounded stall, no lost write — O_EXCL + atomic rename preserve it).
+        // lockfile content via readFileSync — dropped to remove the TOCTOU
+        // between lstatSync (confirms regular file) + readFileSync (follows
+        // symlinks). SEC13-2: the PID write was also dropped (dead code).
+        // ADV12-1/SEC13-1: reclaim if the lockfile is older than lockTimeoutMs
+        // (the original mtime ceiling) OR if its mtime is in the future beyond
+        // MAX_LOCK_FUTURE_MS (1s). A future-dated mtime — from clock skew, NTP
+        // correction, resume from suspend, or a `touch -t` attack — is not a
+        // legitimate hold. The prior 60s ceiling left a 1-60s gap (SEC13-1);
+        // lowered to 1s to catch any human-planted touch + meaningful NTP skew
+        // while tolerating sub-ms floating-point jitter from utimesSync/Date.now
+        // round-trips. A lockfile < 1s in the future ages out via lockTimeoutMs.
         if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs || st.mtimeMs - cfg.now() > MAX_LOCK_FUTURE_MS) {
-          // ADV12-1: reclaim if the lockfile is older than lockTimeoutMs (the
-          // original mtime ceiling) OR if its mtime is implausibly far in the
-          // future (clock skew / `touch -t` attack). A future-dated mtime makes
-          // the first condition negative (never reclaims); the second condition
-          // catches it. Mirrors the forward-dated-pausedTs defense (ADV10-1).
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }
