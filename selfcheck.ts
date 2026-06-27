@@ -4318,6 +4318,79 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV10-3: acquireLock 2s timeout throw path ---
+// acquireLock throws `concurrency-queue: timed out acquiring lock` when the
+// deadline (now + lockTimeoutMs) passes while the lockfile is held with a
+// fresh mtime (not stale → not reclaimed). The throw propagates out of mutate
+// → join(). The path was never exercised. acquireLock's syncSleep blocks the
+// event loop, so an in-process setInterval toucher cannot keep the lockfile
+// fresh while acquireLock spins. We spawn a CHILD process that holds the
+// lockfile (O_EXCL open + a setInterval keeping it alive) so the parent's
+// acquireLock spins against a live holder + times out. With a tiny
+// lockTimeoutMs (50ms) the deadline fires + join() throws within ~200ms.
+if (process.platform !== "win32") {
+  const { spawn } = await import("node:child_process");
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-3-"));
+  const stateFile = join(dir, "state.json");
+  const lockFile = `${stateFile}.lock`;
+  // Child script: open the lockfile with O_EXCL, hold it, touch mtime every
+  // 5ms so the parent's stale-recovery never reclaims it. Exits when the
+  // parent signals (process.kill).
+  const childScript = `
+    const { openSync, writeFileSync, utimesSync } = require("node:fs");
+    const lockFile = process.argv[2] || process.argv[1];
+    const fd = openSync(lockFile, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify({ pid: process.pid }), { encoding: "utf8" });
+    const toucher = setInterval(() => {
+      const now = Date.now() / 1000;
+      try { utimesSync(lockFile, now, now); } catch {}
+    }, 5);
+    process.on("SIGTERM", () => { clearInterval(toucher); process.exit(0); });
+  `;
+  const child = spawn(process.execPath, ["-e", childScript, lockFile], { stdio: ["ignore", "ignore", "ignore"] });
+  // Wait for the child to create the lockfile (poll up to 200ms).
+  const { existsSync } = await import("node:fs");
+  let childReady = false;
+  for (let i = 0; i < 40; i++) {
+    if (existsSync(lockFile)) { childReady = true; break; }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert(childReady, "COV10-3: child holder created the lockfile");
+  try {
+    const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 50, lockRetryMs: 5 });
+    let threw = false;
+    let errMsg = "";
+    const t0 = Date.now();
+    try {
+      q.join();
+    } catch (e) {
+      threw = true;
+      errMsg = e instanceof Error ? e.message : String(e);
+    }
+    const elapsed = Date.now() - t0;
+    assert(threw, "COV10-3: acquireLock threw on timeout (lock held by child with fresh mtime)");
+    assert(errMsg.includes("timed out acquiring lock"),
+      `COV10-3: throw message mentions timeout (got: ${errMsg})`);
+    // The throw fired within ~500ms (the 50ms deadline + retry slack), proving
+    // the timeout fires rather than hanging for the default 2s.
+    assert(elapsed < 1_000, `COV10-3: acquireLock timeout fired quickly (took ${elapsed}ms, expected <1s)`);
+    q.reset();
+  } finally {
+    try { process.kill(child.pid!, "SIGTERM"); } catch { /* may have exited */ }
+    try { child.kill("SIGTERM"); } catch { /* best-effort */ }
+    // Give the child a moment to exit + release the lockfile.
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  rmSync(dir, { recursive: true, force: true });
+} else {
+  // Windows: the child-process spawn + O_EXCL hold is unreliable under CI; skip
+  // the live-holder fixture but assert the timeout message string is present in
+  // the source so the path is at least pinned structurally.
+  const src = readFileSync("concurrency-queue.ts", "utf8");
+  assert(src.includes("timed out acquiring lock"),
+    "COV10-3: acquireLock timeout message present in source (Windows skip)");
+}
+
 // --- COV9-8: concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
 // transformMessageImages does Promise.all over N images, each calling acquireSlot → join →
 // mutate. The O_EXCL lockfile is per-state-file, not per-process, so concurrent mutate calls
