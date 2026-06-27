@@ -1050,7 +1050,8 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // executor, so a throw here rejects the promise and acquireSlot's
           // finally cleans up — safe. But every SUBSEQUENT poll is a
           // setTimeout callback; a throw from mutate() there (acquireLock
-          // timeout after 2s, readFileSync EACCES/EIO, writeStateAtomic
+          // timeout after 2s, readState open/fstatSync/readSync EACCES/EIO/ELOOP,
+          // writeStateAtomic
           // ENOSPC/EROFS) is not on any promise chain and surfaces as an
           // uncaughtException that terminates the Node process (and, with a
           // uncaughtException handler installed, leaves the promise forever
