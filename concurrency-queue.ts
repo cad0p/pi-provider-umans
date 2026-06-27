@@ -651,7 +651,24 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       // worst case is a bounded stall, not a permanent wedge. Reading the
       // nonce back + comparing would add complexity for a single-user dev
       // tool; the drop is cleaner.
-      writeFileSync(fd, JSON.stringify({ pid: cfg.pid() }), { encoding: "utf8" });
+      // CORR11-1: if writeFileSync throws a non-EEXIST error (ENOSPC, EIO,
+      // EROFS), the outer catch re-throws without closing fd or unlinking the
+      // lockfile — fd leaks for the process lifetime + the lockfile blocks
+      // siblings until stale-lockfile recovery (2s) reaps it. Wrap the
+      // openSync+writeFileSync pair in try/finally that closes fd + unlinks
+      // the lockfile on throw, mirroring writeStateAtomic's fd-cleanup
+      // posture. (EEXIST can't reach here — O_EXCL openSync only resolves
+      // when the file did not exist.)
+      try {
+        writeFileSync(fd, JSON.stringify({ pid: cfg.pid() }), { encoding: "utf8" });
+      } catch (e2: any) {
+        // writeFileSync failed — close fd + unlink the lockfile we just
+        // created so we don't leak either, then re-throw.
+        try { closeSync(fd); } catch { /* best-effort */ }
+        try { unlinkSync(lockFile); } catch { /* best-effort: may already be gone */ }
+        fd = undefined;
+        throw e2;
+      }
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. Reclaim if the

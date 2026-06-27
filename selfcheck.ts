@@ -4708,6 +4708,44 @@ if (process.platform !== "win32") {
     "COV10-3: acquireLock timeout message present in source (Windows skip)");
 }
 
+// --- CORR11-1: acquireLock closes fd + unlinks lockfile when writeFileSync throws ---
+// acquireLock does openSync(lockFile, "wx") then writeFileSync(fd, ...). If
+// writeFileSync throws a non-EEXIST error (ENOSPC, EIO, EROFS), the old code
+// re-threw without closing fd or unlinking the lockfile — fd leaked for the
+// process lifetime + the lockfile blocked siblings until stale-lockfile
+// recovery (2s) reaped it. The fix wraps the openSync+writeFileSync pair in a
+// try/finally that closes fd + unlinks the lockfile on throw. Forcing
+// writeFileSync to throw while openSync("wx") succeeds requires a read-only
+// filesystem / ENOSPC, which is not portable in a selfcheck; pin the cleanup
+// structure by source inspection + assert the fd is closed + lockfile unlinked
+// (not left behind) on the throw path.
+{
+  const src = readFileSync("concurrency-queue.ts", "utf8");
+  const acquireIdx = src.indexOf("function acquireLock(");
+  assert(acquireIdx >= 0, "CORR11-1: acquireLock defined in concurrency-queue.ts");
+  const acquireEnd = src.indexOf("\n}\n", acquireIdx);
+  const body = src.slice(acquireIdx, acquireEnd);
+  // The writeFileSync call must be wrapped in an inner try/catch (the
+  // CORR11-1 cleanup) that closes fd + unlinks the lockfile + resets fd +
+  // re-throws.
+  assert(body.includes("writeFileSync(fd, JSON.stringify({ pid: cfg.pid() })"),
+    "CORR11-1: acquireLock writes the holder PID via writeFileSync(fd, ...)");
+  assert(body.includes("try {\n        writeFileSync(fd,"),
+    "CORR11-1: writeFileSync wrapped in inner try (cleanup guard present)");
+  // The catch must close fd + unlink the lockfile + reset fd to undefined +
+  // re-throw — pin each step so a regression dropping one is caught.
+  assert(body.includes("} catch (e2: any) {"),
+    "CORR11-1: inner catch (e2) for writeFileSync throw present");
+  assert(body.includes("try { closeSync(fd); } catch"),
+    "CORR11-1: fd closed on writeFileSync throw (no fd leak)");
+  assert(body.includes("try { unlinkSync(lockFile); } catch"),
+    "CORR11-1: lockfile unlinked on writeFileSync throw (no stale lockfile)");
+  assert(body.includes("fd = undefined;"),
+    "CORR11-1: fd reset to undefined on throw (no stale fd reference)");
+  assert(body.includes("throw e2;"),
+    "CORR11-1: writeFileSync error re-thrown after cleanup (fail-loud, not swallowed)");
+}
+
 // --- COV10-5: side-call tool execute early-return paths driven through real wiring ---
 // umans_web_search.execute + umans_vision.execute have 4 early-return branches that
 // were never driven through the real factory (only the happy-path fetch 200/429 paths
