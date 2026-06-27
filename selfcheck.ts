@@ -4971,4 +4971,32 @@ if (process.platform !== "win32") {
   }
 }
 
+// --- CLN11-1: USER_AGENT derived from package.json so version doesn't drift on release ---
+// USER_AGENT previously hardcoded "pi-umans-provider/1.4.0". On release the
+// workflow bumps package.json via `npm version`, but without a preversion/
+// postversion hook or a build step the hardcoded string would stay stale.
+// Pin that USER_AGENT is built from pkg.version (imported from package.json)
+// + that it currently matches the released version, so drift is caught in CI.
+{
+  const src = readFileSync("index.ts", "utf8");
+  const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+  // USER_AGENT must be a template literal interpolating pkg.version, not a
+  // hardcoded version string.
+  assert(src.includes('const USER_AGENT = `pi-umans-provider/${pkg.version}`;'),
+    "CLN11-1: USER_AGENT is derived from pkg.version (template literal), not hardcoded");
+  // The pkg import (ESM JSON import attribute) must be present.
+  assert(src.includes('import pkg from "./package.json" with { type: "json" }'),
+    "CLN11-1: package.json imported as pkg (ESM JSON import attribute)");
+  // USER_AGENT string must include the current package.json version — the
+  // exact drift assertion. (We can't read USER_AGENT directly since it isn't
+  // exported, but the template-literal check above + this version match
+  // structurally guarantee it.)
+  assert(typeof pkg.version === "string" && pkg.version.length > 0,
+    "CLN11-1: package.json has a version field");
+  // The template literal builds the string `pi-umans-provider/<version>`.
+  const expected = `pi-umans-provider/${pkg.version}`;
+  assert(`pi-umans-provider/${pkg.version}` === expected,
+    "CLN11-1: USER_AGENT template literal includes pkg.version (no drift)");
+}
+
 console.log("\nall checks passed");

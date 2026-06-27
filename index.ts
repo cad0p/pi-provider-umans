@@ -52,6 +52,10 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+// CLN11-1: Derive USER_AGENT from package.json so the version doesn't drift on
+// release. ESM JSON import (Node 22+; the engines floor is Node 20.3, but pi
+// runs on Node 22+ which supports `with { type: "json" }`).
+import pkg from "./package.json" with { type: "json" };
 
 type ReasoningInfo = {
   supported: boolean;
@@ -79,7 +83,7 @@ type UmansModelInfo = {
 
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
-const USER_AGENT = "pi-umans-provider/1.4.0";
+const USER_AGENT = `pi-umans-provider/${pkg.version}`;
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
 // Client-side vision handoff env + tuning. See header doc for the design.
