@@ -606,7 +606,7 @@ function readRetryAfter(headers: Headers | Record<string, string> | undefined | 
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
-// CLN2-L2: ConcurrencyQueue is imported directly (line 45) and used at the
+// CLN2-L2: ConcurrencyQueue is imported directly and used at the
 // factory call site. CLN4-1: the speculative type exports (QueueState /
 // WaiterEntry / TokenState / QueueConfig / CapacitySnapshot / CapacityInputs)
 // had no in-repo consumer (not even tests). External consumers should import
