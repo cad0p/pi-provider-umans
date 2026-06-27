@@ -100,9 +100,9 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
 // --- COV-HIGH-1: isCapacityFree decision logic (extracted from acquireSlot) ---
 // Covers: unlimited-plan short-circuit, /usage-unreachable fallback, shared
-// pause (C2), at-cap, under-cap, priority.low → repause, limit gating
-// (the gate compares against `limit` the soft cap, not `hard_cap`),
-// and unlimited + priority.low repause (CORR2-2).
+// pause (C2), at-cap, under-cap, priority.low lowers cap by 1 (deprio is a
+// status signal, not a stop condition), limit gating, and unlimited +
+// priority.low (no cap to lower → free).
 {
   const lowState = { low: true, until: 1_000_000, reason: "burst" };
   const okState = { low: false, until: 0, reason: null };
@@ -118,15 +118,17 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   );
   assert(unlim.free === true, "isCapacityFree: unlimited plan → free even at high conc");
 
-  // CORR2-2: unlimited plan + priority.low → not free + repause (priority.low
-  // is checked BEFORE the unlimited short-circuit so Code Max still pushes the
-  // shared pause to siblings).
+  // priority.low (deprioritization): the gate lowers the cap by 1 rather
+  // than fully pausing. On an unlimited plan (all caps undefined), there's no
+  // cap to lower, so priority.low is a no-op (free — requests still go through,
+  // just slower). No repause is pushed (priority.low is a status signal, not a
+  // stop condition; actual 429s + the strike counter handle the hard pause).
   const unlimLow = isCapacityFree(
     { concurrentSessions: 0, limit: undefined, hardCap: undefined, priority: lowState },
     { limit: undefined, queuePaused: false },
   );
-  assert(unlimLow.free === false && unlimLow.repause?.until === 1_000_000 && unlimLow.repause?.reason === "burst",
-    "CORR2-2: unlimited plan + priority.low → not free + repause (before short-circuit)");
+  assert(unlimLow.free === true && unlimLow.repause === undefined,
+    "priority.low on unlimited plan → free (no cap to lower; deprio is a status signal)");
 
   // /usage unreachable (snap === null) with a finite limit → free (trust headroom)
   assert(isCapacityFree(null, { limit: 2, queuePaused: false }).free === true,
@@ -174,13 +176,21 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     { limit: 2, queuePaused: false },
   ).free === true, "isCapacityFree: under cap → free");
 
-  // priority.low → not free + repause (so the caller pushes the pause to siblings)
-  const low = isCapacityFree(
+  // priority.low (deprioritization): the gate lowers the cap by 1 (limit 2 → 1),
+  // so cur >= lowered-cap → not free. No repause is pushed (priority.low is a
+  // status signal, not a stop condition). Work continues when cur < lowered-cap.
+  const lowAtCap = isCapacityFree(
+    { concurrentSessions: 1, limit: 2, hardCap: 4, priority: lowState },
+    { limit: 2, queuePaused: false },
+  );
+  assert(lowAtCap.free === false && lowAtCap.repause === undefined,
+    "isCapacityFree: priority.low lowers cap by 1 (limit 2 → 1; cur 1 >= 1 → not free, no repause)");
+  const lowUnderCap = isCapacityFree(
     { concurrentSessions: 0, limit: 2, hardCap: 4, priority: lowState },
     { limit: 2, queuePaused: false },
   );
-  assert(low.free === false && low.repause?.until === 1_000_000 && low.repause?.reason === "burst",
-    "isCapacityFree: priority.low → not free + repause with until/reason");
+  assert(lowUnderCap.free === true && lowUnderCap.repause === undefined,
+    "isCapacityFree: priority.low + cur 0 < lowered-cap 1 → free (work continues during deprio)");
 
   // Local inputs.limit (env override) takes precedence over server snap.limit
   // (cap = inputs.limit ?? snap.limit ?? snap.hardCap) — UMANS_CONCURRENCY_LIMIT
@@ -3404,6 +3414,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(!formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
   }).includes("Strikes"), "COV7-10: no strikes24h -> no Strikes part (undefined)");
+  // deprioritized -> DEPRIO banner.
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    deprioritized: true,
+  }).includes("DEPRIO"), "COV7-10: deprioritized -> DEPRIO banner");
+  assert(!formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    deprioritized: false,
+  }).includes("DEPRIO"), "COV7-10: not deprioritized -> no DEPRIO banner");
   // empty queue (queued 0, not held, not paused) -> no queue part.
   const empty = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,

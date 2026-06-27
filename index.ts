@@ -453,10 +453,10 @@ export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string
 /**
  * COV7-10: pure formatter for the status-bar text, extracted from the
  * `statusText` closure so the rendering (TTFT/TPS, Conc current/guaranteed,
- * Req, q N*, STRIKES X/20, PAUSED until HH:MMZ (reason)) is unit-testable
+ * Req, q N*, STRIKES X/20, DEPRIO, PAUSED until HH:MMZ (reason)) is unit-testable
  * without the pi runtime. The closure in index.ts builds the inputs
  * (effectiveLimit, currentConcurrency, requestLimit/Used, the queue snapshot,
- * concurrencyDisabled, strikes24h) + delegates to this helper.
+ * concurrencyDisabled, strikes24h, deprioritized) + delegates to this helper.
  */
 export function formatStatusText(opts: {
   metrics?: { ttft?: number; tps?: number };
@@ -467,10 +467,11 @@ export function formatStatusText(opts: {
   queueSnap?: { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   concurrencyDisabled?: boolean;
   strikes24h?: number;
+  deprioritized?: boolean;
   now?: number;
 }): string {
   const parts: string[] = [];
-  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, strikes24h, now } = opts;
+  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, strikes24h, deprioritized, now } = opts;
   if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
   if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
   const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
@@ -478,6 +479,9 @@ export function formatStatusText(opts: {
   parts.push(`Conc ${current}/${guaranteed}`);
   if (requestsUsed !== undefined && requestLimit !== undefined) {
     parts.push(`Req ${requestsUsed}/${requestLimit}`);
+  }
+  if (deprioritized) {
+    parts.push("DEPRIO");
   }
   if (!concurrencyDisabled && queueSnap) {
     if (queueSnap.queued > 0 || queueSnap.tokenHeld) {
@@ -904,6 +908,7 @@ export default async function (pi: ExtensionAPI) {
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
   let strikes24h: number | undefined;
+  let deprioritized = false;
 
   // Cross-process FIFO queue over outbound Umans requests, backed by
   // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
@@ -1037,6 +1042,7 @@ export default async function (pi: ExtensionAPI) {
       queueSnap: concurrencyQueue.snapshot(),
       concurrencyDisabled,
       strikes24h,
+      deprioritized,
     });
   }
 
@@ -1170,25 +1176,22 @@ export default async function (pi: ExtensionAPI) {
     currentConcurrency = data.usage?.concurrent_sessions;
     requestLimit = data.limits?.requests?.limit ?? undefined;
     requestsUsed = data.usage?.requests_in_window;
-    // Reconcile the shared pause window with the server's priority state.
-    // priority.low is account-wide, so any pi process seeing it pauses all of
-    // them via the shared queue file; clearing it when low===false lets the
-    // queue unpauses as soon as the server says traffic is healthy again.
-    // CLN2-L1: priorityState is a local const here (it was a module-level let
-    // read only by this writer — no other handler or the status bar reads it;
-    // the status bar reads concurrencyQueue.snapshot() for paused state).
+    // Track the deprioritization state for the status bar (DEPRIO banner).
+    // priority.low is a STATUS signal, not a stop condition: the gate lowers
+    // the cap by 1 (isCapacityFree) to reduce race risk, but does NOT push a
+    // full pause. Work continues — just slower. Actual 429s + the strike
+    // counter handle the hard pause.
     const priority = parsePriority(data.usage?.priority);
-    if (priority.low) {
-      // COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS).
-      // The pause is a best-effort coordination signal; warn + swallow so the
-      // 5s refreshUsage timer doesn't propagate a disk error.
-      try {
-        concurrencyQueue.pauseUntil(priority.until, priority.reason ?? undefined);
-      } catch (err) {
-        console.warn("umans: pauseUntil threw in refreshUsage (continuing):", err instanceof Error ? err.message : err);
+    deprioritized = priority.low;
+    // Only clear a pause that was pushed by a PREVIOUS priority.low tick —
+    // don't clear a 429-origin or strike-origin pause (those have their own
+    // deadlines + must not be wiped by a stale /usage tick reporting low===false
+    // before the server catches up). CORR4-1: the 429 tag survives this clear.
+    if (!priority.low) {
+      const snap = concurrencyQueue.snapshot();
+      if (snap.paused && snap.pausedReason !== PAUSE_REASON_429 && snap.pausedReason !== PAUSE_REASON_STRIKES) {
+        concurrencyQueue.clearPause();
       }
-    } else {
-      concurrencyQueue.clearPause();
     }
   }
 

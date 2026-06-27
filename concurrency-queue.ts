@@ -305,16 +305,20 @@ interface CapacityInputs {
  *
  * - If the shared pause is active → not free (C2: a 429 observed by any local
  *   process backs off all siblings before /usage propagates priority.low).
- * - If priority.low → not free + repause so siblings back off too (honored
- *   BEFORE the unlimited short-circuit so Code Max still pushes the pause).
+ * - If priority.low → free, but with the cap lowered by 1 (deprioritization
+ *   means the server is under load + races are riskier; reduce parallelism
+ *   by one slot rather than fully pausing — requests still go through, just
+ *   slower). No repause is pushed: priority.low is a status signal, not a
+ *   stop condition. Actual 429s + the strike counter handle the hard pause.
  * - If /usage is unreachable (snap === null) → free (trust headroom rather
  *   than block forever; the queue still serializes launches via the token).
  * - If concurrent_sessions >= limit (or hardCap when limit absent, or
- *   inputs.limit when both snap caps are absent) → not free. CORR8-1 (HIGH):
- *   an unlimited plan (inputs.limit === undefined) is NO LONGER a short-
- *   circuit — the cap check below runs so a Code Max account can't trip the
- *   account-wide burst cap; only when ALL caps are undefined (true unlimited
- *   with no burst cap reported) is the gate free (no cap to exceed).
+ *   inputs.limit when both snap caps are absent, minus 1 when priority.low)
+ *   → not free. CORR8-1 (HIGH): an unlimited plan (inputs.limit === undefined)
+ *   is NO LONGER a short-circuit — the cap check below runs so a Code Max
+ *   account can't trip the account-wide burst cap; only when ALL caps are
+ *   undefined (true unlimited with no burst cap reported) is the gate free
+ *   (no cap to exceed).
  * - Otherwise → free.
  *
  * The gate compares against `limit` (the soft cap), NOT `hard_cap` (the 429
@@ -331,22 +335,6 @@ export function isCapacityFree(
   inputs: CapacityInputs,
 ): { free: boolean; repause?: { until: number; reason: string | null } } {
   if (inputs.queuePaused) return { free: false };
-  // priority.low BEFORE the unlimited short-circuit so Code Max (limit absent)
-  // still evaluates repause and pushes the shared pause to siblings (CORR2-2 /
-  // COV2-unlimited+priority.low).
-  if (snap?.priority.low) {
-    return { free: false, repause: { until: snap.priority.until, reason: snap.priority.reason } };
-  }
-  // CORR8-1 (HIGH): the unlimited-plan short-circuit (inputs.limit ===
-  // undefined) used to return { free: true } BEFORE evaluating
-  // concurrent_sessions against the cap — contradicting D5. An unlimited
-  // plan (Code Max, limit undefined) still trips the account-wide burst cap,
-  // so the cap check below must run. It gates against `limit` first (the
-  // soft cap), falling back to `hard_cap` then `inputs.limit`; when ALL are
-  // undefined (a true unlimited plan with no burst cap reported), `cap` is
-  // undefined and we return free (no cap to exceed — correct). The `!snap`
-  // (usage-unreachable) check stays before the cap check so we trust
-  // headroom rather than block forever.
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
   const cur = snap.concurrentSessions ?? 0;
   // Gate against `limit` (the soft cap), NOT `hard_cap` (the 429 threshold).
@@ -360,7 +348,13 @@ export function isCapacityFree(
   // testing with a lower value) takes precedence over the server's reported
   // limit, which in turn takes precedence over the server's hard_cap (fallback
   // when the API reports only hard_cap, e.g. older API responses).
-  const cap = inputs.limit ?? snap.limit ?? snap.hardCap;
+  const baseCap = inputs.limit ?? snap.limit ?? snap.hardCap;
+  // Deprioritization (priority.low): lower the cap by 1 rather than fully
+  // pausing. The server is under load + races are riskier, so reduce
+  // parallelism by one slot. Requests still go through (just slower); this
+  // is a status signal, not a stop condition. Actual 429s + the strike
+  // counter handle the hard pause.
+  const cap = snap.priority.low && baseCap !== undefined ? Math.max(0, baseCap - 1) : baseCap;
   if (cap !== undefined && cur >= cap) return { free: false };
   return { free: true };
 }
