@@ -3794,6 +3794,152 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV10-1: /umans-vision operator command driven through wiring ---
+// All 7 branches of /umans-vision were untested through real wiring: ""
+// (status), on, off, model (no id → list), model <valid id>, model <bogus id>,
+// bogus subcommand. The command mutates visionDisabled + visionModelId (module
+// state); a regression swapping the on/off branches or dropping the
+// available-models check would not be caught. Extend the COV9-3 harness to
+// capture the umans-vision command def, then dispatch every branch + assert
+// notify text + the visionDisabled/visionModelId flips observable via the
+// subsequent status notify.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-1-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  // Clear UMANS_VISION_* so the factory seeds defaults (vision on, model
+  // umans-kimi-k2.7 from STATIC_CATALOG's native-vision pick).
+  savedEnv.UMANS_VISION_DISABLE = process.env.UMANS_VISION_DISABLE;
+  savedEnv.UMANS_VISION_MODEL = process.env.UMANS_VISION_MODEL;
+  delete process.env.UMANS_VISION_DISABLE;
+  delete process.env.UMANS_VISION_MODEL;
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: any) =>
+    Promise.resolve(new Response("", { status: 404 }))) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const cmds = new Map<string, { handler: (args: string, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {},
+      registerCommand(name: string, def: any) { cmds.set(name, def); },
+      registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    await umansFactory(pi as any);
+    // /umans-vision registers only when the catalog has a via-handoff model
+    // (STATIC_CATALOG does: umans-glm-5.1/5.2). Assert it registered.
+    assert(cmds.has("umans-vision"), "COV10-1: /umans-vision command registered through wiring");
+    const cmd = cmds.get("umans-vision")!;
+
+    // (a) no-args → status: notify text mentions vision on + the default model.
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const statusNote = notifications.find((n) => n.msg.startsWith("Umans vision:"));
+    assert(!!statusNote, "COV10-1: no-args produced a status notify");
+    assert(statusNote!.msg.includes("on"), `COV10-1: status notify shows vision on (got: ${statusNote!.msg})`);
+    assert(statusNote!.msg.includes("umans-kimi-k2.7"), `COV10-1: status notify shows default model (got: ${statusNote!.msg})`);
+
+    // (b) off → visionDisabled flips true; notify mentions disabled.
+    notifications.length = 0;
+    await cmd.handler("off", makeCtx());
+    const offNote = notifications.find((n) => n.msg.includes("disabled"));
+    assert(!!offNote, "COV10-1: off subcommand produced a disabled notify");
+    // Verify via a status dispatch: status now shows vision off.
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const offStatus = notifications.find((n) => n.msg.startsWith("Umans vision:"));
+    assert(offStatus!.msg.includes("off"), `COV10-1: status reflects vision off after /umans-vision off (got: ${offStatus!.msg})`);
+
+    // (c) on → visionDisabled flips false; notify mentions enabled.
+    notifications.length = 0;
+    await cmd.handler("on", makeCtx());
+    const onNote = notifications.find((n) => n.msg.includes("enabled"));
+    assert(!!onNote, "COV10-1: on subcommand produced an enabled notify");
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const onStatus = notifications.find((n) => n.msg.startsWith("Umans vision:"));
+    assert(onStatus!.msg.includes("on"), `COV10-1: status reflects vision on after /umans-vision on (got: ${onStatus!.msg})`);
+
+    // (d) model with no id → lists current + available models.
+    notifications.length = 0;
+    await cmd.handler("model", makeCtx());
+    const modelListNote = notifications.find((n) => n.msg.startsWith("Vision model:"));
+    assert(!!modelListNote, "COV10-1: model (no id) produced a list notify");
+    assert(modelListNote!.msg.includes("umans-kimi-k2.7"), `COV10-1: model list mentions current model (got: ${modelListNote!.msg})`);
+
+    // (e) model <valid id> → visionModelId flips; notify confirms.
+    notifications.length = 0;
+    await cmd.handler("model umans-coder", makeCtx());
+    const setNote = notifications.find((n) => n.msg.includes("set to"));
+    assert(!!setNote, "COV10-1: model <valid id> produced a set notify");
+    assert(setNote!.msg.includes("umans-coder"), `COV10-1: set notify mentions umans-coder (got: ${setNote!.msg})`);
+    // Verify via status.
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const coderStatus = notifications.find((n) => n.msg.startsWith("Umans vision:"));
+    assert(coderStatus!.msg.includes("umans-coder"), `COV10-1: status reflects model umans-coder (got: ${coderStatus!.msg})`);
+
+    // (f) model <bogus id> → notify error mentions unknown + available.
+    notifications.length = 0;
+    await cmd.handler("model umans-does-not-exist", makeCtx());
+    const unknownNote = notifications.find((n) => n.msg.includes("Unknown vision model"));
+    assert(!!unknownNote, "COV10-1: model <bogus id> produced an unknown notify");
+    assert(unknownNote!.msg.includes("umans-does-not-exist"), `COV10-1: unknown notify mentions the bogus id (got: ${unknownNote!.msg})`);
+    // visionModelId unchanged (still umans-coder from step e).
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const unchangedStatus = notifications.find((n) => n.msg.startsWith("Umans vision:"));
+    assert(unchangedStatus!.msg.includes("umans-coder"), `COV10-1: vision model unchanged after bogus id (got: ${unchangedStatus!.msg})`);
+
+    // (g) bogus subcommand → usage notify.
+    notifications.length = 0;
+    await cmd.handler("bogus", makeCtx());
+    const usageNote = notifications.find((n) => n.msg.startsWith("Usage: /umans-vision"));
+    assert(!!usageNote, `COV10-1: bogus subcommand printed usage (got: ${notifications.map((n) => n.msg).join(" | ")})`);
+
+    // Dispatch session_shutdown to stop the factory's refresh loop (if any started).
+    const hs = handlers.get("session_shutdown");
+    if (hs) for (const h of hs) await h({ type: "session_shutdown" }, makeCtx());
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV9-4/COV8-3: side-call acquireSlot wiring in tool execute bodies driven through real factory ---
 // acquireSlot is a closure (not exported); COV2-H2 simulated the acquire+release
 // pattern directly against createConcurrencyQueue. The real tool execute bodies
