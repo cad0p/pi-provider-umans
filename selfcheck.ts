@@ -4162,6 +4162,162 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV10-2: multi-image transformMessageImages Promise.all path driven through wiring ---
+// transformMessageImages does Promise.all over N image blocks, each calling
+// acquireSlot → join → mutate + analyzeImage (fetch /v1/messages). The
+// multi-image path was never driven through the real factory (COV9-4 drove a
+// single image). A regression dropping the Promise.all, leaking a side-call
+// slot per image, or failing to release all would not be caught. Drive a
+// message_end with 3 image blocks through the COV9-4 harness; assert all image
+// ids land in imageStore (via the umans_vision tool follow-up), all analyzeImage
+// fetches fire (messagesCalls === 3), the token is not held after, and no waiter
+// leaks (state file waiters empty after).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-2-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
+  delete process.env.UMANS_SEARCH_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  let messagesCalls = 0;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      messagesCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "analysis result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let result: any;
+      for (const h of hs) {
+        const r = await h(payload, ctx ?? makeCtx());
+        if (r !== undefined && result === undefined) result = r;
+      }
+      return result;
+    }
+    await umansFactory(pi as any);
+
+    // Dispatch message_end with 3 image blocks (different base64 data so each
+    // gets a distinct image id). Drives transformMessageImages → Promise.all
+    // over 3 acquireSlot + analyzeImage calls.
+    messagesCalls = 0;
+    usageCalls = 0;
+    const transformed = await dispatch("message_end", {
+      type: "message_end",
+      message: {
+        role: "user",
+        provider: "umans",
+        content: [
+          { type: "text", text: "compare these three" },
+          { type: "image", data: "aGk=", mimeType: "image/png" },       // "hi"
+          { type: "image", data: "Ynll", mimeType: "image/png" },        // "bye"
+          { type: "image", data: "dGhyZWU=", mimeType: "image/jpeg" },   // "three"
+        ],
+      },
+    }, makeCtx({ provider: "umans", id: "umans-glm-5.2" })); // via-handoff model
+
+    // All 3 analyzeImage fetches fired (one per image via Promise.all).
+    assert(messagesCalls === 3, `COV10-2: 3 analyzeImage /v1/messages fetches fired (got ${messagesCalls})`);
+    // The transformed message has 3 [Image analysis (image:ID)]: text blocks.
+    assert(transformed?.message?.content, "COV10-2: multi-image handoff returned a transformed message");
+    const analysisBlocks: string[] = (transformed.message.content as any[])
+      .filter((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))
+      .map((b: any) => b.text);
+    assert(analysisBlocks.length === 3,
+      `COV10-2: 3 analysis text blocks produced (got ${analysisBlocks.length})`);
+    // Extract the 3 distinct image ids.
+    const imgIds: string[] = analysisBlocks
+      .map((t: string) => t.match(/\[Image analysis \(image:([^\)]+)\)\]/)?.[1])
+      .filter((id: string | undefined): id is string => typeof id === "string");
+    assert(imgIds.length === 3, `COV10-2: 3 image ids extracted (got ${imgIds.length})`);
+    const distinct = new Set(imgIds);
+    assert(distinct.size === 3, `COV10-2: 3 distinct image ids (got ${distinct.size})`);
+
+    // All 3 image ids landed in imageStore — verify by driving the umans_vision
+    // tool follow-up for each id (the tool reads imageStore.get(id)).
+    const visionTool = tools.get("umans_vision")!;
+    for (const id of imgIds) {
+      const res = await visionTool.execute(`c-${id}`, { image_id: id, question: "describe" }, new AbortController().signal, undefined, makeCtx());
+      assert(typeof res?.content?.[0]?.text === "string" && res.content[0].text.length > 0,
+        `COV10-2: umans_vision follow-up for image ${id} returned analysis text (image in store)`);
+    }
+
+    // The token must not be held after all side-calls complete (every
+    // acquireSlot's finally released its slot — no leak across the Promise.all).
+    const probe = createConcurrencyQueue({ stateFile });
+    assert(probe.snapshot().tokenHeld === false,
+      "COV10-2: token not held after multi-image handoff (all side-call slots released)");
+    // No waiter leaked: the state file's waiters array is empty (each acquireSlot
+    // cancelled its waiter in the finally release).
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    const ourWaiters = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).length;
+    assert(ourWaiters === 0,
+      `COV10-2: no waiter leaked after multi-image handoff (our waiters=${ourWaiters}, expected 0)`);
+    probe.reset();
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV9-8: concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
 // transformMessageImages does Promise.all over N images, each calling acquireSlot → join →
 // mutate. The O_EXCL lockfile is per-state-file, not per-process, so concurrent mutate calls
