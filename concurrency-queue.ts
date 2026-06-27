@@ -816,12 +816,19 @@ function reapStaleTmps(path: string, now: number): void {
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
     try {
-      // SEC8-2/SEC9-6: use lstatSync (not statSync) so a symlink .tmp →
-      // /etc/passwd is detected as non-regular + unlinked directly without
-      // following the link (matching the lockfile's SEC7-1 posture). statSync
-      // would follow the symlink, read the TARGET's mtime, and unlinkSync
-      // (which removes the symlink itself, safe) but the mtime leak is
-      // inconsistent with the hardened posture.
+      // SEC8-2/SEC9-6/ADV-R13-2: use lstatSync (not statSync) so a symlink
+      // .tmp → /etc/passwd is detected as non-regular + unlinked directly
+      // without following the link (matching the lockfile's SEC7-1 posture).
+      // statSync would follow the symlink, read the TARGET's mtime, and
+      // unlinkSync (which removes the symlink itself, safe) but the mtime
+      // leak is inconsistent with the hardened posture.
+      // ADV-R13-2: a symlink .tmp is NEVER a legitimate temp file (the writer
+      // uses openSync("wx") which creates regular files only). Unlink
+      // unconditionally regardless of mtime — a freshly-planted symlink has
+      // lstatSync().mtimeMs ≈ now, so the STALE_TMP_MS check below would skip
+      // it, leaving it to block a future writeStateAtomic that generates the
+      // same temp name (EEXIST). Matches the lockfile's non-regular → unlink
+      // posture at acquireLock (SEC7-1).
       const st = lstatSync(full);
       // CORR7-5: a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
       // (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the
@@ -829,6 +836,17 @@ function reapStaleTmps(path: string, now: number): void {
       // (best-effort) + skip; a non-empty dir is left for the operator.
       if (st.isDirectory()) {
         try { rmdirSync(full); } catch { /* non-empty or gone — skip */ }
+        unlinked++;
+        continue;
+      }
+      if (!st.isFile()) {
+        // ADV-R13-2: a symlink (or other non-regular non-directory) at a .tmp
+        // name is never legitimate — unlink unconditionally regardless of
+        // mtime. The writer uses openSync("wx") which creates regular files
+        // only, so a non-regular .tmp was planted (attacker with write access
+        // to ~/.pi/agent/) or left by a prior crash. Unlinking it prevents the
+        // EEXIST wedge on a future writeStateAtomic.
+        try { unlinkSync(full); } catch { /* race: gone — skip */ }
         unlinked++;
         continue;
       }

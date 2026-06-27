@@ -707,13 +707,16 @@ if (process.platform !== "win32") {
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- SEC6-2: writeStateAtomic uses O_EXCL ("wx"), does not follow a planted symlink ---
+// --- SEC6-2/ADV-R13-2: writeStateAtomic uses O_EXCL ("wx"), reaper unlinks planted symlink .tmp ---
 // The per-pid temp name `${path}.${process.pid}.tmp` + writeFileSync (no O_EXCL)
 // follows a planted symlink → write-redirect to an arbitrary file (probe-
 // confirmed). openSync("wx", 0o600) creates the file ONLY if it does not exist
 // (no follow on creation), so a planted symlink/name throws EEXIST instead.
-// We plant a symlink at the exact temp name our pid will use and assert the
-// next mutate (join) throws EEXIST rather than writing through the symlink.
+// ADV-R13-2: the reaper now unlinks a non-regular .tmp (symlink) unconditionally
+// regardless of mtime — a freshly-planted symlink .tmp no longer survives to
+// cause an EEXIST wedge on the next writeStateAtomic. The reaper clears it
+// BEFORE writeStateAtomic runs, so join() succeeds (the symlink is gone) +
+// the canary is untouched (symlink was never followed).
 {
   if (process.platform !== "win32") {
     const dir = mkdtempSync(join(tmpdir(), "umans-q-sec6-2-"));
@@ -737,25 +740,28 @@ if (process.platform !== "win32") {
     symlinkSync(canary, tmpName);
 
     try {
-      // join() -> mutate -> writeStateAtomic must throw EEXIST (not follow the
-      // symlink). createConcurrencyQueue throws on construct-time dir create? No —
-      // dir already exists. The throw surfaces from join()'s mutate.
+      // join() → mutate → reapStaleTmps unlinks the planted symlink .tmp
+      // (ADV-R13-2: non-regular .tmp unlinked unconditionally regardless of
+      // mtime) → writeStateAtomic creates a fresh regular temp + renames →
+      // join succeeds (no EEXIST throw). The canary is untouched.
       const q = createConcurrencyQueue({ stateFile });
       let threw = false;
-      let code: string | undefined;
+      let id: string | null = null;
       try {
-        q.join();
+        id = q.join();
       } catch (e) {
         threw = true;
-        code = (e as NodeJS.ErrnoException).code;
       }
-      assert(threw, "SEC6-2: writeStateAtomic rejects a planted symlink at the temp name");
-      assert(code === "EEXIST", "SEC6-2: planted-symlink write throws EEXIST (not followed)");
-      // The canary must be untouched (symlink was not followed).
+      assert(!threw && typeof id === "string",
+        "ADV-R13-2: reaper unlinks planted symlink .tmp (join succeeds, no EEXIST wedge)");
+      // The canary must be untouched (symlink was never followed).
       assert(readFileSync(canary, "utf8") === "ORIGINAL",
         "SEC6-2: symlink target not written through (canary intact)");
-      assert(!existsSync(stateFile),
-        "SEC6-2: state file not created when temp name was a planted symlink");
+      // The state file should exist (writeStateAtomic created it after reaper
+      // cleared the symlink).
+      assert(existsSync(stateFile),
+        "ADV-R13-2: state file created after reaper cleared planted symlink");
+      if (id) q.cancel(id);
       q.reset();
     } finally {
       Math.random = realRandom;
