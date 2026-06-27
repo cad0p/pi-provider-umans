@@ -1,6 +1,6 @@
 # pi-provider-umans
 
-[Umans.ai](https://umans.ai) provider for [pi](https://shittycodingagent.ai) — speaks the **Anthropic Messages API** against the Umans Code gateway (`https://api.code.umans.ai`), with **dynamic model discovery** and **client-side vision handoff** for text-only models.
+[Umans.ai](https://umans.ai) provider for [pi](https://github.com/earendil-works/pi) — speaks the **Anthropic Messages API** against the Umans Code gateway (`https://api.code.umans.ai`), with **dynamic model discovery** and **client-side vision handoff** for text-only models.
 
 ## Install
 
@@ -9,7 +9,7 @@
 pi install npm:pi-provider-umans
 
 # From git
-pi install git:github.com/user/pi-provider-umans
+pi install git:github.com/umans-ai/pi-provider-umans
 
 # From local path (for development)
 pi install ./pi-provider-umans
