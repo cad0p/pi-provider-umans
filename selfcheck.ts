@@ -4617,16 +4617,19 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
 // --- COV10-7: concurrencyDisabled mode driven through real factory wiring ---
 // When UMANS_CONCURRENCY_DISABLE=1, the factory wires concurrencyDisabled=true
-// and 5 handlers short-circuit: before_provider_request (no acquireSlot),
-// after_provider_response 429 (no handle429), message_end (no releaseMainTurn),
-// turn_end/agent_end (no releaseMainTurn), session_shutdown (no reset). The
-// disabled mode was never driven through the real factory (only unit-tested
-// at the queue level). A regression dropping a `if (concurrencyDisabled) return`
-// guard, or writing state despite the flag, would not be caught. Run the
-// COV7-1 harness with UMANS_CONCURRENCY_DISABLE=1; dispatch before_provider_
-// request + after_provider_response(429) + message_end + session_shutdown;
-// assert no state file is written, no /usage poll fires, and mainTurnRelease
-// stays undefined (no slot acquired).
+// and 4 handlers short-circuit via an explicit `if (concurrencyDisabled)`
+// guard: before_provider_request (no acquireSlot), after_provider_response 429
+// (no handle429), message_end (no releaseMainTurn — guarded via the
+// before_provider_request short-circuit leaving mainTurnRelease undefined),
+// session_shutdown (no reset). turn_end + agent_end have NO short-circuit
+// guard but are safe no-ops via the undefined-release guard in releaseSlot
+// (COV11-1: driven below). The disabled mode was never driven through the
+// real factory (only unit-tested at the queue level). A regression dropping a
+// `if (concurrencyDisabled) return` guard, or writing state despite the flag,
+// would not be caught. Run the COV7-1 harness with UMANS_CONCURRENCY_DISABLE=1;
+// dispatch before_provider_request + after_provider_response(429) + message_end
+// + turn_end + agent_end + session_shutdown; assert no state file is written,
+// no /usage poll fires, and mainTurnRelease stays undefined (no slot acquired).
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-7-"));
   const stateFile = join(dir, "state.json");
@@ -4717,6 +4720,21 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // no-op either way. Assert no state file appears (no reset path writes).
     await dispatch("message_end", { type: "message_end", message: { role: "assistant", provider: "umans" } });
     assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled message_end wrote no state file");
+
+    // COV11-1: turn_end + agent_end also call releaseMainTurn(). They have NO
+    // `if (concurrencyDisabled) return` guard (unlike before_provider_request /
+    // after_provider_response), but they're safe no-ops via the undefined-
+    // release guard in releaseSlot (mainTurnRelease is undefined because (a)
+    // short-circuited before acquireSlot). Drive both through the disabled
+    // wiring + assert no state file is written (releaseSlot(undefined) returns
+    // early, never touching the queue / state file).
+    await dispatch("turn_end", { type: "turn_end" });
+    assert(!existsSync(stateFile), "COV10-7/COV11-1: concurrencyDisabled turn_end wrote no state file (undefined-release no-op)");
+    await dispatch("agent_end", { type: "agent_end" });
+    assert(!existsSync(stateFile), "COV10-7/COV11-1: concurrencyDisabled agent_end wrote no state file (undefined-release no-op)");
+    // turn_end + agent_end are registered (the safety-net wiring is present).
+    assert(handlers.has("turn_end"), "COV11-1: turn_end handler registered (safety net)");
+    assert(handlers.has("agent_end"), "COV11-1: agent_end handler registered (safety net)");
 
     // (d) session_shutdown: the handler runs stopRefreshLoop + releaseMainTurn
     // + concurrencyQueue.reset(). reset() on a disabled queue is a no-op (no
