@@ -18,7 +18,6 @@ import {
   clampPauseUntil,
   isCapacityFree,
   parseConcurrencyLimit,
-  canAtomicsWait,
   MAX_PAUSE_MS,
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
@@ -1182,18 +1181,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // detection + that a contended acquire still resolves (the existing lockfile
 // tests cover correctness; this pins the non-spinning path).
 {
-  // canAtomicsWait is the exported feature guard. On any modern Node (22+) with
-  // SharedArrayBuffer enabled it returns true; the export itself is the
-  // contract that acquireLock's spin uses it.
-  const can = canAtomicsWait();
-  assert(typeof can === "boolean", "C2/CMP6-1: canAtomicsWait returns a boolean");
-  // Sanity: on Node >= 22 with SAB, the Atomics.wait path is available. We do
-  // not assert `can === true` unconditionally (some hardened runtimes disable
-  // SAB); we assert the function is the gate the spin consults.
+  // CLN10-5: canAtomicsWait was exported only for this tautological assertion
+  // (typeof boolean). The export is dropped (it had no external consumer —
+  // syncSleep is the only caller, and it's now a module-private function).
+  // The meaningful assertion below drives a contended acquire end-to-end
+  // (two queues on the same state file, the first holds the lock via a long
+  // mutate, the second must wait + retry through syncSleep + succeed).
 
-  // Drive a contended acquire end-to-end: two queues on the same state file,
-  // the first holds the lock via a long mutate, the second must wait + retry
-  // through syncSleep (Atomics.wait or busy-spin) and then succeed.
   const dir = mkdtempSync(join(tmpdir(), "umans-q-c2-"));
   const stateFile = join(dir, "state.json");
   const q1 = createConcurrencyQueue({ stateFile, lockRetryMs: 5, lockTimeoutMs: 2_000 });

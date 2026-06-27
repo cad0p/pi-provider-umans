@@ -557,7 +557,7 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
  * (older Node, or SAB disabled via --no-harmony-sharedarraybuffer) and the
  * caller must fall back to a busy-spin.
  */
-export function canAtomicsWait(): boolean {
+function canAtomicsWait(): boolean {
   return typeof Atomics !== "undefined" && typeof Atomics.wait === "function" &&
     typeof SharedArrayBuffer !== "undefined";
 }
