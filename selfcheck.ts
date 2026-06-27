@@ -3912,4 +3912,39 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV9-8: concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
+// transformMessageImages does Promise.all over N images, each calling acquireSlot → join →
+// mutate. The O_EXCL lockfile is per-state-file, not per-process, so concurrent mutate calls
+// from the same process contend on the same lockfile (second spins up to 2s via syncSleep).
+// Assert N concurrent join()s all land their waiters in the state file (no acquireLock
+// timeout, no lost write).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov9-8-"));
+  const stateFile = join(dir, "state.json");
+  try {
+    const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2000 });
+    // Launch 5 concurrent join()s — each does a mutate (acquireLock + writeStateAtomic).
+    // If the lock contention is not handled correctly, some join()s would time out or lose
+    // their waiter entry. All 5 should land in the state file.
+    const ids = await Promise.all(
+      Array.from({ length: 5 }, () => Promise.resolve(q.join())),
+    );
+    // All join()s must return a non-null id (queue not disabled).
+    assert(ids.every((id) => id !== null), "COV9-8: all 5 concurrent join()s returned a non-null id");
+    // Read the state file + assert all 5 waiters landed.
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    assert(Array.isArray(parsed.waiters), "COV9-8: state file has a waiters array");
+    assert(parsed.waiters.length === 5, `COV9-8: all 5 waiters landed (got ${parsed.waiters.length})`);
+    // Each id from join() must be present in the file.
+    const fileIds = new Set(parsed.waiters.map((w: any) => w.id));
+    for (const id of ids) {
+      assert(fileIds.has(id), `COV9-8: waiter ${id} present in state file (no lost write)`);
+    }
+    q.reset();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log("\nall checks passed");
