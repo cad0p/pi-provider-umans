@@ -1205,6 +1205,13 @@ export default async function (pi: ExtensionAPI) {
             // Pathological state: reaped + re-joined too many times. Fail
             // open rather than loop forever (bounded by the watchdog + the
             // hard_cap headroom, same stance as /usage-unreachable).
+            // CORR11-2: clear the stale releaseToken closure before break.
+            // releaseToken still points at the prior iteration's closure
+            // (a no-op — the token was reaped — but confusing). The returned
+            // closure below calls releaseToken(); point it at an explicit
+            // no-op so fail-open proceeds without holding (or pretending to
+            // release) a token.
+            releaseToken = () => {};
             break;
           }
           ourId = concurrencyQueue.join()!;

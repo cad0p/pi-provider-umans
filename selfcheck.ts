@@ -3129,6 +3129,30 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- CORR11-2: clear stale releaseToken on MAX_TOKEN_REJOINS fail-open ---
+// When touchToken returns false + rejoins >= MAX_TOKEN_REJOINS, acquireSlot
+// breaks out of the poll loop + returns a closure that calls releaseToken().
+// Before the fix, releaseToken still pointed at the PRIOR iteration's closure
+// (a no-op — the token was reaped — but confusing: the returned closure
+// pretends to release a token we no longer hold). The fix sets
+// `releaseToken = () => {}` before the break so the returned closure's
+// releaseToken() is an explicit no-op documenting fail-open proceeds without
+// holding the token. COV7-2 already drives the live fail-open path; pin the
+// clear is present at the MAX_TOKEN_REJOINS break site by source inspection.
+{
+  const src = readFileSync("index.ts", "utf8");
+  const rejoinIdx = src.indexOf("rejoins >= MAX_TOKEN_REJOINS");
+  assert(rejoinIdx >= 0, "CORR11-2: MAX_TOKEN_REJOINS fail-open guard present in index.ts");
+  // The clear must sit inside the if-block, before the break.
+  const blockEnd = src.indexOf("break;", rejoinIdx);
+  assert(blockEnd > rejoinIdx, "CORR11-2: break present in MAX_TOKEN_REJOINS block");
+  const block = src.slice(rejoinIdx, blockEnd);
+  assert(block.includes("releaseToken = () => {};"),
+    "CORR11-2: releaseToken cleared to no-op before MAX_TOKEN_REJOINS break (no stale closure)");
+  assert(block.includes("CORR11-2:"),
+    "CORR11-2: clear documented with CORR11-2 citation");
+}
+
 // --- COV7-3: concurrentSessions ?? 0 + full cap fallback chain ---
 // isCapacityFree's `cur = snap.concurrentSessions ?? 0` (undefined -> 0) and
 // `cap = snap.hardCap ?? snap.limit ?? inputs.limit` (full chain) were untested.
