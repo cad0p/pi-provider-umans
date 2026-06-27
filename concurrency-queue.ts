@@ -194,8 +194,10 @@ const PAUSE_REASON_MAX_CHARS = 64;
 // introducer), + Unicode bidi/RTL override chars (U+202A-E, U+2066-9, U+061C)
 // and zero-width / BOM chars (U+200B-F, U+FEFF) that could spoof the displayed
 // pause reason in the status bar. Keeps printable ASCII + common printable
-// Unicode. Mirrored in sanitizeErrorBody (index.ts).
-const SANITIZE_CTRL_RE = /[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+// Unicode. Mirrored in sanitizeErrorBody (index.ts) via the shared
+// SANITIZE_CTRL_RE export (CLN10-3) so the character class stays in sync
+// across both modules without manual duplication.
+export const SANITIZE_CTRL_RE = /[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 export function sanitizeReason(reason: string | null | undefined): string | null {
   if (typeof reason !== "string") return null;
   const cleaned = reason.replace(SANITIZE_CTRL_RE, "").trim();

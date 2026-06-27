@@ -45,6 +45,7 @@ import {
   PRIORITY_BACKOFF_MS,
   PAUSE_REASON_429,
   MAX_PAUSE_429_MS,
+  SANITIZE_CTRL_RE,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
@@ -481,8 +482,11 @@ export function hashImageId(data: string): string {
 const ERROR_BODY_MAX_CHARS = 80;
 // SEC9-1/SEC8-3: mirror sanitizeReason's strip — control + ESC + Unicode
 // bidi/RTL overrides + zero-width/BOM chars that could spoof displayed text.
+// CLN10-3: uses the shared SANITIZE_CTRL_RE export from concurrency-queue.ts
+// so the character class stays in sync with sanitizeReason without manual
+// duplication. The 80-char cap stays local (sanitizeReason caps at 64).
 export function sanitizeErrorBody(body: string): string {
-  const cleaned = body.replace(/[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "").trim();
+  const cleaned = body.replace(SANITIZE_CTRL_RE, "").trim();
   return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
 }
 
