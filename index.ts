@@ -111,6 +111,20 @@ const SEARCH_MAX_TOKENS = 2048;
 // hostile/misbehaving /usage that always reports full.
 const CAPACITY_POLL_TIMEOUT_MS = 60_000;
 
+// 429 strike counter: the Umans account is paused for 5h after >N concurrency
+// 429s in 24h (N=10 historically, now 20 per the dashboard). The queue polls
+// /v1/usage/history every STRIKE_POLL_INTERVAL_MS, sums rate_limit_concurrency
+// buckets over the last 24h, and defensively pauses when the count reaches
+// STRIKE_PAUSE_THRESHOLD — better to self-pause briefly than risk the 5h ban.
+// The threshold is set below the server's pause trigger so a small burst of
+// in-flight requests (between the poll + the server's counter update) can't
+// tip us over before we react.
+const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
+const STRIKE_PAUSE_THRESHOLD = 18; // pause defensively at 18 (server triggers at 20)
+const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
+const PAUSE_REASON_STRIKES = "429 strike limit approached";
+
 /**
  * COV5-1: pure decision extracted from acquireSlot's capacity-poll loop so the
  * branch logic (free-first-poll, poll-then-free, timeout-fail-open, timeout-
@@ -437,10 +451,10 @@ export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string
 /**
  * COV7-10: pure formatter for the status-bar text, extracted from the
  * `statusText` closure so the rendering (TTFT/TPS, Conc current/guaranteed,
- * Req, q N*, PAUSED Ns (reason), elapsed-pause clamps to 0s not negative) is
- * unit-testable without the pi runtime. The closure in index.ts builds the
- * inputs (effectiveLimit, currentConcurrency, requestLimit/Used, the queue
- * snapshot, concurrencyDisabled) + delegates to this helper.
+ * Req, q N*, STRIKES X/20, PAUSED until HH:MMZ (reason)) is unit-testable
+ * without the pi runtime. The closure in index.ts builds the inputs
+ * (effectiveLimit, currentConcurrency, requestLimit/Used, the queue snapshot,
+ * concurrencyDisabled, strikes24h) + delegates to this helper.
  */
 export function formatStatusText(opts: {
   metrics?: { ttft?: number; tps?: number };
@@ -450,10 +464,11 @@ export function formatStatusText(opts: {
   requestsUsed?: number;
   queueSnap?: { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
   concurrencyDisabled?: boolean;
+  strikes24h?: number;
   now?: number;
 }): string {
   const parts: string[] = [];
-  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, now } = opts;
+  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, strikes24h, now } = opts;
   if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
   if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
   const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
@@ -467,13 +482,18 @@ export function formatStatusText(opts: {
       parts.push(`q ${queueSnap.queued}${queueSnap.tokenHeld ? "*" : ""}`);
     }
     if (queueSnap.paused) {
-      // Clamp to 0s so an elapsed pause (pausedUntil <= now) renders "PAUSED 0s",
-      // not a negative number (the closure re-checks paused via snapshot, but
-      // a racing tick between the check + the render could otherwise go negative).
-      const secs = Math.max(0, Math.round((queueSnap.pausedUntil - (now ?? Date.now())) / 1000));
+      // Render the pause deadline as an absolute UTC time (HH:MMZ) so the user
+      // knows exactly when deprioritization clears without mental arithmetic.
+      // Clamp to the current minute so an elapsed pause (pausedUntil <= now)
+      // renders the current time, not a future-past time.
+      const untilMs = Math.max((now ?? Date.now()), queueSnap.pausedUntil);
+      const hhmm = new Date(untilMs).toISOString().slice(11, 16) + "Z";
       const reason = queueSnap.pausedReason ? ` (${queueSnap.pausedReason})` : "";
-      parts.push(`PAUSED ${secs}s${reason}`);
+      parts.push(`PAUSED until ${hhmm}${reason}`);
     }
+  }
+  if (strikes24h !== undefined) {
+    parts.push(`Strikes ${strikes24h}/20`);
   }
   return `Umans ${parts.join(" │ ")}`;
 }
@@ -881,6 +901,7 @@ export default async function (pi: ExtensionAPI) {
   let currentConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
+  let strikes24h: number | undefined;
 
   // Cross-process FIFO queue over outbound Umans requests, backed by
   // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
@@ -915,6 +936,7 @@ export default async function (pi: ExtensionAPI) {
   let lastMetrics: { ttft?: number; tps?: number } = {};
 
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let strikeTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshStopped = false;
 
   function stopRefreshLoop() {
@@ -923,12 +945,17 @@ export default async function (pi: ExtensionAPI) {
       clearTimeout(refreshTimer);
       refreshTimer = undefined;
     }
+    if (strikeTimer) {
+      clearTimeout(strikeTimer);
+      strikeTimer = undefined;
+    }
   }
 
   function restartRefreshLoop(apiKey: string) {
     stopRefreshLoop();
     refreshStopped = false;
     scheduleRefresh(apiKey);
+    scheduleStrikePoll(apiKey, true); // immediate: know the strike count at startup
   }
 
   function scheduleRefresh(apiKey: string) {
@@ -937,6 +964,48 @@ export default async function (pi: ExtensionAPI) {
       await refreshUsage(apiKey);
       scheduleRefresh(apiKey);
     }, 5000);
+  }
+
+  // Strike counter poll: fetch the 24h 429 count + defensively pause if we're
+  // approaching the server's 5h-pause threshold. Runs on a longer interval than
+  // refreshUsage (5 min vs 5s) because /history is heavier + the count moves
+  // slowly. The first poll fires immediately (no delay) so we know the strike
+  // count at startup, not 5 min in.
+  function scheduleStrikePoll(apiKey: string, immediate = false) {
+    if (refreshStopped || !apiKey) return;
+    strikeTimer = setTimeout(async () => {
+      await refreshStrikes(apiKey);
+      scheduleStrikePoll(apiKey);
+    }, immediate ? 0 : STRIKE_POLL_INTERVAL_MS);
+  }
+
+  async function refreshStrikes(apiKey: string) {
+    const count = await fetch429Strikes(apiKey);
+    if (count === null) return; // leave cached value; status bar shows "?"
+    strikes24h = count;
+    // Defensively self-pause when approaching the 5h-pause threshold. Better to
+    // pause briefly + let strikes age out than risk the 5h account ban. The
+    // pause is only pushed if no longer pause is already active (don't shorten a
+    // real priority.low / 429 pause with a shorter strikes pause).
+    if (count >= STRIKE_PAUSE_THRESHOLD) {
+      const snap = concurrencyQueue.snapshot();
+      const now = Date.now();
+      const strikeUntil = now + STRIKE_PAUSE_MS;
+      // Only push if no active pause OR the active pause ends sooner than our
+      // strike pause (extend, never shorten). A priority.low pause from the
+      // server (boxed_until) or a 429 pause is left untouched if it's longer.
+      if (!snap.paused || snap.pausedUntil < strikeUntil) {
+        try {
+          concurrencyQueue.pauseUntil(strikeUntil, PAUSE_REASON_STRIKES);
+        } catch (err) {
+          console.warn("umans: pauseUntil threw in refreshStrikes (continuing):", err instanceof Error ? err.message : err);
+        }
+      }
+    }
+    // No updateStatus call here — refreshStrikes runs from a timer without an
+    // event ctx. The strikes24h var is picked up on the next status render
+    // (streaming event or the periodic refreshUsage path). The pause push
+    // above is what matters operationally; the display follows on the next tick.
   }
 
   function computeCumulativeTps(req: LiveRequest, now: number): number {
@@ -958,6 +1027,7 @@ export default async function (pi: ExtensionAPI) {
       requestsUsed,
       queueSnap: concurrencyQueue.snapshot(),
       concurrencyDisabled,
+      strikes24h,
     });
   }
 
@@ -1019,6 +1089,43 @@ export default async function (pi: ExtensionAPI) {
         limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
         usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
       };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Fetch the count of concurrency 429s in the last 24h from /v1/usage/history.
+  // This is the API-accessible proxy for the dashboard's "X/20 limit hits today"
+  // counter (which is not available via API key — it requires a NextAuth web
+  // session on app.umans.ai). The server pauses the account for 5h after >20
+  // concurrency 429s in 24h; we defensively self-pause before reaching that.
+  // Returns null on any failure (caller leaves the cached value).
+  async function fetch429Strikes(apiKey: string): Promise<number | null> {
+    const now = Date.now();
+    const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
+    const to = new Date(now).toISOString();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(
+        `${baseUrl}/v1/usage/history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=hour`,
+        {
+          signal: ctrl.signal,
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: "application/json",
+            "User-Agent": USER_AGENT,
+          },
+        },
+      );
+      if (!res.ok) return null;
+      const data = await res.json() as { buckets?: Array<{ error_category?: string | null; requests?: number }> };
+      if (!Array.isArray(data.buckets)) return null;
+      return data.buckets
+        .filter((b) => b.error_category === "rate_limit_concurrency")
+        .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
     } catch {
       return null;
     } finally {

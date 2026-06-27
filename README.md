@@ -113,6 +113,22 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 | `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the capacity check value (handy for testing the queue with a low number). |
 | `UMANS_CONCURRENCY_STATE_FILE` | `~/.pi/agent/umans-concurrency.json` | Override the queue state file path (handy for multi-process isolation experiments). |
 
+### 429 strike counter
+
+The queue polls `/v1/usage/history` every 5 min to count concurrency 429s in the last 24h (the `rate_limit_concurrency` error buckets). When the count reaches **18** (of the server's 20/24h threshold that triggers a 5h account pause), the queue **defensively self-pauses for 30 min** so strikes can age out of the rolling window rather than risk the 5h ban. The status bar shows `Strikes X/20` so you can see how close you are. The server's exact "limit hits today" counter lives on the dashboard (`app.umans.ai/api/account/cap-health`, NextAuth web-session only — not accessible via API key); the `/v1/usage/history` sum is a conservative upper bound that's close enough to pace with.
+
+### Umans API endpoints used
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `GET /v1/usage` | GET | Live limits + concurrent_sessions + priority.low (polled every 5s + on every head-waiter launch) |
+| `GET /v1/usage/history` | GET | 24h 429 strike count (polled every 5 min for the defensive pause) |
+| `POST /v1/keys/validate` | POST | Plan + max_concurrency (not used by the queue; `/v1/usage` provides `limit`. Documented for future per-key limit support) |
+| `GET /v1/models/info` | GET | Model catalog (public, no auth) |
+| `GET /v1/status` | GET | Service health (uptime, TTFT, TPS) |
+
+The dashboard endpoint `app.umans.ai/api/account/cap-health` (exact strike counter) is **not accessible via API key** — it requires a NextAuth web session (Google OIDC or email/password). The `/v1/usage/history` strike sum is the API-accessible proxy.
+
 ## Configuration
 
 | Env var | Default | Effect |

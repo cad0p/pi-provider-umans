@@ -355,7 +355,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
 // --- SEC5-1 / ADV5-5: pausedReason is capped + sanitized (no ANSI/control injection) ---
 // A compromised or misconfigured gateway can push a crafted `priority.reason`
-// that flows unescaped into the status bar (PAUSED <Ns> (<reason>)). parsePriority
+// that flows unescaped into the status bar (PAUSED until HH:MMZ (<reason>)). parsePriority
 // now caps to ~64 chars and strips non-printable / control / ANSI-escape
 // characters, and pauseUntil re-sanitizes at the write boundary (defense-in-
 // depth). A crafted 200-char reason with ANSI escapes must be capped + stripped
@@ -3352,8 +3352,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // --- COV7-10: formatStatusText rendering (extracted pure helper) ---
 // statusText was a closure (not exported), so the status-bar rendering was
 // untested. formatStatusText is the pure seam: queued>0 + tokenHeld ->
-// `q N*`; paused -> `PAUSED Ns (reason)`; paused with elapsed pausedUntil ->
-// `PAUSED 0s` (not negative); empty -> no queue part.
+// `q N*`; paused -> `PAUSED until HH:MMZ (reason)`; paused with elapsed
+// pausedUntil -> clamps to current minute (not future-past); empty -> no
+// queue part; strikes24h -> `Strikes X/20`.
 {
   const now = 1_700_000_000_000;
   // queued + tokenHeld -> q N*.
@@ -3372,18 +3373,37 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     queueSnap: { queued: 2, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
     now,
   }).includes("q 2*"), "COV7-10: queued + not tokenHeld -> q N (no star)");
-  // paused -> PAUSED Ns (reason).
-  assert(formatStatusText({
+  // paused -> PAUSED until HH:MMZ (reason). 30s from now = 1_700_000_030_000.
+  const pausedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now + 30_000, pausedReason: "HTTP 429 from gateway" },
     now,
-  }).includes("PAUSED 30s (HTTP 429 from gateway)"), "COV7-10: paused -> PAUSED Ns (reason)");
-  // paused with elapsed pausedUntil -> PAUSED 0s (not negative).
-  assert(formatStatusText({
+  });
+  assert(pausedText.includes("PAUSED until ") && pausedText.includes("Z (HTTP 429 from gateway)"),
+    "COV7-10: paused -> PAUSED until HH:MMZ (reason): got: " + pausedText);
+  // Verify the HH:MM format (5 chars + Z, e.g. "12:34Z").
+  assert(/PAUSED until \d{2}:\d{2}Z/.test(pausedText),
+    "COV7-10: paused renders HH:MMZ absolute time");
+  // paused with elapsed pausedUntil -> clamps to current minute (not future-past).
+  const elapsedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now - 5_000, pausedReason: null },
     now,
-  }).includes("PAUSED 0s"), "COV7-10: elapsed pause -> PAUSED 0s (not negative)");
+  });
+  assert(elapsedText.includes("PAUSED until ") && /PAUSED until \d{2}:\d{2}Z/.test(elapsedText),
+    "COV7-10: elapsed pause -> clamps to current minute (not negative): got: " + elapsedText);
+  // strikes24h -> Strikes X/20 part.
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    strikes24h: 5,
+  }).includes("Strikes 5/20"), "COV7-10: strikes24h -> Strikes X/20 part");
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    strikes24h: 0,
+  }).includes("Strikes 0/20"), "COV7-10: strikes24h=0 still shows the part");
+  assert(!formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+  }).includes("Strikes"), "COV7-10: no strikes24h -> no Strikes part (undefined)");
   // empty queue (queued 0, not held, not paused) -> no queue part.
   const empty = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
