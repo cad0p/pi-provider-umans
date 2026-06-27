@@ -1051,7 +1051,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
               // Release: remove our token and our waiter entry. A throw here
               // (lock timeout, EACCES, ENOSPC) propagates to releaseSlot in
               // index.ts, which wraps release() in try/catch (ADV3-1) so the
-              // drain continues and the watchdog reaps the stale entry.
+              // release continues and the watchdog reaps the stale entry.
               mutate((_now, state) => {
                 if (state.token && state.token.id === ourId) {
                   state.token = null;

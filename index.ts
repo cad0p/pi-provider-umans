@@ -1772,7 +1772,7 @@ export default async function (pi: ExtensionAPI) {
     // until the body stream completes — so the next waiter's /usage poll would
     // see stale capacity and launch too (peak 4 vs limit 2). The token is held
     // until assistant message_end (the primary release path) or turn_end /
-    // agent_end (the drain safety nets). Here we only intercept 429s to extend
+    // agent_end (the safety nets). Here we only intercept 429s to extend
     // the shared pause window so sibling processes back off instead of
     // immediately re-launching. Per Umans docs, each 429 deprioritizes the
     // account for ~30 min (Retry-After overrides).
