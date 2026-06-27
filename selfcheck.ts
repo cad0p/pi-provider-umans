@@ -3578,4 +3578,116 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- COV9-3/COV8-7: /umans-concurrency operator command driven through wiring ---
+// All 4 branches untested through real wiring: status (renders snapshot),
+// reset (clearPause({force:true}) + reset()), unknown-subcommand (prints
+// usage), no-args (defaults to status). The clearPause({force:true}) caller
+// exists only here. Change the harness mock to capture commands, then dispatch
+// status / reset / bogus / "" against a seeded pause + assert notify text +
+// state-file pausedUntil===0 after reset.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov9-3-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: any) =>
+    Promise.resolve(new Response("", { status: 404 }))) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const cmds = new Map<string, { handler: (args: string, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {},
+      registerCommand(name: string, def: any) {
+        if (name === "umans-concurrency") cmds.set(name, def);
+      },
+      registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    await umansFactory(pi as any);
+    assert(cmds.has("umans-concurrency"), "COV9-3: /umans-concurrency command registered through wiring");
+    const cmd = cmds.get("umans-concurrency")!;
+
+    // Seed a 429-origin pause in the shared state file so status renders it +
+    // reset's clearPause({force:true}) has something to clear (the force branch
+    // is the only caller of clearPause({force:true})).
+    const seedQ = createConcurrencyQueue({ stateFile });
+    const pauseUntil = Date.now() + 30_000;
+    seedQ.pauseUntil(pauseUntil, PAUSE_REASON_429);
+    assert(seedQ.snapshot().paused === true, "COV9-3: seeded 429 pause visible to snapshot");
+
+    // (a) status: notify text must mention queued + tokenHeld + paused + 429 reason.
+    notifications.length = 0;
+    await cmd.handler("status", makeCtx());
+    const statusNote = notifications.find((n) => n.msg.startsWith("Umans concurrency:"));
+    assert(!!statusNote, "COV9-3: status subcommand produced a notify");
+    assert(statusNote!.msg.includes("paused"), `COV9-3: status notify mentions paused (got: ${statusNote!.msg})`);
+    assert(statusNote!.msg.includes(PAUSE_REASON_429!), `COV9-3: status notify mentions 429 reason (got: ${statusNote!.msg})`);
+
+    // (b) no-args ("") defaults to status — same notify shape.
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const emptyNote = notifications.find((n) => n.msg.startsWith("Umans concurrency:"));
+    assert(!!emptyNote, "COV9-3: no-args defaulted to status (produced a notify)");
+    assert(emptyNote!.msg.includes("paused"), "COV9-3: no-args status notify mentions paused");
+
+    // (c) reset: clearPause({force:true}) + reset() — must clear the 429 pause
+    // (the force branch is the only caller that overrides CORR4-1's 429 guard)
+    // + drop this process's own waiter/token entry.
+    notifications.length = 0;
+    await cmd.handler("reset", makeCtx());
+    const resetNote = notifications.find((n) => n.msg.includes("force-cleared"));
+    assert(!!resetNote, `COV9-3: reset produced force-cleared notify (got: ${notifications.map((n) => n.msg).join(" | ")})`);
+    // The state file's pausedUntil must be 0 after reset (clearPause force + reset).
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedUntil === 0, `COV9-3: reset cleared pausedUntil (got ${parsed.pausedUntil}, expected 0)`);
+
+    // (d) bogus subcommand: prints usage.
+    notifications.length = 0;
+    await cmd.handler("bogus", makeCtx());
+    const usageNote = notifications.find((n) => n.msg.startsWith("Usage: /umans-concurrency"));
+    assert(!!usageNote, `COV9-3: bogus subcommand printed usage (got: ${notifications.map((n) => n.msg).join(" | ")})`);
+
+    // Dispatch session_shutdown to stop the factory's refresh loop (if any started).
+    const hs = handlers.get("session_shutdown");
+    if (hs) for (const h of hs) await h({ type: "session_shutdown" }, makeCtx());
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log("\nall checks passed");
