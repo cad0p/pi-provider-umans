@@ -115,7 +115,7 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 
 ### 429 strike counter
 
-The queue polls `/v1/usage/history` every 5 min to count concurrency 429s in the last 24h (the `rate_limit_concurrency` error buckets). When the count reaches **18** (of the server's 20/24h threshold that triggers a 5h account pause), the queue **defensively self-pauses for 30 min** so strikes can age out of the rolling window rather than risk the 5h ban. The status bar shows `Strikes X/20` so you can see how close you are. The server's exact "limit hits today" counter lives on the dashboard (`app.umans.ai/api/account/cap-health`, NextAuth web-session only — not accessible via API key); the `/v1/usage/history` sum is a conservative upper bound that's close enough to pace with.
+The queue polls `/v1/usage/history` every 5 min to count concurrency 429s since the most recent `cap_suspended` bucket (the server resets the counter on reactivation, so pre-pause strikes are excluded to match the dashboard's behavior). When the count reaches the dynamic threshold — **20 minus the concurrency limit** (e.g. 20−4 = 16) — the queue **defensively self-pauses for 30 min** so strikes can age out of the rolling window rather than risk the 5h ban. The margin equals the max in-flight requests that could all 429 simultaneously before our next poll tips the server's counter over. The status bar shows `Strikes X/20` so you can see how close you are. The server's exact "limit hits today" counter lives on the dashboard (`app.umans.ai/api/account/cap-health`, NextAuth web-session only — not accessible via API key); the `/v1/usage/history` sum (excluding pre-pause strikes) matches the dashboard exactly.
 
 ### Umans API endpoints used
 

@@ -111,17 +111,19 @@ const SEARCH_MAX_TOKENS = 2048;
 // hostile/misbehaving /usage that always reports full.
 const CAPACITY_POLL_TIMEOUT_MS = 60_000;
 
-// 429 strike counter: the Umans account is paused for 5h after >N concurrency
-// 429s in 24h (N=10 historically, now 20 per the dashboard). The queue polls
-// /v1/usage/history every STRIKE_POLL_INTERVAL_MS, sums rate_limit_concurrency
-// buckets over the last 24h, and defensively pauses when the count reaches
-// STRIKE_PAUSE_THRESHOLD — better to self-pause briefly than risk the 5h ban.
-// The threshold is set below the server's pause trigger so a small burst of
-// in-flight requests (between the poll + the server's counter update) can't
-// tip us over before we react.
+// 429 strike counter: the Umans account is paused for 5h after >20 concurrency
+// 429s in 24h. The queue polls /v1/usage/history every STRIKE_POLL_INTERVAL_MS,
+// sums rate_limit_concurrency buckets since the last cap_suspended (the server
+// resets the counter on reactivation), and defensively pauses when the count
+// reaches the dynamic threshold — better to self-pause briefly than risk the 5h ban.
+//
+// The threshold is dynamic: STRIKE_SERVER_LIMIT (20) minus the max in-flight
+// requests (the concurrency limit, e.g. 4), so a burst of in-flight requests
+// between the poll + the server's counter update can't tip us over before we
+// react. With limit=4 → threshold=16; with limit=3 → threshold=17.
 const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
-const STRIKE_PAUSE_THRESHOLD = 18; // pause defensively at 18 (server triggers at 20)
+const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
 const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
 const PAUSE_REASON_STRIKES = "429 strike limit approached";
 
@@ -983,11 +985,18 @@ export default async function (pi: ExtensionAPI) {
     const count = await fetch429Strikes(apiKey);
     if (count === null) return; // leave cached value; status bar shows "?"
     strikes24h = count;
+    // Dynamic threshold: server limit minus the max in-flight requests (the
+    // concurrency limit). A burst of in-flight requests can all 429 before our
+    // next poll (every 5 min) tips the server's counter past the limit; leaving
+    // a margin equal to the max in-flight means we pause before that burst can
+    // push us over. With limit=4 → threshold=16; with limit=3 → threshold=17.
+    const maxInFlight = concurrencyLimit() ?? guaranteedConcurrency ?? 0;
+    const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
     // Defensively self-pause when approaching the 5h-pause threshold. Better to
     // pause briefly + let strikes age out than risk the 5h account ban. The
     // pause is only pushed if no longer pause is already active (don't shorten a
     // real priority.low / 429 pause with a shorter strikes pause).
-    if (count >= STRIKE_PAUSE_THRESHOLD) {
+    if (count >= strikeThreshold) {
       const snap = concurrencyQueue.snapshot();
       const now = Date.now();
       const strikeUntil = now + STRIKE_PAUSE_MS;
@@ -1096,11 +1105,14 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  // Fetch the count of concurrency 429s in the last 24h from /v1/usage/history.
-  // This is the API-accessible proxy for the dashboard's "X/20 limit hits today"
-  // counter (which is not available via API key — it requires a NextAuth web
-  // session on app.umans.ai). The server pauses the account for 5h after >20
-  // concurrency 429s in 24h; we defensively self-pause before reaching that.
+  // Fetch the count of concurrency 429s since the last cap_suspended (5h pause)
+  // from /v1/usage/history. This is the API-accessible proxy for the dashboard's
+  // "X/20 limit hits today" counter (which is not available via API key — it
+  // requires a NextAuth web session on app.umans.ai). The server pauses the
+  // account for 5h after >20 concurrency 429s in 24h AND resets the counter on
+  // reactivation (a reactivation revokes + rotates API keys), so we exclude
+  // strikes from before the most recent cap_suspended bucket — matching the
+  // dashboard's behavior so our count stays accurate after a reactivation.
   // Returns null on any failure (caller leaves the cached value).
   async function fetch429Strikes(apiKey: string): Promise<number | null> {
     const now = Date.now();
@@ -1121,10 +1133,26 @@ export default async function (pi: ExtensionAPI) {
         },
       );
       if (!res.ok) return null;
-      const data = await res.json() as { buckets?: Array<{ error_category?: string | null; requests?: number }> };
+      const data = await res.json() as { buckets?: Array<{ bucket?: string; error_category?: string | null; requests?: number }> };
       if (!Array.isArray(data.buckets)) return null;
+      // Find the most recent cap_suspended bucket timestamp. Strikes before it
+      // are excluded (the counter resets on reactivation). If there's no
+      // cap_suspended in the window, all strikes count.
+      let lastPauseTs = 0;
+      for (const b of data.buckets) {
+        if (b.error_category === "cap_suspended" && b.bucket) {
+          const ts = new Date(b.bucket).getTime();
+          if (ts > lastPauseTs) lastPauseTs = ts;
+        }
+      }
       return data.buckets
         .filter((b) => b.error_category === "rate_limit_concurrency")
+        .filter((b) => {
+          // Exclude strikes before the most recent cap_suspended (counter reset).
+          if (lastPauseTs === 0) return true;
+          const ts = b.bucket ? new Date(b.bucket).getTime() : 0;
+          return ts > lastPauseTs;
+        })
         .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
     } catch {
       return null;
