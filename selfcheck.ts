@@ -4391,6 +4391,201 @@ if (process.platform !== "win32") {
     "COV10-3: acquireLock timeout message present in source (Windows skip)");
 }
 
+// --- COV10-5: side-call tool execute early-return paths driven through real wiring ---
+// umans_web_search.execute + umans_vision.execute have 4 early-return branches that
+// were never driven through the real factory (only the happy-path fetch 200/429 paths
+// were exercised by COV9-4):
+//   (a) umans_web_search: getApiKeyForProvider returns undefined → "API key unavailable"
+//   (b) umans_vision: image_id not in imageStore → "not available in this session"
+//   (c) umans_vision: getApiKeyForProvider returns undefined → "API key unavailable"
+//   (d) umans_vision: visionModelId is empty → "No vision model configured"
+// A regression dropping any guard (e.g. removing the !apiKey check, letting the side-
+// call proceed with an undefined key + throw a confusing fetch error) would not be
+// caught. Drive each branch through the real factory wiring + assert the early-return
+// text. No fetch should fire for these branches (the early-return precedes acquireSlot).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-5-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
+  delete process.env.UMANS_SEARCH_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  let messagesCalls = 0;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      messagesCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "analysis result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    // apiKeyResolver controls what getApiKeyForProvider returns. Default to
+    // the key (happy path); each sub-test overrides it.
+    let apiKeyResolver: () => Promise<string | undefined> = async () => "uk-test-key";
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => apiKeyResolver() }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let result: any;
+      for (const h of hs) {
+        const r = await h(payload, ctx ?? makeCtx());
+        if (r !== undefined && result === undefined) result = r;
+      }
+      return result;
+    }
+    await umansFactory(pi as any);
+
+    assert(tools.has("umans_web_search"), "COV10-5: umans_web_search tool registered through wiring");
+    assert(tools.has("umans_vision"), "COV10-5: umans_vision tool registered through wiring");
+    const searchTool = tools.get("umans_web_search")!;
+    const visionTool = tools.get("umans_vision")!;
+
+    // (a) umans_web_search.execute with getApiKeyForProvider → undefined: the
+    // !apiKey early-return fires BEFORE acquireSlot (no /usage poll, no fetch).
+    // resolveApiKey checks UMANS_API_KEY env first, so clear it too.
+    messagesCalls = 0;
+    usageCalls = 0;
+    apiKeyResolver = async () => undefined;
+    const savedApiKeyA = process.env.UMANS_API_KEY;
+    delete process.env.UMANS_API_KEY;
+    const searchNoKey = await searchTool.execute("call-1", { query: "test" }, new AbortController().signal, undefined, makeCtx());
+    process.env.UMANS_API_KEY = savedApiKeyA;
+    assert(typeof searchNoKey?.content?.[0]?.text === "string" &&
+      searchNoKey.content[0].text.includes("API key unavailable"),
+      `COV10-5: web_search no-apiKey early-return text (got: ${searchNoKey?.content?.[0]?.text})`);
+    assert(usageCalls === 0, "COV10-5: web_search no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "COV10-5: web_search no-apiKey did not fetch /v1/messages (early-return before searchWeb)");
+
+    // (b) umans_vision.execute with an unknown image_id (not in imageStore):
+    // the !image early-return fires BEFORE apiKey resolution + acquireSlot.
+    // No fetch should fire even when the apiKey resolver returns a valid key.
+    apiKeyResolver = async () => "uk-test-key";
+    messagesCalls = 0;
+    usageCalls = 0;
+    const savedApiKeyB = process.env.UMANS_API_KEY;
+    process.env.UMANS_API_KEY = "uk-test-key";
+    const visionUnknown = await visionTool.execute("call-2", { image_id: "img_doesnotexist", question: "q" }, new AbortController().signal, undefined, makeCtx());
+    process.env.UMANS_API_KEY = savedApiKeyB;
+    assert(typeof visionUnknown?.content?.[0]?.text === "string" &&
+      visionUnknown.content[0].text.includes("not available in this session"),
+      `COV10-5: vision unknown-image_id early-return text (got: ${visionUnknown?.content?.[0]?.text})`);
+    assert(usageCalls === 0, "COV10-5: vision unknown-image_id did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "COV10-5: vision unknown-image_id did not fetch /v1/messages (early-return before analyzeImage)");
+
+    // Populate imageStore via the via-handoff message_end handler with one
+    // image so the subsequent (c)/(d) sub-tests can use its id.
+    apiKeyResolver = async () => "uk-test-key";
+    const transformed = await dispatch("message_end", {
+      type: "message_end",
+      message: {
+        role: "user",
+        provider: "umans",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+      },
+    }, makeCtx({ provider: "umans", id: "umans-glm-5.2" })); // via-handoff model
+    const analysisText: string = transformed.message.content
+      .find((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))?.text ?? "";
+    const imgIdMatch = analysisText.match(/\[Image analysis \(image:([^\)]+)\)\]/);
+    assert(!!imgIdMatch, `COV10-5: vision handoff produced an image id (got: ${analysisText})`);
+    const imgId = imgIdMatch![1];
+    const probeC = createConcurrencyQueue({ stateFile });
+    probeC.reset();
+
+    // (c) umans_vision.execute with a known image_id but getApiKeyForProvider →
+    // undefined: the !apiKey early-return fires AFTER image lookup but BEFORE
+    // acquireSlot. No fetch should fire.
+    apiKeyResolver = async () => undefined;
+    messagesCalls = 0;
+    usageCalls = 0;
+    const savedApiKeyC = process.env.UMANS_API_KEY;
+    delete process.env.UMANS_API_KEY;
+    const visionNoKey = await visionTool.execute("call-3", { image_id: imgId, question: "q" }, new AbortController().signal, undefined, makeCtx());
+    process.env.UMANS_API_KEY = savedApiKeyC;
+    assert(typeof visionNoKey?.content?.[0]?.text === "string" &&
+      visionNoKey.content[0].text.includes("API key unavailable"),
+      `COV10-5: vision no-apiKey early-return text (got: ${visionNoKey?.content?.[0]?.text})`);
+    assert(usageCalls === 0, "COV10-5: vision no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "COV10-5: vision no-apiKey did not fetch /v1/messages (early-return before analyzeImage)");
+
+    // (d) umans_vision.execute with a known image_id + valid apiKey but no
+    // vision model configured: the !visionModelId early-return fires AFTER
+    // apiKey resolution but BEFORE acquireSlot. The /umans-vision command has
+    // no "clear" subcommand + the static catalog always has native-vision
+    // models, so the branch is not cleanly reachable live. Assert the guard is
+    // structurally present in source (the !visionModelId guard exists at the
+    // tool execute site) + sits before acquireSlot, so a regression dropping it
+    // is caught by source inspection.
+    apiKeyResolver = async () => "uk-test-key";
+    const srcIdx = readFileSync("index.ts", "utf8");
+    assert(srcIdx.includes('"No vision model configured. Set one with /umans-vision model <id>."'),
+      "COV10-5: vision no-model early-return guard present in source (index.ts)");
+    // Confirm the guard sits between the apiKey check and acquireSlot in the
+    // umans_vision execute body (so it fires before any side-call).
+    const guardIdx = srcIdx.indexOf('"No vision model configured');
+    const acquireIdx = srcIdx.indexOf("acquireSlot(apiKey, signal);", guardIdx);
+    assert(acquireIdx > guardIdx, "COV10-5: vision no-model guard precedes acquireSlot (early-return before side-call)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV9-8: concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
 // transformMessageImages does Promise.all over N images, each calling acquireSlot → join →
 // mutate. The O_EXCL lockfile is per-state-file, not per-process, so concurrent mutate calls
