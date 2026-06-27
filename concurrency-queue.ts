@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync, fstatSync, readSync, constants as fsConstants } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync, fstatSync, readSync, constants as fsConstants } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -115,6 +115,21 @@ const DEFAULT_STALE_TOKEN_MS = 120_000;
 const DEFAULT_STALE_WAITER_MS = 5 * 60 * 1000;
 const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
+
+/**
+ * ADV12-1: a lockfile whose mtime is implausibly far in the future is treated
+ * as stale + reclaimed. A future-dated mtime arises from a backwards clock
+ * jump (NTP correction, resume from suspend, manual `date` change) or a
+ * hand-edited/planted lockfile. Without this bound, `cfg.now() - st.mtimeMs`
+ * is negative, the stale-lockfile condition is false, and the lock is never
+ * reclaimed — wedging every `mutate` until the wall clock catches up. 60s is
+ * a generous ceiling: no legitimate lockfile is ever minutes in the future
+ * (the lock timeout is 2s, the critical section is sub-ms). An attacker with
+ * write access to ~/.pi/agent/ (the documented threat model) could otherwise
+ * `touch -t` the lockfile to a future date + wedge every local pi process
+ * indefinitely.
+ */
+export const MAX_LOCK_FUTURE_MS = 60_000;
 
 function defaultNow(): number { return Date.now(); }
 function defaultPid(): number { return process.pid; }
@@ -695,7 +710,12 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
         // The mtime check alone is correct + removes the read vector entirely;
         // a slow-but-legitimate mutate holding past lockTimeoutMs is reclaimed
         // (bounded stall, no lost write — O_EXCL + atomic rename preserve it).
-        if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs) {
+        if (cfg.now() - st.mtimeMs > cfg.lockTimeoutMs || st.mtimeMs - cfg.now() > MAX_LOCK_FUTURE_MS) {
+          // ADV12-1: reclaim if the lockfile is older than lockTimeoutMs (the
+          // original mtime ceiling) OR if its mtime is implausibly far in the
+          // future (clock skew / `touch -t` attack). A future-dated mtime makes
+          // the first condition negative (never reclaims); the second condition
+          // catches it. Mirrors the forward-dated-pausedTs defense (ADV10-1).
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }

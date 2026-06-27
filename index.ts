@@ -1260,7 +1260,7 @@ export default async function (pi: ExtensionAPI) {
           // release it before returning — the watchdog would reap it
           // eventually, but releasing now frees the next head immediately.
           try { releaseToken(); } catch { /* best-effort */ }
-          concurrencyQueue.cancel(ourId);
+          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort: COV12-1 */ }
           released = true;
           return undefined;
         }
@@ -1764,7 +1764,24 @@ export default async function (pi: ExtensionAPI) {
     // release race (message_end precedes the server decrement) is absorbed by
     // the hard_cap burst headroom (CORR2-1). turn_end and agent_end are safety
     // nets for turns that never reach message_end.
-    const release = await acquireSlot(apiKey, ctx.signal);
+    // ADV12-2: wrap acquireSlot in try/catch so a wedged lock (ADV12-1
+    // future-dated mtime) or transient disk error (EACCES/ENOSPC/EROFS/ENOENT
+    // on the lockfile or state file) does NOT break the user's turn as an
+    // uncaught extension error. The queue must not break inference, only the
+    // gate. Fail-open ungated (proceed without a release fn), matching the
+    // /usage-unreachable stance at isCapacityFree + the ADV-3 poll-timeout
+    // fail-open. The watchdog + hard_cap burst headroom absorb one ungated
+    // send. This mirrors the COV4-2 hardening applied to pauseUntil/handle429.
+    let release: Release | undefined;
+    try {
+      release = await acquireSlot(apiKey, ctx.signal);
+    } catch (err) {
+      ctx.ui?.notify?.(
+        `Umans concurrency queue: gating unavailable (${err instanceof Error ? err.message : String(err)}); proceeding ungated.`,
+        "warning",
+      );
+      release = undefined; // fail-open ungated
+    }
     if (release) {
       // ADV2-F2: wrap acquire + register in a try/finally so a throw between
       // acquireSlot resolving and the safety-net registration (message_end /

@@ -5,7 +5,7 @@
 // - createConcurrencyQueue: FIFO + launch-token + pause (file-backed, temp dir)
 //
 // Run: node --experimental-strip-types selfcheck.ts
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody, handle429 } from "./index.ts";
@@ -23,6 +23,7 @@ import {
   MAX_PAUSE_429_MS,
   PRIORITY_BACKOFF_MS,
   sanitizeReason,
+  MAX_LOCK_FUTURE_MS,
   type QueueState,
   type QueueConfig,
 } from "./concurrency-queue.ts";
@@ -5303,6 +5304,104 @@ if (process.platform !== "win32") {
   const expected = `pi-umans-provider/${pkg.version}`;
   assert(`pi-umans-provider/${pkg.version}` === expected,
     "CLN11-1: USER_AGENT template literal includes pkg.version (no drift)");
+}
+
+// --- ADV12-1: future-dated lockfile mtime is reclaimed (clock skew / touch -t attack) ---
+// Without this guard, a lockfile mtime in the future makes `cfg.now() -
+// st.mtimeMs` negative, so the stale-lockfile condition is never true + the
+// lock is never reclaimed — wedging every mutate until the wall clock catches
+// up. An attacker with write access to ~/.pi/agent/ can `touch -t` the
+// lockfile to a future date + wedge every local pi process indefinitely.
+{
+  const tmp = `/tmp/adv12-1-${process.pid}-${Date.now()}`;
+  try {
+    const stateFile = `${tmp}/state.json`;
+    const lockFile = `${stateFile}.lock`;
+    mkdirSync(tmp, { recursive: true });
+    // Plant a lockfile with a future-dated mtime (1h in the future).
+    writeFileSync(lockFile, "planted");
+    const future = new Date(Date.now() + 60 * 60 * 1000); // +1h
+    utimesSync(lockFile, future, future);
+    const cfg: Required<QueueConfig> = {
+      stateFile,
+      pollIntervalMs: 50,
+      staleTokenMs: 120_000,
+      staleWaiterMs: 300_000,
+      lockTimeoutMs: 2_000,
+      lockRetryMs: 5,
+      now: () => Date.now(),
+    };
+    const q = createConcurrencyQueue(cfg);
+    // join() → mutate → acquireLock should reclaim the future-dated lockfile
+    // + succeed (not throw "timed out acquiring lock"). Before ADV12-1, this
+    // threw because the future-dated mtime made the stale condition negative.
+    const id = q.join();
+    assert(typeof id === "string" && id.length > 0,
+      "ADV12-1: future-dated lockfile mtime is reclaimed (join succeeds, not wedged)");
+    // The future-dated lockfile was unlinked + replaced; join() cleaned up
+    // after itself (release unlinks the lockfile). So the lockfile should NOT
+    // exist after join completes. (If the reclaim failed, join would have
+    // thrown before reaching here.)
+    assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
+      "ADV12-1: lockfile is either gone (released) or freshly created (~now, not future-dated)");
+    q.cancel(id);
+  } finally {
+    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- ADV12-3: readFileSync import removed from concurrency-queue.ts (dead after SEC9-3) ---
+// SEC9-3 dropped the PID-based fast-path (the only readFileSync call site).
+// The dead import is misleading + trips stricter configs/linters.
+{
+  const src = readFileSync("concurrency-queue.ts", "utf8");
+  // The import line must NOT include readFileSync.
+  const importLine = src.match(/import\{[^}]*\}from"node:fs"/)?.[0] ?? src.split("\n").find((l) => l.includes('from "node:fs"')) ?? "";
+  assert(!importLine.includes("readFileSync"),
+    "ADV12-3: readFileSync removed from concurrency-queue.ts import (dead after SEC9-3)");
+  // Sanity: readFileSync should not appear as a call (only in comments is OK).
+  const calls = src.replace(/\/\/.*$/gm, "").match(/readFileSync\(/g);
+  assert(calls === null,
+    "ADV12-3: no readFileSync call sites in concurrency-queue.ts (comments excluded)");
+}
+
+// --- COV12-1: cancel(ourId) in acquireSlot abort path is wrapped in try/catch ---
+// The abort path (decideLaunch === "abort") calls concurrencyQueue.cancel(ourId)
+// without a try/catch, unlike its 3 sibling cancel call sites. A lock-timeout
+// or disk error during the cancel would surface a Ctrl-C as an uncaught
+// extension error, defeating the C3 "return undefined, don't throw" contract.
+{
+  const src = readFileSync("index.ts", "utf8");
+  // Find the abort path block.
+  const abortBlock = src.match(/if \(decision === "abort"\) \{[\s\S]*?return undefined;\n\s*\}/)?.[0] ?? "";
+  assert(abortBlock.length > 0,
+    "COV12-1: abort path block found in index.ts");
+  // The cancel(ourId) call in the abort path must be wrapped in try/catch.
+  assert(abortBlock.includes('try { concurrencyQueue.cancel(ourId); } catch'),
+    "COV12-1: cancel(ourId) in abort path wrapped in try/catch (best-effort)");
+  // The sibling cancel calls must also be wrapped (regression guard).
+  const touchReapBlock = src.match(/touchToken.*?reaped[\s\S]*?\n\s*\}/)?.[0] ?? "";
+}
+
+// --- ADV12-2: before_provider_request wraps acquireSlot in try/catch (fail-open on lock/disk error) ---
+// acquireSlot calls join() → mutate → acquireLock, which can throw on lock
+// timeout (ADV12-1 future-dated mtime), EACCES/ENOSPC/EROFS/ENOENT. Without a
+// catch, the throw propagates out of before_provider_request as an unhandled
+// extension error, breaking every Umans turn. Fail-open ungated (proceed without
+// a release fn), matching the /usage-unreachable stance + ADV-3 poll-timeout.
+{
+  const src = readFileSync("index.ts", "utf8");
+  // Find the before_provider_request handler's acquireSlot call.
+  const handlerBlock = src.match(/pi\.on\("before_provider_request"[\s\S]*?\n  \}\);/)?.[0] ?? "";
+  assert(handlerBlock.length > 0,
+    "ADV12-2: before_provider_request handler block found");
+  // The acquireSlot call must be inside a try/catch.
+  assert(handlerBlock.includes('try {') && handlerBlock.includes('release = await acquireSlot'),
+    "ADV12-2: acquireSlot call wrapped in try block");
+  assert(handlerBlock.includes('catch (err)') && handlerBlock.includes('fail-open ungated'),
+    "ADV12-2: catch block fails open ungated (proceeds without release fn)");
+  assert(handlerBlock.includes('proceeding ungated'),
+    "ADV12-2: user notified via ctx.ui.notify on fail-open");
 }
 
 console.log("\nall checks passed");
