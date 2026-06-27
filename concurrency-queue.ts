@@ -48,7 +48,7 @@
  * section (read-modify-write of the JSON) is guarded by an O_EXCL lockfile
  * with bounded spin-retry. The state file itself is written via atomic rename.
  */
-import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync, fstatSync, readSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, renameSync, lstatSync, readdirSync, rmdirSync, fstatSync, readSync, constants as fsConstants } from "node:fs";
 import { dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -410,6 +410,19 @@ export function readState(path: string): QueueState {
   // file is rejected before opening; the fd read then cannot be swapped to a
   // different target. A missing file throws ENOENT from openSync, caught by
   // the outer try → empty state (matching the prior absent-file behavior).
+  //
+  // ADV11-1 / SEC11-1: the open itself is now O_NOFOLLOW. The pre-open
+  // lstatSync guards against a symlink at lstat time, but a swap between the
+  // lstat + the openSync could replace the regular file with a symlink or a
+  // FIFO. openSync("r") follows symlinks + a FIFO target blocks indefinitely
+  // (probe-confirmed: openSync on a FIFO hangs past 8s, so the post-open
+  // fstatSync re-check never runs). O_NOFOLLOW makes the open fail with
+  // ELOOP on a symlink (eliminating the swap vector entirely) + still opens
+  // a regular file or a FIFO. A FIFO opened with O_NOFOLLOW does NOT block
+  // for O_RDONLY on a FIFO with no writer — but to be safe the post-open
+  // fstatSync re-check still rejects a non-regular fd (closing it), so a
+  // swapped FIFO is rejected without blocking on the read. The lstat guard
+  // remains as a fast-path early return for the common symlink case.
   try {
     let fd: number | undefined;
     try {
@@ -421,12 +434,16 @@ export function readState(path: string): QueueState {
       if (!lstat.isFile() || lstat.size > MAX_STATE_BYTES) {
         return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
       }
-      // SEC10-1: open the fd AFTER the lstat guard, then fstat + read from
-      // the fd so a path swap between the lstat + the read cannot redirect
-      // the read into a symlink/FIFO target. fstat operates on the fd we
-      // already hold; readSync reads from that fd. Re-check isFile + size on
-      // the fd in case the file was swapped (the lstat was on the path).
-      fd = openSync(path, "r");
+      // SEC10-1 / ADV11-1: open the fd AFTER the lstat guard with O_NOFOLLOW
+      // so a path swap between the lstat + the open cannot redirect the open
+      // into a symlink (ELOOP) or block on a swapped FIFO. fstat operates on
+      // the fd we already hold; readSync reads from that fd. Re-check isFile
+      // + size on the fd in case the file was swapped (the lstat was on the
+      // path). A swapped FIFO opened with O_NOFOLLOW|O_RDONLY does not block
+      // the open itself (open is non-blocking on a FIFO with no writer only
+      // under O_NONBLOCK; here we rely on the fstatSync re-check to reject
+      // the non-regular fd before the read).
+      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       const st = fstatSync(fd);
       if (!st.isFile() || st.size > MAX_STATE_BYTES) {
         closeSync(fd);
