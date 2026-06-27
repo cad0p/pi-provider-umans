@@ -4919,6 +4919,51 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV-R14-1: UMANS_SEARCH_DISABLE=1 wiring driven through real factory ---
+// When UMANS_SEARCH_DISABLE=1, the factory skips registering umans_web_search.
+// No selfcheck test set this env var + asserted the tool is absent. A regression
+// dropping the `if (!searchDisabled)` guard would not be caught.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov-r14-1-"));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_DISABLE: "1",
+    UMANS_SEARCH_DISABLE: "1", // disable the search tool
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (() => Promise.resolve(new Response("", { status: 404 }))) as any;
+  try {
+    const registeredTools: string[] = [];
+    const pi: any = {
+      on() {},
+      registerTool(name: string, _opts: any, _handler: any) { registeredTools.push(name); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+
+    // UMANS_SEARCH_DISABLE=1 → tool NOT registered
+    await umansFactory(pi as any);
+    assert(!registeredTools.includes("umans_web_search"),
+      "COV-R14-1: UMANS_SEARCH_DISABLE=1 → umans_web_search NOT registered");
+    // Other tools should still be registered (only search is disabled).
+    assert(registeredTools.length > 0,
+      "COV-R14-1: UMANS_SEARCH_DISABLE=1 → other tools still registered");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV10-3: acquireLock 2s timeout throw path ---
 // acquireLock throws `concurrency-queue: timed out acquiring lock` when the
 // deadline (now + lockTimeoutMs) passes while the lockfile is held with a
