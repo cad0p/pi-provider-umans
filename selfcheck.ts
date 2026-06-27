@@ -4156,6 +4156,184 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV10-6: searchWeb/analyzeImage fallback text paths driven through real wiring ---
+// searchWeb has 3 return paths past the !res.ok branch: (1) synthesized text
+// from a text block (covered by COV9-4); (2) content:[] or no text + no
+// web_search_tool_result -> '(no search results returned)'; (3) no text but a
+// web_search_tool_result-only response -> formatted 'N. title\n   URL: url'
+// list. analyzeImage has 2 return paths: (1) text from a text block (covered
+// by COV9-4); (2) no text -> '(no analysis returned)'. The fallback paths
+// (2)+(3) were never exercised — a regression dropping the
+// web_search_tool_result formatting or the empty-content guard would not be
+// caught. Extend the COV9-4 fetch stub with two modes + assert the formatted
+// fallback text.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov10-6-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
+  delete process.env.UMANS_SEARCH_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  // messagesMode controls what /v1/messages returns:
+  //   "empty" -> content: [] (searchWeb + analyzeImage empty fallback)
+  //   "results-only" -> content with a web_search_tool_result block, no text
+  //   "analysis-empty" -> content with no text blocks (analyzeImage empty fallback)
+  let messagesMode: "empty" | "results-only" | "analysis-empty" = "empty";
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      let body: string;
+      if (messagesMode === "empty") {
+        body = JSON.stringify({ content: [] });
+      } else if (messagesMode === "results-only") {
+        body = JSON.stringify({
+          content: [{
+            type: "web_search_tool_result",
+            content: [
+              { title: "First Result", url: "https://example.com/1" },
+              { title: "Second Result", url: "https://example.com/2" },
+            ],
+          }],
+        });
+      } else {
+        // analysis-empty: a content array with a non-text block (no text to join).
+        body = JSON.stringify({ content: [{ type: "tool_use", id: "x", name: "web_search", input: {} }] });
+      }
+      return Promise.resolve(new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      let result: any;
+      for (const h of hs) {
+        const r = await h(payload, ctx ?? makeCtx());
+        if (r !== undefined && result === undefined) result = r;
+      }
+      return result;
+    }
+    await umansFactory(pi as any);
+
+    const searchTool = tools.get("umans_web_search")!;
+    const visionTool = tools.get("umans_vision")!;
+
+    // (a) searchWeb with content:[] (no text + no web_search_tool_result):
+    // returns '(no search results returned)'.
+    messagesMode = "empty";
+    const searchEmpty = await searchTool.execute("call-1", { query: "test" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof searchEmpty?.content?.[0]?.text === "string" &&
+      searchEmpty.content[0].text === "(no search results returned)",
+      `COV10-6: searchWeb content:[] fallback text (got: ${searchEmpty?.content?.[0]?.text})`);
+    const probeA = createConcurrencyQueue({ stateFile });
+    assert(probeA.snapshot().tokenHeld === false, "COV10-6: searchWeb empty-fallback released the side-call slot");
+    probeA.reset();
+
+    // (b) searchWeb with a web_search_tool_result-only response (no text block):
+    // returns the formatted 'N. title\n   URL: url' list.
+    messagesMode = "results-only";
+    const searchResults = await searchTool.execute("call-2", { query: "test" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof searchResults?.content?.[0]?.text === "string",
+      "COV10-6: searchWeb results-only fallback returned a text string");
+    const resultsText: string = searchResults.content[0].text;
+    assert(resultsText.includes("1. First Result") && resultsText.includes("https://example.com/1"),
+      `COV10-6: searchWeb results-only fallback lists result 1 (got: ${resultsText})`);
+    assert(resultsText.includes("2. Second Result") && resultsText.includes("https://example.com/2"),
+      `COV10-6: searchWeb results-only fallback lists result 2 (got: ${resultsText})`);
+    assert(resultsText.includes("URL: "),
+      `COV10-6: searchWeb results-only fallback uses 'URL: ' prefix (got: ${resultsText})`);
+    const probeB = createConcurrencyQueue({ stateFile });
+    assert(probeB.snapshot().tokenHeld === false, "COV10-6: searchWeb results-only fallback released the side-call slot");
+    probeB.reset();
+
+    // (c) analyzeImage with a content array that has no text block (e.g. a
+    // tool_use-only response): returns '(no analysis returned)'. Populate
+    // imageStore first via the via-handoff message_end handler.
+    messagesMode = "empty"; // populate imageStore with a normal 200 first
+    const transformed = await dispatch("message_end", {
+      type: "message_end",
+      message: {
+        role: "user",
+        provider: "umans",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+      },
+    }, makeCtx({ provider: "umans", id: "umans-glm-5.2" }));
+    const analysisText: string = transformed.message.content
+      .find((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))?.text ?? "";
+    const imgIdMatch = analysisText.match(/\[Image analysis \(image:([^\)]+)\)\]/);
+    assert(!!imgIdMatch, `COV10-6: vision handoff produced an image id (got: ${analysisText})`);
+    const imgId = imgIdMatch![1];
+    const probeC0 = createConcurrencyQueue({ stateFile });
+    probeC0.reset();
+
+    // Now drive umans_vision with a content array that has no text block.
+    messagesMode = "analysis-empty";
+    const visionEmpty = await visionTool.execute("call-3", { image_id: imgId, question: "q" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof visionEmpty?.content?.[0]?.text === "string" &&
+      visionEmpty.content[0].text === "(no analysis returned)",
+      `COV10-6: analyzeImage no-text fallback text (got: ${visionEmpty?.content?.[0]?.text})`);
+    const probeC = createConcurrencyQueue({ stateFile });
+    assert(probeC.snapshot().tokenHeld === false, "COV10-6: analyzeImage no-text fallback released the side-call slot");
+    probeC.reset();
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- COV10-2: multi-image transformMessageImages Promise.all path driven through wiring ---
 // transformMessageImages does Promise.all over N image blocks, each calling
 // acquireSlot → join → mutate + analyzeImage (fetch /v1/messages). The
