@@ -88,6 +88,8 @@ export UMANS_VISION_DISABLE="1"               # start with handoff off
 
 Umans enforces a **concurrency soft cap** on in-flight requests per account (e.g. 3–4 on paid plans, with ~2× headroom before hard 429 enforcement). Per the [Umans docs](https://app.umans.ai/offers/code/docs), each 429 **deprioritizes the whole account for ~30 minutes** (requests still go through, just slower), and **>10 concurrency 429s in a day triggers a 5-hour pause**. Because all keys under an account share the counter, a burst of parallel subagents — or several `pi` processes on the same machine — can trip this easily.
 
+Unlike the OpenAI/Anthropic SDKs (which retry 429s reactively with backoff), this provider gates proactively because Umans's 429 penalty is account-wide (~30min deprio) rather than per-request.
+
 This provider ships a **cross-process FIFO queue** to keep you under the soft cap and avoid deprioritization:
 
 - A single file at **`~/.pi/agent/umans-concurrency.json`** (guarded by an `O_EXCL` lockfile + atomic rename) holds a **pure waiter queue + launch token**. No in-flight count lives in the file.
