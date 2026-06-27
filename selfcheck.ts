@@ -3690,4 +3690,226 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- COV9-4/COV8-3: side-call acquireSlot wiring in tool execute bodies driven through real factory ---
+// acquireSlot is a closure (not exported); COV2-H2 simulated the acquire+release
+// pattern directly against createConcurrencyQueue. The real tool execute bodies
+// (umans_web_search, umans_vision) were never driven through the real factory —
+// the harness mocked registerTool as a no-op. A regression dropping acquireSlot
+// from searchWeb/analyzeImage, or assigning side-call's release to
+// mainTurnRelease (ADV4-3/CORR5-3 invariant) would not be caught. CORR8-2
+// side-call-429 wiring tested at helper level but call sites not driven.
+// Fix: capture tool defs in registerTool, dispatch umans_web_search's execute
+// with stubbed fetch 200 (assert acquire+release — token not held after) and
+// 429 (assert shared pause lands — pausedUntil > now, pausedReason === 429).
+// Same for umans_vision's execute (populate imageStore via the via-handoff
+// message_end handler, then drive the tool execute).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov9-4-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  // The main session sets UMANS_SEARCH_DISABLE=1; clear it so umans_web_search
+  // registers + its execute body drives acquireSlot.
+  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
+  delete process.env.UMANS_SEARCH_DISABLE;
+
+  const realFetch = globalThis.fetch;
+  // messagesStatus controls what /v1/messages returns: 200 (valid analysis) or 429.
+  let messagesStatus = 200;
+  let usageCalls = 0;
+  let messagesCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      messagesCalls++;
+      if (messagesStatus === 429) {
+        return Promise.resolve(new Response("{\"error\":\"rate limited\"}", {
+          status: 429, headers: { "retry-after": "60", "Content-Type": "application/json" },
+        }));
+      }
+      // 200 — valid Anthropic-shaped analysis/search result.
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "analysis result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    // /v1/models/info -> non-OK so the factory falls back to STATIC_CATALOG
+    // (which has via-handoff models so umans_vision registers).
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgets = new Map<string, any>();
+    const statuses = new Map<string, any>();
+    const notifications: { msg: string; type: string }[] = [];
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {},
+      registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (k: string, c: any) => { widgets.set(k, c); },
+          setStatus: (k: string, t: string | undefined) => { statuses.set(k, t); },
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<any> {
+      const hs = handlers.get(event);
+      if (!hs) return undefined;
+      // Return the first truthy result (message_end has two handlers: the
+      // via-handoff transform returns {message}; the main-turn release returns
+      // undefined — we want the transform's result).
+      let result: any;
+      for (const h of hs) {
+        const r = await h(payload, ctx ?? makeCtx());
+        if (r !== undefined && result === undefined) result = r;
+      }
+      return result;
+    }
+    await umansFactory(pi as any);
+
+    // umans_web_search must have been registered with an execute fn.
+    assert(tools.has("umans_web_search"), "COV9-4: umans_web_search tool registered through wiring");
+    const searchTool = tools.get("umans_web_search")!;
+
+    // (a) umans_web_search execute with fetch 200: acquireSlot joins + claims the
+    // token, searchWeb fetches /v1/messages (200), finally releaseSlot frees
+    // the token. After execute returns, the token must NOT be held (acquire+
+    // release wired through). acquireSlot polled /usage (proves the real
+    // capacity-free path ran, not a stubbed queue).
+    messagesStatus = 200;
+    usageCalls = 0;
+    const searchRes200 = await searchTool.execute("call-1", { query: "latest news" }, new AbortController().signal, undefined, makeCtx());
+    assert(usageCalls > 0, "COV9-4: web_search 200 drove acquireSlot /v1/usage poll through wiring");
+    assert(typeof searchRes200?.content?.[0]?.text === "string" && searchRes200.content[0].text.length > 0,
+      "COV9-4: web_search 200 returned result text");
+    // Token must be released after the side-call completes (acquire+release).
+    const probeA = createConcurrencyQueue({ stateFile });
+    assert(probeA.snapshot().tokenHeld === false,
+      "COV9-4: web_search 200 released the side-call slot (token not held after)");
+    probeA.reset();
+
+    // (b) umans_web_search execute with fetch 429: searchWeb sees 429, calls
+    // handle429(res, concurrencyQueue) which writes the shared pause, then
+    // throws (caught by execute's catch). The finally releaseSlot still frees
+    // the token. Assert the shared pause landed (pausedUntil > now, pausedReason
+    // === PAUSE_REASON_429) + token not held after.
+    messagesStatus = 429;
+    const before429 = Date.now();
+    const searchRes429 = await searchTool.execute("call-2", { query: "will 429" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof searchRes429?.content?.[0]?.text === "string" && searchRes429.content[0].text.includes("429"),
+      `COV9-4: web_search 429 returned error text mentioning 429 (got: ${searchRes429?.content?.[0]?.text})`);
+    const rawB = readFileSync(stateFile, "utf8");
+    const parsedB = JSON.parse(rawB);
+    assert(parsedB.pausedUntil > before429, "COV9-4: web_search 429 set pausedUntil > now (shared pause landed)");
+    assert(parsedB.pausedReason === PAUSE_REASON_429, "COV9-4: web_search 429 tagged PAUSE_REASON_429");
+    const probeB = createConcurrencyQueue({ stateFile });
+    assert(probeB.snapshot().tokenHeld === false,
+      "COV9-4: web_search 429 released the side-call slot (token not held after 429)");
+    probeB.clearPause({ force: true });
+    probeB.reset();
+
+    // (c) umans_vision execute: first populate imageStore by dispatching the
+    // via-handoff message_end handler with a user message containing an image
+    // block. This drives transformMessageImages -> acquireSlot + analyzeImage
+    // (fetch /v1/messages 200) -> imageStore.set(id, ...). The returned
+    // transformed message text carries the image id.
+    messagesStatus = 200;
+    messagesCalls = 0;
+    const transformed = await dispatch("message_end", {
+      type: "message_end",
+      message: {
+        role: "user",
+        provider: "umans",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+      },
+    }, makeCtx({ provider: "umans", id: "umans-glm-5.2" })); // via-handoff model
+    assert(messagesCalls > 0, "COV9-4: vision handoff drove analyzeImage /v1/messages fetch (acquireSlot wired)");
+    assert(transformed?.message?.content, "COV9-4: vision handoff returned a transformed message");
+    // Extract the image id from the [Image analysis (image:ID)]: text block.
+    const analysisText: string = transformed.message.content
+      .find((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))?.text ?? "";
+    const imgIdMatch = analysisText.match(/\[Image analysis \(image:([^\)]+)\)\]/);
+    assert(!!imgIdMatch, `COV9-4: vision handoff produced an image id in the analysis text (got: ${analysisText})`);
+    const imgId = imgIdMatch![1];
+    // The token must be released after the handoff side-call completes.
+    const probeC = createConcurrencyQueue({ stateFile });
+    assert(probeC.snapshot().tokenHeld === false,
+      "COV9-4: vision handoff released the side-call slot (token not held after)");
+    probeC.reset();
+
+    // umans_vision must have been registered (catalog has a via-handoff model).
+    assert(tools.has("umans_vision"), "COV9-4: umans_vision tool registered through wiring");
+    const visionTool = tools.get("umans_vision")!;
+
+    // (d) umans_vision execute with fetch 200: acquireSlot + analyzeImage (200)
+    // + releaseSlot. Assert token not held after.
+    messagesStatus = 200;
+    const visionRes200 = await visionTool.execute("call-3", { image_id: imgId, question: "describe it" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof visionRes200?.content?.[0]?.text === "string" && visionRes200.content[0].text.length > 0,
+      "COV9-4: vision 200 returned result text");
+    const probeD = createConcurrencyQueue({ stateFile });
+    assert(probeD.snapshot().tokenHeld === false,
+      "COV9-4: vision 200 released the side-call slot (token not held after)");
+    probeD.reset();
+
+    // (e) umans_vision execute with fetch 429: analyzeImage sees 429, calls
+    // handle429 -> shared pause lands. Assert pausedUntil > now + 429 tag.
+    messagesStatus = 429;
+    const before429v = Date.now();
+    const visionRes429 = await visionTool.execute("call-4", { image_id: imgId, question: "will 429" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof visionRes429?.content?.[0]?.text === "string" && visionRes429.content[0].text.includes("429"),
+      `COV9-4: vision 429 returned error text mentioning 429 (got: ${visionRes429?.content?.[0]?.text})`);
+    const rawE = readFileSync(stateFile, "utf8");
+    const parsedE = JSON.parse(rawE);
+    assert(parsedE.pausedUntil > before429v, "COV9-4: vision 429 set pausedUntil > now (shared pause landed)");
+    assert(parsedE.pausedReason === PAUSE_REASON_429, "COV9-4: vision 429 tagged PAUSE_REASON_429");
+    const probeE = createConcurrencyQueue({ stateFile });
+    assert(probeE.snapshot().tokenHeld === false,
+      "COV9-4: vision 429 released the side-call slot (token not held after 429)");
+    probeE.clearPause({ force: true });
+    probeE.reset();
+
+    // Dispatch session_shutdown to stop the factory's refresh loop + clear state.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 console.log("\nall checks passed");
