@@ -1706,9 +1706,10 @@ export default async function (pi: ExtensionAPI) {
   // slot). NOTE: message_end fires at CLIENT-side stream completion, which
   // precedes the server's concurrent_sessions decrement by a network RTT +
   // cleanup lag, so the next waiter's /usage poll can transiently see stale
-  // (too-low) capacity and launch 1-2 over `limit`. That overshoot stays within
-  // the documented burst headroom (hard_cap) -> no 429, no deprioritization
-  // (CORR2-1; see isCapacityFree). The launch token serializes the /usage poll
+  // (too-low) capacity and launch 1-2 over `limit`. The gate compares against
+  // `limit` (the soft cap), NOT `hard_cap`, so the burst headroom (hard_cap -
+  // limit) absorbs that overshoot → no 429, no deprioritization
+  // (see isCapacityFree). The launch token serializes the /usage poll
   // (no thundering-herd). The message_end release is the PRIMARY path;
   // turn_end and agent_end are safety nets for turns that error before
   // message_end fires.
@@ -1770,7 +1771,8 @@ export default async function (pi: ExtensionAPI) {
     // headers (the server hasn't registered the request as in-flight until the
     // body streams). message_end frees the slot during tool execution too; the
     // release race (message_end precedes the server decrement) is absorbed by
-    // the hard_cap burst headroom (CORR2-1). turn_end and agent_end are safety
+    // the burst headroom (hard_cap - limit) since the gate compares against
+    // `limit`, not `hard_cap`. turn_end and agent_end are safety
     // nets for turns that never reach message_end.
     // ADV12-2: wrap acquireSlot in try/catch so a wedged lock (ADV12-1
     // future-dated mtime) or transient disk error (EACCES/ENOSPC/EROFS/ENOENT
@@ -1918,9 +1920,10 @@ export default async function (pi: ExtensionAPI) {
     // concurrency slot). NOTE: message_end fires at CLIENT-side stream
     // completion, which PRECEDES the server's concurrent_sessions decrement by a
     // network RTT + cleanup lag, so the next waiter's /usage poll can
-    // transiently see stale capacity and launch 1-2 over `limit`; that overshoot
-    // stays within the documented burst headroom (hard_cap) -> no 429, no
-    // deprioritization (CORR2-1; see isCapacityFree). turn_end and agent_end
+    // transiently see stale capacity and launch 1-2 over `limit`; the gate
+    // compares against `limit` (not `hard_cap`) so the burst headroom
+    // (hard_cap - limit) absorbs that overshoot → no 429, no
+    // deprioritization (see isCapacityFree). turn_end and agent_end
     // remain as safety nets for turns that never reach here.
     releaseMainTurn();
     const req = liveRequest;

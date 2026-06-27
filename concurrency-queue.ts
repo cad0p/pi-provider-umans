@@ -27,8 +27,9 @@
  *   at CLIENT-side stream completion, which precedes the server's
  *   concurrent_sessions decrement by a network RTT + cleanup lag, so the next
  *   waiter's /usage poll can transiently see stale capacity and launch 1-2
- *   over `limit`. That overshoot stays within the documented burst headroom
- *   (hard_cap) -> no 429, no deprioritization (see isCapacityFree / CORR2-1).
+ *   over `limit`. The gate compares against `limit` (the soft cap), NOT
+ *   `hard_cap`, so the burst headroom (hard_cap - limit) absorbs that
+ *   overshoot → no 429, no deprioritization (see isCapacityFree).
  *   The launch token still serializes the /usage poll (no thundering-herd of
  *   polls all seeing stale capacity). The watchdog (reapStale, 120s token
  *   cap) reclaims a crashed/aborted holder; the AbortSignal plumbed through
@@ -107,8 +108,8 @@ export interface QueueConfig {
 const DEFAULT_STATE_FILE = `${homedir()}/.pi/agent/umans-concurrency.json`;
 // CORR2-3 / CMP-MED-4: 120s comfortably exceeds long streaming turns (xhigh/max
 // thinking, long outputs, slow TTFT). The watchdog is a LAST RESORT (dead PID
-// or truly hung process), not a tight bound on legitimate turns — the hard_cap
-// burst headroom (CORR2-1) absorbs any transient over-limit from a reaped
+// or truly hung process), not a tight bound on legitimate turns — the burst
+// headroom (hard_cap - limit) absorbs any transient over-limit from a reaped
 // token. 30s was too tight and reaped tokens held by legitimately long streaming
 // turns, racing a sibling launch the same way as the message_end release race.
 const DEFAULT_STALE_TOKEN_MS = 120_000;
@@ -277,11 +278,12 @@ interface CapacitySnapshot {
   limit: number | undefined;
   /**
    * Account-wide hard burst cap (the threshold at which Umans actually returns
-   * 429s / deprioritizes). When present, the gate compares against this instead
-   * of `limit` so the documented burst headroom (burst_pct, e.g. limit=4 /
-   * hard_cap=8 on Code Max) absorbs the message_end release race (CORR2-1) and
-   * server-side concurrent_sessions accounting noise (ADV2-F3). Falls back to
-   * `limit` when absent (e.g. unlimited plans, older API responses).
+   * 429s / deprioritizes). The gate compares against `limit` (the soft cap)
+   * first, NOT `hard_cap` — the burst headroom (hard_cap - limit) exists to
+   * absorb the message_end release race + server-side accounting noise, so
+   * gating to `limit` keeps that headroom intact. `hard_cap` is the fallback
+   * when the API reports only `hard_cap` (older API) or when a local env
+   * override is absent.
    */
   hardCap: number | undefined;
   priority: PriorityState;
@@ -307,25 +309,22 @@ interface CapacityInputs {
  *   BEFORE the unlimited short-circuit so Code Max still pushes the pause).
  * - If /usage is unreachable (snap === null) → free (trust headroom rather
  *   than block forever; the queue still serializes launches via the token).
- * - If concurrent_sessions >= hardCap (or limit when hardCap absent, or
+ * - If concurrent_sessions >= limit (or hardCap when limit absent, or
  *   inputs.limit when both snap caps are absent) → not free. CORR8-1 (HIGH):
  *   an unlimited plan (inputs.limit === undefined) is NO LONGER a short-
- *   circuit — when snap.hardCap is present the gate compares against it so a
- *   Code Max account can't trip the account-wide burst cap; only when ALL
- *   caps are undefined (true unlimited with no burst cap reported) is the
- *   gate free (no cap to exceed).
+ *   circuit — the cap check below runs so a Code Max account can't trip the
+ *   account-wide burst cap; only when ALL caps are undefined (true unlimited
+ *   with no burst cap reported) is the gate free (no cap to exceed).
  * - Otherwise → free.
  *
- * CORR2-1: the gate's PURPOSE is to prevent 429s, which hit at `hard_cap`, not
- * `limit`. message_end releases at client-side stream completion, which
- * PRECEDES the server's concurrent_sessions decrement by a network RTT +
- * cleanup lag, so the next waiter's /usage poll can transiently see stale
- * (too-low) capacity and launch 1-2 over `limit`. That overshoot stays within
- * the documented burst headroom (hard_cap) → no 429, no deprioritization. The
- * launch token still serializes the /usage poll (no thundering-herd), and the
- * message_end release frees the slot for tool-execution parallelism. Gating to
- * hard_cap also absorbs server-side concurrent_sessions accounting noise
+ * The gate compares against `limit` (the soft cap), NOT `hard_cap` (the 429
+ * threshold). The message_end release race can transiently push
+ * concurrent_sessions 1-2 over the gate before the server decrements;
+ * gating to `limit` leaves the full burst headroom (hard_cap - limit) to
+ * absorb that race + server-side concurrent_sessions accounting noise
  * (ADV2-F3: the counter oscillates ±1 during a single serialized turn).
+ * Gating to `hard_cap` would leave zero headroom — the race would
+ * immediately push past hard_cap → 429 → deprioritization.
  */
 export function isCapacityFree(
   snap: CapacitySnapshot | null,
@@ -340,21 +339,28 @@ export function isCapacityFree(
   }
   // CORR8-1 (HIGH): the unlimited-plan short-circuit (inputs.limit ===
   // undefined) used to return { free: true } BEFORE evaluating
-  // concurrent_sessions against hard_cap — contradicting D5 ("When hard_cap is
-  // present, the gate compares against it; when absent, it falls back to
-  // limit"). hard_cap is the actual 429 threshold, and an unlimited plan
-  // (Code Max, limit undefined) still trips the account-wide burst cap. We
-  // dropped the short-circuit; the cap check below handles all cases: when
-  // hard_cap (or limit) is present, gate against it; when ALL of
-  // snap.hardCap / snap.limit / inputs.limit are undefined (a true unlimited
-  // plan with no burst cap reported), `cap` is undefined and we return free
-  // (no cap to exceed — correct). The `!snap` (usage-unreachable) check stays
-  // before the cap check so we trust headroom rather than block forever.
+  // concurrent_sessions against the cap — contradicting D5. An unlimited
+  // plan (Code Max, limit undefined) still trips the account-wide burst cap,
+  // so the cap check below must run. It gates against `limit` first (the
+  // soft cap), falling back to `hard_cap` then `inputs.limit`; when ALL are
+  // undefined (a true unlimited plan with no burst cap reported), `cap` is
+  // undefined and we return free (no cap to exceed — correct). The `!snap`
+  // (usage-unreachable) check stays before the cap check so we trust
+  // headroom rather than block forever.
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
   const cur = snap.concurrentSessions ?? 0;
-  // CORR2-1: prefer hard_cap (the 429 threshold) over limit; fall back to
-  // limit when the API did not report a hard_cap.
-  const cap = snap.hardCap ?? snap.limit ?? inputs.limit;
+  // Gate against `limit` (the soft cap), NOT `hard_cap` (the 429 threshold).
+  // The message_end release race can transiently push concurrent_sessions
+  // 1-2 over the gate before the server decrements. Gating to `limit` leaves
+  // the full burst headroom (hard_cap - limit) to absorb that race; gating to
+  // `hard_cap` leaves zero headroom, so the race immediately pushes past
+  // hard_cap → 429 → deprioritization.
+  //
+  // Precedence: inputs.limit (the env override UMANS_CONCURRENCY_LIMIT, for
+  // testing with a lower value) takes precedence over the server's reported
+  // limit, which in turn takes precedence over the server's hard_cap (fallback
+  // when the API reports only hard_cap, e.g. older API responses).
+  const cap = inputs.limit ?? snap.limit ?? snap.hardCap;
   if (cap !== undefined && cur >= cap) return { free: false };
   return { free: true };
 }

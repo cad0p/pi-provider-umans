@@ -100,8 +100,9 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 
 // --- COV-HIGH-1: isCapacityFree decision logic (extracted from acquireSlot) ---
 // Covers: unlimited-plan short-circuit, /usage-unreachable fallback, shared
-// pause (C2), at-cap, under-cap, priority.low → repause, hard_cap gating
-// (CORR2-1), and unlimited + priority.low repause (CORR2-2).
+// pause (C2), at-cap, under-cap, priority.low → repause, limit gating
+// (the gate compares against `limit` the soft cap, not `hard_cap`),
+// and unlimited + priority.low repause (CORR2-2).
 {
   const lowState = { low: true, until: 1_000_000, reason: "burst" };
   const okState = { low: false, until: 0, reason: null };
@@ -137,29 +138,29 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     { limit: 2, queuePaused: true },
   ).free === false, "isCapacityFree: shared pause active → not free");
 
-  // CORR2-1: hard_cap gating. cur between limit and hard_cap → free (the gate
-  // prevents 429s, which hit at hard_cap, not limit). The message_end release
-  // race can transiently push concurrent_sessions 1-2 over limit but within the
-  // burst headroom (hard_cap); gating to hard_cap absorbs that + server-side
-  // accounting noise (ADV2-F3).
+  // The gate compares against `limit` (the soft cap), NOT `hard_cap` (the 429
+  // threshold). The burst headroom (hard_cap - limit) exists to absorb the
+  // message_end release race + server-side accounting noise — gating to
+  // `limit` keeps that headroom intact; gating to `hard_cap` would leave zero
+  // headroom and the race would push past hard_cap → 429.
   assert(isCapacityFree(
     { concurrentSessions: 3, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === true, "CORR2-1: cur (3) between limit (2) and hard_cap (4) → free (burst headroom)");
+  ).free === false, "gate to limit: cur (3) >= limit (2) → not free (hard_cap headroom preserved for race)");
   assert(isCapacityFree(
     { concurrentSessions: 4, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "CORR2-1: cur (4) at hard_cap (4) → not free (429 threshold)");
+  ).free === false, "gate to limit: cur (4) >= limit (2) → not free");
   assert(isCapacityFree(
     { concurrentSessions: 5, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "CORR2-1: cur (5) over hard_cap (4) → not free");
+  ).free === false, "gate to limit: cur (5) over limit (2) → not free");
 
   // hard_cap absent (older API / unlimited) → falls back to limit.
   assert(isCapacityFree(
     { concurrentSessions: 2, limit: 2, hardCap: undefined, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "CORR2-1: hard_cap absent → falls back to limit (cur === limit → not free)");
+  ).free === false, "gate to limit: hard_cap absent → uses limit (cur === limit → not free)");
 
   // At cap (cur >= cap) → not free (legacy path: hard_cap absent, cap = limit)
   assert(isCapacityFree(
@@ -181,28 +182,32 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   assert(low.free === false && low.repause?.until === 1_000_000 && low.repause?.reason === "burst",
     "isCapacityFree: priority.low → not free + repause with until/reason");
 
-  // Server-reported hard_cap overrides the local limit when smaller (cap = snap.hardCap ?? snap.limit ?? limit)
+  // Local inputs.limit (env override) takes precedence over server snap.limit
+  // (cap = inputs.limit ?? snap.limit ?? snap.hardCap) — UMANS_CONCURRENCY_LIMIT
+  // is for testing with a lower value than the server reports.
   assert(isCapacityFree(
-    { concurrentSessions: 1, limit: 4, hardCap: 1, priority: okState },
+    { concurrentSessions: 1, limit: 4, hardCap: 8, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === false, "CORR2-1: server hard_cap (1) < local limit (2) → at cap");
+  ).free === true, "gate to limit: local override (2) < server limit (4) → uses local (cur 1 < 2 → free)");
+  assert(isCapacityFree(
+    { concurrentSessions: 4, limit: 4, hardCap: 8, priority: okState },
+    { limit: 2, queuePaused: false },
+  ).free === false, "gate to limit: local override (2) < server limit (4) → cur (4) >= local (2) → not free");
 
   // CORR8-1 (HIGH): unlimited-plan path (inputs.limit === undefined) must
-  // NOT short-circuit before the hard_cap gate. hard_cap is the actual 429
-  // threshold; an unlimited plan (Code Max) can still trip the account-wide
-  // burst cap. Previously isCapacityFree returned { free: true } before
-  // evaluating concurrent_sessions against hard_cap — the gate would launch a
-  // request the server 429s (probe-confirmed: limit=undefined, hardCap=8,
-  // concurrentSessions=10 → free: true). Now the cap check runs: at/over
-  // hard_cap → not free; under hard_cap (or all caps undefined) → free.
+  // NOT short-circuit before the cap gate. An unlimited plan (Code Max) can
+  // still trip the account-wide burst cap, so the cap check below runs. When
+  // `limit` is absent from the snapshot, the gate falls back to `hard_cap`;
+  // when ALL caps are undefined (true unlimited with no burst cap reported),
+  // the gate is free (no cap to exceed).
   assert(isCapacityFree(
     { concurrentSessions: 10, limit: undefined, hardCap: 8, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === false, "CORR8-1: unlimited plan (limit undefined) + cur (10) at/over hard_cap (8) → not free (D5)");
+  ).free === false, "CORR8-1: unlimited plan (limit undefined) + cur (10) >= hard_cap (8) → not free (D5)");
   assert(isCapacityFree(
     { concurrentSessions: 5, limit: undefined, hardCap: 8, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === true, "CORR8-1: unlimited plan (limit undefined) + cur (5) under hard_cap (8) → free");
+  ).free === true, "CORR8-1: unlimited plan (limit undefined) + cur (5) < hard_cap (8) → free (falls back to hard_cap)");
   // True unlimited (all caps undefined) → free (no cap to exceed).
   assert(isCapacityFree(
     { concurrentSessions: 999, limit: undefined, hardCap: undefined, priority: okState },
