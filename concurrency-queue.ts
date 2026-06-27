@@ -726,7 +726,18 @@ function writeStateAtomic(path: string, state: QueueState): void {
   } finally {
     try { closeSync(fd); } catch { /* best-effort */ }
   }
-  renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
+  // ADV10-2: wrap renameSync in try/catch so a throw (EISDIR, EXDEV) unlinks
+  // the .tmp before re-throwing. Without this the temp file leaks on disk
+  // (reaped after 10s by reapStaleTmps, but accumulates under sustained
+  // failure — e.g. a planted directory at `path` makes every renameSync throw
+  // EISDIR, leaking a .tmp per mutate). Probe-confirmed. unlinkSync errors are
+  // swallowed (best-effort; the reaper is the safety net).
+  try {
+    renameSync(tmp, path); // atomic on POSIX & Windows; rename preserves the temp's 0600 mode
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* best-effort: reaper will clean up */ }
+    throw err;
+  }
 }
 
 /**

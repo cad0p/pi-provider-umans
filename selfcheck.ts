@@ -3613,6 +3613,36 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- ADV10-2: writeStateAtomic unlinks .tmp on renameSync failure ---
+// When renameSync throws (EISDIR when `path` is a directory, EXDEV across
+// filesystems), the .tmp file leaked on disk. Reaped after 10s by reapStaleTmps
+// but accumulates under sustained failure. writeStateAtomic now wraps renameSync
+// in try/catch that unlinks the temp on failure before re-throwing. We force
+// EISDIR by making the state path a directory (so renameSync(tmp, path) throws)
+// + assert no .tmp is left on disk after the throw.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-adv10-2-"));
+  const stateFile = join(dir, "state.json");
+  const { mkdirSync, readdirSync } = await import("node:fs");
+  // Make `path` a directory so renameSync(tmp, path) throws EISDIR (cannot
+  // rename a file over a directory).
+  mkdirSync(stateFile, { mode: 0o700 });
+  const q = createConcurrencyQueue({ stateFile });
+  let threw = false;
+  try {
+    q.pauseUntil(Date.now() + 1_000, "ADV10-2 probe");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "ADV10-2: writeStateAtomic threw when state path is a directory (renameSync EISDIR)");
+  // No .tmp file may be left on disk (the catch unlinked it before re-throwing).
+  const leftover = readdirSync(dir).filter((n: string) => n.endsWith(".tmp"));
+  assert(leftover.length === 0,
+    `ADV10-2: no .tmp leaked on renameSync failure (left ${leftover.length} .tmp file(s))`);
+  q.reset();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- SEC8-2/SEC9-6: reapStaleTmps uses lstatSync (symlink .tmp unlinked, not followed) ---
 // A symlink .tmp → /etc/passwd must be unlinked directly without following the
 // link (matching the lockfile's SEC7-1 posture). lstatSync detects non-regular
