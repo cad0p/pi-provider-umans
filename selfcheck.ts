@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, sanitizeErrorBody, handle429 } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, countdown, sanitizeErrorBody, handle429 } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -2325,24 +2325,30 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     assert(handlers.has("session_shutdown"), "COV7-1: session_shutdown handler registered");
 
     // (a) before_provider_request: acquireSlot joins + claims token + polls
-    // /usage (free) -> mainTurnRelease is set. The token must be held in the
-    // shared state file (a sibling queue would see tokenHeld via snapshot).
-    // The state file is written by acquireSlot's join + waitForLaunch.
+    // /usage (free) -> token released immediately (throughput fix: the token
+    // serializes the /usage POLL, not the send; releasing it immediately lets
+    // the next head poll + launch, achieving limit-concurrent saturation).
+    // After acquireSlot returns, the token is NOT held (already released);
+    // the waiter entry may still be present briefly (cleaned by the returned
+    // release fn or the watchdog).
     await dispatch("before_provider_request", makeCtx());
     // Give the poll a moment (acquireSlot awaits waitForLaunch + capacityFree).
     await new Promise((r) => setTimeout(r, 50));
+    // Throughput fix: the token is released immediately after the capacity
+    // check passes (not held across the send). We can't assert tokenHeld
+    // anymore; instead assert the queue state is clean (no wedge).
     const probeQ = createConcurrencyQueue({ stateFile });
-    assert(probeQ.snapshot().tokenHeld === true || probeQ.snapshot().queued >= 1,
-      "COV7-1: before_provider_request acquired a slot (token held or queued)");
+    assert(probeQ.snapshot().tokenHeld === false || probeQ.snapshot().queued >= 1,
+      "COV7-1: before_provider_request completed (token released immediately for throughput; not held across send)");
     probeQ.reset();
 
-    // (b) message_end with an Umans assistant message: releases the main-turn
-    // slot (mainTurnRelease cleared). After this, turn_end/agent_end are no-ops.
+    // (b) message_end with an Umans assistant message: the main-turn release
+    // is a no-op (token already released at acquireSlot). After this, the
+    // queue state stays clean.
     await dispatch("message_end", makeCtx({ model: { provider: "umans", id: "umans-flash" } }));
-    // The token must be released (no longer held by this process).
     const probeQ2 = createConcurrencyQueue({ stateFile });
     assert(probeQ2.snapshot().tokenHeld === false,
-      "COV7-1: message_end released the main-turn slot (token freed)");
+      "COV7-1: message_end is a no-op (token already released at acquireSlot for throughput)");
     probeQ2.reset();
 
     // (c) turn_end + agent_end AFTER message_end are no-ops (token already
@@ -2441,25 +2447,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     }
     await umansFactory(pi as any);
 
-    // First before_provider_request acquires a slot.
+    // First before_provider_request acquires a slot. Throughput fix: the
+    // token is released immediately after the capacity check (not held across
+    // the send), so we can't assert tokenHeld. Assert the queue state is clean
+    // (no wedge) + our waiter is gone (immediate release).
     await dispatch("before_provider_request");
     await new Promise((r) => setTimeout(r, 50));
     const probe1 = createConcurrencyQueue({ stateFile });
     const s1 = probe1.snapshot();
-    assert(s1.tokenHeld === true || s1.queued >= 1,
-      "CORR8-3: first before_provider_request acquired a slot");
+    assert(s1.tokenHeld === false || s1.queued >= 1,
+      "CORR8-3: first before_provider_request completed (token released immediately for throughput)");
+    probe1.reset();
 
-    // Release the first slot via message_end. The CORR8-3 guard
-    // (releaseSlot(mainTurnRelease) before overwriting) is a defensive check
-    // for same-turn retry — but a real retry would deadlock (acquireSlot
-    // waits for the token the first dispatch holds). So we test the normal
-    // release flow: message_end releases the slot. Assert no orphaned waiter
-    // remains for this process.
+    // message_end is a no-op (token already released at acquireSlot). Assert
+    // no orphaned waiter remains for this process.
     await dispatch("message_end", { type: "message_end", message: { role: "assistant", provider: "umans" } });
     await new Promise((r) => setTimeout(r, 50));
     const probeMid = createConcurrencyQueue({ stateFile });
     assert(probeMid.snapshot().tokenHeld === false,
-      "CORR8-3: message_end released the first slot");
+      "CORR8-3: message_end is a no-op (token already released at acquireSlot for throughput)");
     // No orphaned waiter entry for this process after release.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
@@ -3383,25 +3389,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     queueSnap: { queued: 2, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
     now,
   }).includes("q 2*"), "COV7-10: queued + not tokenHeld -> q N (no star)");
-  // paused -> PAUSED until HH:MMZ (reason). 30s from now = 1_700_000_030_000.
+  // paused -> PAUSED +countdown (reason). 30s from now = 1_700_000_030_000.
   const pausedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now + 30_000, pausedReason: "HTTP 429 from gateway" },
     now,
   });
-  assert(pausedText.includes("PAUSED until ") && pausedText.includes("Z (HTTP 429 from gateway)"),
-    "COV7-10: paused -> PAUSED until HH:MMZ (reason): got: " + pausedText);
-  // Verify the HH:MM format (5 chars + Z, e.g. "12:34Z").
-  assert(/PAUSED until \d{2}:\d{2}Z/.test(pausedText),
-    "COV7-10: paused renders HH:MMZ absolute time");
-  // paused with elapsed pausedUntil -> clamps to current minute (not future-past).
+  assert(pausedText.includes("PAUSED") && pausedText.includes("30s") && pausedText.includes("(HTTP 429 from gateway)"),
+    "COV7-10: paused -> PAUSED +countdown (reason): got: " + pausedText);
+  // Verify the countdown format (e.g. "30s", " 5m04s", " 3h12m").
+  assert(/PAUSED \d+s|PAUSED \d+m\d{2}s|PAUSED \d+h\d{2}m/.test(pausedText),
+    "COV7-10: paused renders countdown (seconds/minutes/hours)");
+  // paused with elapsed pausedUntil -> countdown shows 0s (already cleared).
   const elapsedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 0, tokenHeld: false, paused: true, pausedUntil: now - 5_000, pausedReason: null },
     now,
   });
-  assert(elapsedText.includes("PAUSED until ") && /PAUSED until \d{2}:\d{2}Z/.test(elapsedText),
-    "COV7-10: elapsed pause -> clamps to current minute (not negative): got: " + elapsedText);
+  assert(elapsedText.includes("PAUSED") && elapsedText.includes("0s"),
+    "COV7-10: elapsed pause -> countdown 0s (not negative): got: " + elapsedText);
   // strikes24h -> Strikes X/20 part.
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
@@ -3414,15 +3420,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(!formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
   }).includes("Strikes"), "COV7-10: no strikes24h -> no Strikes part (undefined)");
-  // deprioritized -> DEPRIO banner.
+  // deprioritized -> DEPRIO +countdown banner.
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
-    deprioritized: true,
+    deprioritized: true, priorityUntil: now + 3_600_000, now,
   }).includes("DEPRIO"), "COV7-10: deprioritized -> DEPRIO banner");
+  assert(formatStatusText({
+    effectiveLimit: 2, currentConcurrency: 1,
+    deprioritized: true, priorityUntil: now + 3_600_000, now,
+  }).includes("1h00m"), "COV7-10: DEPRIO shows countdown (1h00m for 1h remaining)");
   assert(!formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
-    deprioritized: false,
+    deprioritized: false, priorityUntil: undefined, now,
   }).includes("DEPRIO"), "COV7-10: not deprioritized -> no DEPRIO banner");
+  // countdown() helper unit tests.
+  assert(countdown(now + 3_600_000, now) === " 1h00m", "countdown: 1h -> ' 1h00m'");
+  assert(countdown(now + 45_000, now) === " 45s", "countdown: 45s -> ' 45s'");
+  assert(countdown(now + 90_000, now) === " 1m30s", "countdown: 90s -> ' 1m30s'");
+  assert(countdown(now - 1_000, now) === " 0s", "countdown: past -> ' 0s'");
+  assert(countdown(undefined, now) === "", "countdown: undefined -> ''");
   // empty queue (queued 0, not held, not paused) -> no queue part.
   const empty = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,

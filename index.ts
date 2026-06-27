@@ -451,12 +451,33 @@ export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string
 }
 
 /**
+ * Formats a human-readable countdown to a future deadline (e.g. " 3h12m",
+ * " 45m", " 2s", " 0s"). Returns "" for past deadlines (already cleared).
+ * Used by the DEPRIO + PAUSED status-bar banners so the user sees how long
+ * until the state clears without mental arithmetic.
+ */
+export function countdown(untilMs: number | undefined, now?: number): string {
+  if (untilMs === undefined) return "";
+  const nowMs = now ?? Date.now();
+  const remainingMs = untilMs - nowMs;
+  if (remainingMs <= 0) return " 0s";
+  const totalSec = Math.floor(remainingMs / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  if (h > 0) return ` ${h}h${String(m).padStart(2, "0")}m`;
+  if (m > 0) return ` ${m}m${String(s).padStart(2, "0")}s`;
+  return ` ${s}s`;
+}
+
+/**
  * COV7-10: pure formatter for the status-bar text, extracted from the
  * `statusText` closure so the rendering (TTFT/TPS, Conc current/guaranteed,
- * Req, q N*, STRIKES X/20, DEPRIO, PAUSED until HH:MMZ (reason)) is unit-testable
- * without the pi runtime. The closure in index.ts builds the inputs
- * (effectiveLimit, currentConcurrency, requestLimit/Used, the queue snapshot,
- * concurrencyDisabled, strikes24h, deprioritized) + delegates to this helper.
+ * Req, q N*, STRIKES X/20, DEPRIO +countdown, PAUSED +countdown (reason)) is
+ * unit-testable without the pi runtime. The closure in index.ts builds the
+ * inputs (effectiveLimit, currentConcurrency, requestLimit/Used, the queue
+ * snapshot, concurrencyDisabled, strikes24h, deprioritized, priorityUntil)
+ * + delegates to this helper.
  */
 export function formatStatusText(opts: {
   metrics?: { ttft?: number; tps?: number };
@@ -468,10 +489,11 @@ export function formatStatusText(opts: {
   concurrencyDisabled?: boolean;
   strikes24h?: number;
   deprioritized?: boolean;
+  priorityUntil?: number;
   now?: number;
 }): string {
   const parts: string[] = [];
-  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, strikes24h, deprioritized, now } = opts;
+  const { metrics, effectiveLimit, currentConcurrency, requestLimit, requestsUsed, queueSnap, concurrencyDisabled, strikes24h, deprioritized, priorityUntil, now } = opts;
   if (metrics?.ttft !== undefined) parts.push(`TTFT ${metrics.ttft}ms`);
   if (metrics?.tps !== undefined) parts.push(`TPS ${metrics.tps}`);
   const guaranteed = effectiveLimit !== undefined ? String(effectiveLimit) : "?";
@@ -481,21 +503,18 @@ export function formatStatusText(opts: {
     parts.push(`Req ${requestsUsed}/${requestLimit}`);
   }
   if (deprioritized) {
-    parts.push("DEPRIO");
+    // Show countdown until deprioritization clears (boxed_until).
+    const remaining = countdown(priorityUntil, now);
+    parts.push(`DEPRIO${remaining}`);
   }
   if (!concurrencyDisabled && queueSnap) {
     if (queueSnap.queued > 0 || queueSnap.tokenHeld) {
       parts.push(`q ${queueSnap.queued}${queueSnap.tokenHeld ? "*" : ""}`);
     }
     if (queueSnap.paused) {
-      // Render the pause deadline as an absolute UTC time (HH:MMZ) so the user
-      // knows exactly when deprioritization clears without mental arithmetic.
-      // Clamp to the current minute so an elapsed pause (pausedUntil <= now)
-      // renders the current time, not a future-past time.
-      const untilMs = Math.max((now ?? Date.now()), queueSnap.pausedUntil);
-      const hhmm = new Date(untilMs).toISOString().slice(11, 16) + "Z";
+      const remaining = countdown(queueSnap.pausedUntil, now);
       const reason = queueSnap.pausedReason ? ` (${queueSnap.pausedReason})` : "";
-      parts.push(`PAUSED until ${hhmm}${reason}`);
+      parts.push(`PAUSED${remaining}${reason}`);
     }
   }
   if (strikes24h !== undefined) {
@@ -909,6 +928,7 @@ export default async function (pi: ExtensionAPI) {
   let requestsUsed: number | undefined;
   let strikes24h: number | undefined;
   let deprioritized = false;
+  let priorityUntil: number | undefined;
 
   // Cross-process FIFO queue over outbound Umans requests, backed by
   // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
@@ -1043,6 +1063,7 @@ export default async function (pi: ExtensionAPI) {
       concurrencyDisabled,
       strikes24h,
       deprioritized,
+      priorityUntil,
     });
   }
 
@@ -1183,6 +1204,7 @@ export default async function (pi: ExtensionAPI) {
     // counter handle the hard pause.
     const priority = parsePriority(data.usage?.priority);
     deprioritized = priority.low;
+    priorityUntil = priority.until;
     // Only clear a pause that was pushed by a PREVIOUS priority.low tick —
     // don't clear a 429-origin or strike-origin pause (those have their own
     // deadlines + must not be wiped by a stale /usage tick reporting low===false
@@ -1286,8 +1308,14 @@ export default async function (pi: ExtensionAPI) {
       releaseToken = releaseTokenThisIter;
       // We are head + hold the launch token. Poll /usage until the server reports
       // a free slot (or the plan is unlimited) and the account isn't deprioritized.
-      // The token stays held during the poll + the subsequent send so the next
-      // head polls a /usage that already reflects our in-flight request.
+      // The token serializes the /usage POLL (no thundering herd on the capacity
+      // endpoint); it is released as soon as the capacity check passes (before
+      // the send), NOT held across the send. Holding the token across the send
+      // serializes to 1-at-a-time (over-serialization). Releasing immediately
+      // lets the next head poll right away; the server's /usage lag means it
+      // sees a stale-low concurrent_sessions + launches — achieving
+      // limit-concurrent saturation (4/4). The hard_cap burst headroom
+      // absorbs any overshoot from the lag.
       const limit = concurrencyLimit();
       // Unlimited plan: skip the capacity check (still honor priority.low).
       // CORR11-3: read queuePaused ONCE per poll iteration into a local const
@@ -1426,9 +1454,18 @@ export default async function (pi: ExtensionAPI) {
       // not break the user's turn, only the gate. The status bar's `q <queued>*`
       // already reflects the wait; the launch itself is silent so as not to
       // spam notifies on every poll.
+      //
+      // Throughput fix: release the token IMMEDIATELY (not at message_end) so
+      // the next head can poll + launch. The token serializes the /usage poll;
+      // holding it across the send serializes to 1-at-a-time. Releasing here
+      // lets the next head poll right away — the server's /usage lag means it
+      // sees a stale-low concurrent_sessions + launches, achieving
+      // limit-concurrent saturation. The hard_cap absorbs overshoot.
+      try { releaseToken(); } catch { /* best-effort — ADV3-1 release-resilience */ }
+      releaseToken = () => {}; // no-op for the returned release fn (token already released)
       released = true;
       return () => {
-        releaseToken();
+        releaseToken(); // no-op (token released above)
         concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
       };
     } // end tokenAcquire
@@ -1834,23 +1871,27 @@ export default async function (pi: ExtensionAPI) {
   // HTTP send, and is awaited by pi. We join the cross-process FIFO here so the
   // main turn blocks (queued) rather than hitting the server and risking a 429.
   //
-  // Token-release contract (D2): the token is held ACROSS the send and released
-  // at assistant message_end (the response stream has completed). Releasing at
-  // after_provider_response headers is too early (headers arrive ~1s in, but
-  // the server only registers the request as in-flight once the body streams);
-  // releasing at turn_end holds the token through tool execution, collapsing
-  // throughput. message_end frees the slot as soon as the stream completes AND
-  // during this turn's tool execution (tools don't consume a server concurrency
-  // slot). NOTE: message_end fires at CLIENT-side stream completion, which
-  // precedes the server's concurrent_sessions decrement by a network RTT +
-  // cleanup lag, so the next waiter's /usage poll can transiently see stale
-  // (too-low) capacity and launch 1-2 over `limit`. The gate compares against
-  // `limit` (the soft cap), NOT `hard_cap`, so the burst headroom (hard_cap -
-  // limit) absorbs that overshoot → no 429, no deprioritization
-  // (see isCapacityFree). The launch token serializes the /usage poll
-  // (no thundering-herd). The message_end release is the PRIMARY path;
-  // turn_end and agent_end are safety nets for turns that error before
-  // message_end fires.
+  // Token-release contract (D2, revised for throughput): the token is
+  // released IMMEDIATELY after the capacity check passes (before the send),
+  // NOT at assistant message_end. The token's job is to serialize the
+  // /usage poll (no thundering herd on the capacity endpoint); it must NOT
+  // serialize the send itself. Holding the token across the send serialized
+  // to 1-at-a-time (over-serialization, peak 1-2 instead of 4/4).
+  //
+  // Releasing immediately lets the next head poll right away. The server's
+  // /usage concurrent_sessions lag means the next head sees a stale-low count
+  // + launches — achieving limit-concurrent saturation (4/4). The hard_cap
+  // burst headroom (hard_cap - limit = 4) absorbs any overshoot from the lag.
+  //
+  // The SLOT (the actual concurrency slot on the server) is tracked by the
+  // request lifecycle: the server increments concurrent_sessions when the
+  // request streams, decrements when it completes. We don't track a local
+  // in-flight count (D1: /v1/usage is the only capacity authority); the
+  // server lag + hard_cap headroom are the design's throughput mechanism.
+  //
+  // The message_end release is now a no-op (the token + waiter are already
+  // released); it's kept as a safety net for turns that error before the
+  // capacity check completes (the abort + rejoin-exhaustion paths).
   //
   // CORR5-3: the main-turn release is tracked in a SINGLE slot
   // (mainTurnRelease), not a Set. The design guarantees at most one main-turn
