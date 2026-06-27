@@ -4704,6 +4704,39 @@ if (process.platform !== "win32") {
   }
 }
 
+// --- CLN10-4: raiseForUmansStatus helper extracted from duplicated side-call !res.ok blocks ---
+// analyzeImage + searchWeb both had the same 429-push + read-body + sanitize + throw
+// block inlined in their !res.ok branch. The refactor extracts a single
+// raiseForUmansStatus(res, concurrencyQueue) helper + calls it from both sites.
+// A regression re-inlining the block (or dropping the 429 push / sanitize at one
+// site) would not be caught by the existing COV9-4 side-call 429 tests alone.
+// Pin the helper exists + is called from both sites by source inspection.
+{
+  const src = readFileSync("index.ts", "utf8");
+  assert(src.includes("async function raiseForUmansStatus("),
+    "CLN10-4: raiseForUmansStatus helper defined in index.ts");
+  // Both side-call sites call the helper in their !res.ok branch.
+  const analyzeIdx = src.indexOf("async function analyzeImage(");
+  const searchIdx = src.indexOf("async function searchWeb(");
+  assert(analyzeIdx >= 0 && searchIdx > analyzeIdx,
+    "CLN10-4: analyzeImage + searchWeb defined in index.ts");
+  const analyzeCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
+  const searchCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
+  assert(analyzeCallIdx > analyzeIdx && analyzeCallIdx < searchIdx,
+    "CLN10-4: analyzeImage !res.ok branch calls raiseForUmansStatus");
+  assert(searchCallIdx > searchIdx,
+    "CLN10-4: searchWeb !res.ok branch calls raiseForUmansStatus");
+  // The helper runs the 429 push (handle429) + the body sanitize
+  // (sanitizeErrorBody) — pin both are referenced inside it.
+  const helperStart = src.indexOf("async function raiseForUmansStatus(");
+  const helperEnd = src.indexOf("\n}\n", helperStart);
+  const helperBody = src.slice(helperStart, helperEnd);
+  assert(helperBody.includes("handle429(res, concurrencyQueue)"),
+    "CLN10-4: raiseForUmansStatus runs the 429 push (handle429)");
+  assert(helperBody.includes("sanitizeErrorBody(txt)"),
+    "CLN10-4: raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
+}
+
 // --- COV9-8: concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
 // transformMessageImages does Promise.all over N images, each calling acquireSlot → join →
 // mutate. The O_EXCL lockfile is per-state-file, not per-process, so concurrent mutate calls

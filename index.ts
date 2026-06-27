@@ -538,6 +538,38 @@ export function handle429(
   return until;
 }
 
+/**
+ * CLN10-4: shared !res.ok handler for the side-call sites (analyzeImage,
+ * searchWeb). Both sites duplicated the same 429-push + read-body + sanitize +
+ * throw block. This helper runs the 429 push (CORR8-2: a side-call 429
+ * deprioritizes the whole account — per D6 the side-call consumes a real
+ * concurrency slot — so push the shared pause so sibling pi processes + the
+ * main turn on its next launch back off, do NOT merely throw), reads + caps +
+ * sanitizes the gateway error body (SEC7-4: attacker-controlled body must not
+ * inject control sequences or mangle the tool result), then throws an Error
+ * carrying HTTP status + the sanitized body. The Promise<never> return type
+ * preserves control-flow narrowing (no dangling code after the call).
+ *
+ * Accepts the same duck-typed { status, headers } shape as handle429 (a fetch
+ * Response) + the optional concurrencyQueue (omitted when the caller has no
+ * queue — then only the body sanitize + throw run, matching the prior inline
+ * behavior).
+ */
+async function raiseForUmansStatus(
+  res: { status: number; headers?: Headers | Record<string, string> | undefined | null; text(): Promise<string> },
+  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
+): Promise<never> {
+  if (res.status === 429 && concurrencyQueue) {
+    handle429(res, concurrencyQueue);
+  }
+  const txt = await res.text().catch(() => "");
+  // SEC7-4: cap + sanitize the gateway error body before echoing it (cap 80,
+  // strip non-printable / ANSI-escape) so a crafted body cannot inject
+  // control sequences or mangle the tool result.
+  const safe = sanitizeErrorBody(txt);
+  throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
+}
+
 /** Duck-typed Retry-After header lookup (fetch Headers .get OR a plain record). */
 function readRetryAfter(headers: Headers | Record<string, string> | undefined | null): string | undefined {
   if (!headers) return undefined;
@@ -624,20 +656,9 @@ async function analyzeImage(
       signal: composed,
     });
     if (!res.ok) {
-      // CORR8-2: a 429 from a side-call deprioritizes the whole account too
-      // (per D6 the side-call consumes a real concurrency slot). Push the
-      // shared pause so sibling pi processes (and the main turn on its next
-      // launch) back off — do NOT merely throw. The helper parses Retry-After
-      // (strict) + clamps to MAX_PAUSE_429_MS + calls pauseUntil (try/catch).
-      if (res.status === 429 && concurrencyQueue) {
-        handle429(res, concurrencyQueue);
-      }
-      const txt = await res.text().catch(() => "");
-      // SEC7-4: cap + sanitize the gateway error body before echoing it (cap 80,
-      // strip non-printable / ANSI-escape) so a crafted body cannot inject
-      // control sequences or mangle the tool result.
-      const safe = sanitizeErrorBody(txt);
-      throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
+      // CLN10-4: delegated to raiseForUmansStatus (shared with searchWeb) —
+      // runs the 429 push (CORR8-2), reads + sanitizes the body (SEC7-4), throws.
+      await raiseForUmansStatus(res, concurrencyQueue);
     }
     const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
     const text = (data.content ?? [])
@@ -702,18 +723,9 @@ async function searchWeb(
       signal: composed,
     });
     if (!res.ok) {
-      // CORR8-2: a 429 from a side-call deprioritizes the whole account too
-      // (per D6 the side-call consumes a real concurrency slot). Push the
-      // shared pause so sibling pi processes (and the main turn on its next
-      // launch) back off — do NOT merely throw. The helper parses Retry-After
-      // (strict) + clamps to MAX_PAUSE_429_MS + calls pauseUntil (try/catch).
-      if (res.status === 429 && concurrencyQueue) {
-        handle429(res, concurrencyQueue);
-      }
-      const txt = await res.text().catch(() => "");
-      // SEC7-4: cap + sanitize the gateway error body before echoing it.
-      const safe = sanitizeErrorBody(txt);
-      throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
+      // CLN10-4: delegated to raiseForUmansStatus (shared with analyzeImage) —
+      // runs the 429 push (CORR8-2), reads + sanitizes the body (SEC7-4), throws.
+      await raiseForUmansStatus(res, concurrencyQueue);
     }
     const data = (await res.json()) as {
       content?: Array<{
