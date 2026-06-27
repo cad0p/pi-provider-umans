@@ -243,10 +243,19 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     "COV5-1: signal aborted overrides failOpen → abort");
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: true }) === "abort",
     "COV5-1: signal aborted overrides wait-during-pause → abort");
-  // isFree takes precedence over signalAborted (a freed slot launches even if
-  // the signal fired concurrently — the launch is safe, the abort is moot).
-  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "launch",
-    "COV5-1: isFree takes precedence over signalAborted");
+  // C13-1: signalAborted takes precedence over isFree (was: isFree first).
+  // When the turn's AbortSignal fires mid-poll AND /usage is unreachable
+  // (isCapacityFree(null) returns {free:true}), the prior isFree-first
+  // ordering returned "launch" + held the token until a safety net fired.
+  // Now signalAborted is checked first → returns "abort" immediately.
+  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "abort",
+    "C13-1: signalAborted takes precedence over isFree (abort-first)");
+  assert(decideLaunch({ isFree: true, elapsedMs: 60_000, queuePaused: false, signalAborted: true }) === "abort",
+    "C13-1: signalAborted takes precedence over isFree + failOpen window");
+  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: true, signalAborted: true }) === "abort",
+    "C13-1: signalAborted takes precedence over isFree + queuePaused");
+  assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: false }) === "launch",
+    "C13-1: isFree + !signalAborted → launch (happy path preserved)");
 }
 
 // --- CMP6-3: nextPollInterval exponential backoff on /usage poll under steady-full ---

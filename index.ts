@@ -134,8 +134,16 @@ export function decideLaunch(opts: {
   queuePaused: boolean;
   signalAborted: boolean;
 }): LaunchDecision {
-  if (opts.isFree) return "launch";
+  // C13-1: signalAborted takes precedence over isFree. When the turn's
+  // AbortSignal fires mid-poll AND /usage is unreachable (fetchUsage returns
+  // null → isCapacityFree(null) returns {free:true} via the trust-headroom
+  // stance), the prior isFree-first ordering would return "launch" + hold
+  // the token until a safety net (turn_end/agent_end/session_shutdown) fires.
+  // For a Ctrl-C'd turn that never sends, the token leaks up to the 120s
+  // watchdog. Checking signalAborted first routes through the abort branch
+  // (release token + cancel + return undefined) immediately at the abort site.
   if (opts.signalAborted) return "abort";
+  if (opts.isFree) return "launch";
   if (opts.elapsedMs >= CAPACITY_POLL_TIMEOUT_MS && !opts.queuePaused) return "failOpen";
   return "wait";
 }

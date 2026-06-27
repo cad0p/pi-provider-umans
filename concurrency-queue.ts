@@ -663,10 +663,11 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       // TOCTOU). The PID write was retained as dead code until SEC13-2 dropped
       // it — a write that is never read back is not a fencing token. The
       // mtime ceiling is the sole authoritative reclaim bound.
-      // CORR11-1: if openSync throws a non-EEXIST error (ENOSPC, EIO, EROFS),
-      // the outer catch re-throws without closing fd — fd leaks for the
-      // process lifetime. The lockfile persists but is O_EXCL-created, so
-      // stale-lockfile recovery (below) reaps it after lockTimeoutMs.
+      // CORR11-1/SEC13-2: the only throwing call is openSync itself. If it
+      // throws (EEXIST handled below; ENOSPC/EIO/EROFS re-thrown by the outer
+      // catch), fd is still undefined (no leak possible — there is no
+      // writeFileSync after openSync that could throw + leave fd open). The
+      // prior CORR11-1 fix wrapped a writeFileSync that no longer exists.
       // (EEXIST can't reach here — O_EXCL openSync only resolves when the
       // file did not exist.)
       // No PID write — the lockfile is a zero-byte O_EXCL sentinel (SEC13-2).
