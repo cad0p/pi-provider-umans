@@ -492,18 +492,29 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
   const waiters = state.waiters.filter((w) =>
     !isPidDead(w.pid) && (now - w.ts) <= cfg.staleWaiterMs
   );
-  // Reap a pause that violates the MAX_PAUSE_MS ceiling. Two conditions
-  // (SEC2-MED-1): (1) pausedTs is older than the ceiling (the original
+  // Reap a pause that violates the MAX_PAUSE_MS ceiling. Three conditions
+  // (SEC2-MED-1 + ADV10-1): (1) pausedTs is older than the ceiling (the original
   // defense — a clamp-bypassed poisoned value ages out); (2) the pause
   // DURATION (pausedUntil - now) itself exceeds the ceiling from the current
   // vantage, regardless of pausedTs — this catches a forward-dated pausedTs
   // (a hand-edited file setting pausedTs to the future makes `now - pausedTs`
-  // negative, bypassing condition 1) paired with an oversized pausedUntil.
+  // negative, bypassing condition 1) paired with an oversized pausedUntil;
+  // (3) the pause's OWN claimed duration (pausedUntil - pausedTs) exceeds the
+  // ceiling, independent of now — ADV10-1 closes a gap where a forward-dated
+  // pausedTs (e.g. now+1h) paired with a sub-ceiling pausedUntil (e.g. now+4h)
+  // bypasses both (1) (age is negative) and (2) (duration-from-now is 3h, under
+  // the 5h ceiling), yet the pause's claimed 3h span exceeds MAX_PAUSE_MS from
+  // pausedTs. Probe-confirmed: a hand-edited file with pausedTs=future+1h +
+  // pausedUntil=future+4h survived both prior checks. Condition (3) keys on the
+  // pause's own claimed span (pausedUntil - pausedTs) regardless of where
+  // pausedTs sits relative to now, so a poisoned pause whose claimed duration
+  // exceeds the ceiling is reaped no matter where pausedTs lands.
   let { pausedUntil, pausedReason, pausedTs } = state;
   if (pausedUntil > 0) {
     const ageTooOld = pausedTs > 0 && (now - pausedTs) > MAX_PAUSE_MS;
     const durationTooLong = (pausedUntil - now) > MAX_PAUSE_MS;
-    if (ageTooOld || durationTooLong) {
+    const claimedDurationTooLong = pausedTs > 0 && (pausedUntil - pausedTs) > MAX_PAUSE_MS;
+    if (ageTooOld || durationTooLong || claimedDurationTooLong) {
       pausedUntil = 0;
       pausedReason = null;
       pausedTs = 0;

@@ -983,6 +983,41 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "SEC2-MED-1: short pause with forward-dated pausedTs is not reaped (duration within ceiling)");
 }
 
+// --- ADV10-1: pause whose OWN claimed duration exceeds MAX_PAUSE_MS is reaped ---
+// The two prior conditions (age, duration-from-now) miss a poisoned pause whose
+// claimed span (pausedUntil - pausedTs) exceeds the ceiling while BOTH age and
+// duration-from-now are under it. Example: pausedTs = now - 4h (age 4h < 5h,
+// condition 1 misses), pausedUntil = now + 2h (duration-from-now 2h < 5h,
+// condition 2 misses), claimed duration = 6h > 5h (condition 3 catches). A
+// hand-edited file with such values would survive both prior checks; the new
+// third condition keys on the pause's own claimed duration independent of now.
+{
+  const now = 1_700_000_000_000;
+  const cfg = {
+    stateFile: "/dev/null", staleTokenMs: 30_000, staleWaiterMs: 300_000,
+    lockRetryMs: 5, lockTimeoutMs: 2_000, now: () => now, pid: () => process.pid,
+  } as const;
+  // pausedTs = now - 4h (age 4h, under 5h ceiling → condition 1 misses).
+  // pausedUntil = now + 2h (duration-from-now 2h, under 5h → condition 2 misses).
+  // claimed duration = (now+2h) - (now-4h) = 6h > 5h → condition 3 catches.
+  const gapState = {
+    waiters: [],
+    token: null,
+    pausedUntil: now + 2 * 60 * 60 * 1000,
+    pausedReason: "poisoned-claimed-duration",
+    pausedTs: now - 4 * 60 * 60 * 1000,
+  };
+  const gapReaped = reapStale(gapState, cfg as any, now);
+  assert(gapReaped.pausedUntil === 0 && gapReaped.pausedReason === null && gapReaped.pausedTs === 0,
+    "ADV10-1: pause whose claimed duration (pausedUntil - pausedTs) exceeds MAX_PAUSE_MS is reaped even when age + duration-from-now are both under the ceiling");
+  // A pause whose claimed duration is within the ceiling + age + duration-from-now
+  // also within is NOT reaped (no false positive).
+  const safeState = { ...gapState, pausedTs: now - 1_000 };
+  const safeReaped = reapStale(safeState, cfg as any, now);
+  assert(safeReaped.pausedUntil === gapState.pausedUntil,
+    "ADV10-1: pause with claimed duration under ceiling is not reaped (no false positive)");
+}
+
 // --- createConcurrencyQueue: FIFO + launch token (file-backed, temp dir) ---
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
