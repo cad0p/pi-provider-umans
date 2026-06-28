@@ -954,6 +954,12 @@ export default async function (pi: ExtensionAPI) {
   let strikes24h: number | undefined;
   let deprioritized = false;
   let priorityUntil: number | undefined;
+  // Stash the last seen pi ctx (from session_start) so the periodic
+  // refreshUsage timer can re-render the status bar (countdown, strikes,
+  // concurrency) even when the user is idle at the prompt — not just during
+  // streaming events. Without this, the PAUSED/DEPRIO countdown freezes
+  // because updateStatus is only called from event handlers.
+  let lastCtx: any;
 
   // Cross-process FIFO queue over outbound Umans requests, backed by
   // ~/.pi/agent/umans-concurrency.json (O_EXCL lockfile + atomic rename). The
@@ -1058,6 +1064,13 @@ export default async function (pi: ExtensionAPI) {
     // a margin equal to the max in-flight means we pause before that burst can
     // push us over. With limit=4 → threshold=16; with limit=3 → threshold=17.
     const maxInFlight = concurrencyLimit() ?? guaranteedConcurrency ?? 0;
+    // Skip the threshold check at startup before guaranteedConcurrency is
+    // populated (refreshUsage runs 5s after the immediate strike poll). With
+    // maxInFlight=0 the threshold would be 20 (the server limit) — pausing at
+    // the server's own trigger point is too late + risks a false-positive
+    // pause if the API transiently returns stale data. Wait for the first
+    // refreshUsage to populate the real limit, then the dynamic threshold applies.
+    if (maxInFlight <= 0) return;
     const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
     // Defensively self-pause when approaching the 5h-pause threshold. Better to
     // pause briefly + let strikes age out than risk the 5h account ban. The
@@ -1304,6 +1317,13 @@ export default async function (pi: ExtensionAPI) {
       if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
         concurrencyQueue.clearPause();
       }
+    }
+    // Re-render the status bar so the countdown (PAUSED/DEPRIO) + concurrency
+    // + strikes display stays live while the user is idle at the prompt.
+    // Without this, the status bar freezes between streaming events because
+    // updateStatus is only called from event handlers.
+    if (lastCtx) {
+      try { updateStatus(lastCtx); } catch { /* UI may not be available */ }
     }
   }
 
@@ -2162,6 +2182,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     imageStore.clear();
+    lastCtx = ctx; // stash for periodic updateStatus from the refreshUsage timer
     const apiKey = await resolveApiKey(ctx);
     if (ctx.model?.provider === "umans") {
       if (apiKey) await refreshUsage(apiKey);
@@ -2189,6 +2210,7 @@ export default async function (pi: ExtensionAPI) {
   // spans the full send→first-token gap, not just the stream body from message_start.
   pi.on("turn_start", async (event, ctx) => {
     if (ctx.model?.provider !== "umans") return;
+    lastCtx = ctx; // refresh in case of model switch / new session
     liveRequest = { startTime: event.timestamp, estimatedTokens: 0, lastStatusUpdate: 0 };
     updateStatus(ctx);
   });
