@@ -1567,7 +1567,7 @@ export default async function (pi: ExtensionAPI) {
       // spam notifies on every poll.
       //
       // D11 local in-flight tracking: add an in-flight entry BEFORE releasing
-      // the token (C8: the order is load-bearing — the next head's readState
+      // the token (the order is load-bearing — the next head's readState
       // must see our entry before it can claim the token, so max(localInFlight,
       // concurrent_sessions) counts us + blocks a sibling from launching into
       // our still-in-flight request). addInFlight is fail-closed (Adv5): a throw

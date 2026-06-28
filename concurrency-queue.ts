@@ -1067,7 +1067,7 @@ function reapStaleTmps(path: string, now: number): void {
   try { entries = readdirSync(dir); } catch { return; /* dir missing/unreadable */ }
   let unlinked = 0;
   for (const name of entries) {
-    if (unlinked >= REAP_TMP_MAX) break; // ADV7-2: bound the critical section
+    if (unlinked >= REAP_TMP_MAX) break; // bound the critical section
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
     try {
