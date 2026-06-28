@@ -2064,18 +2064,15 @@ export default async function (pi: ExtensionAPI) {
     const apiKey = await resolveApiKey(ctx);
     if (!apiKey) return; // no key — let the request fail naturally
     // acquireSlot joins the FIFO, waits for the token, polls /usage until the
-    // server reports a free slot, then returns a release fn. Per D2 we hold the
-    // token ACROSS the send (stored in mainTurnRelease) and release it at
-    // assistant message_end (stream completed) — NOT inline before the send
-    // (the prior release-token-immediately-after-launch design defeated serialization: siblings all polled
-    // /usage, all saw capacity, all released, and all sent simultaneously —
-    // empirically peak 4 vs limit 2 (C1)), and NOT at after_provider_response
-    // headers (the server hasn't registered the request as in-flight until the
-    // body streams). message_end frees the slot during tool execution too; the
-    // release race (message_end precedes the server decrement) is absorbed by
-    // the burst headroom (hard_cap - limit) since the gate compares against
-    // `limit`, not `hard_cap`. turn_end and agent_end are safety
-    // nets for turns that never reach message_end.
+    // server reports a free slot, then returns a release fn. Per D2 the token
+    // serializes the /usage poll only — it is released IMMEDIATELY after the
+    // capacity check passes (before the send), so the next head can poll +
+    // launch right away. The server's /usage lag means the next head sees a
+    // stale-low concurrent_sessions + launches, achieving limit-concurrent
+    // saturation; the hard_cap burst headroom absorbs the overshoot. The
+    // in-flight slot is tracked by the release fn (addInFlight at launch,
+    // removeInFlight at message_end/turn_end/agent_end). turn_end + agent_end
+    // are safety nets for turns that never reach message_end.
     // wrap acquireSlot in try/catch so a wedged lock (a lock-timeout
     // future-dated mtime) or transient disk error (EACCES/ENOSPC/EROFS/ENOENT
     // on the lockfile or state file) does NOT break the user's turn as an
