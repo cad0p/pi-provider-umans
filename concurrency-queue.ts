@@ -252,7 +252,7 @@ export const PAUSE_403_BRIDGE_MS = 5_000;
 /**
  * The set of pause reasons that a stale /v1/usage tick reporting
  * priority.low===false must NOT clear. /v1/usage LAGS a real suspension by
- * 1-5s (the same lag CORR4-1 defends for 429s), so a stale-low===false tick
+ * 1-5s (the same lag the sticky-pause guard defends for 429s), so a stale-low===false tick
  * arriving right after a 403/cap_abuse pause was written would wipe it —
  * letting the next waiter launch into a still-suspended account + re-trip
  * the cascade the pause exists to prevent. clearPause + the refreshUsage
@@ -539,7 +539,7 @@ export function isCapacityFree(
 ): { free: boolean; repause?: { until: number; reason: string | null } } {
   if (inputs.queuePaused) return { free: false };
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
-  // D12 reason-aware pause: when priority.low AND the reason indicates a
+  // reason-aware pause: when priority.low AND the reason indicates a
   // suspend-family account state (cap_abuse / cap_suspended / account_suspended
   // / billing_error), the account is SUSPENDED (the server returns 403), not
   // just slow. Lowering the cap by 1 is wrong — no launches should happen
@@ -1196,7 +1196,7 @@ export interface ConcurrencyQueue {
   removeInFlight(ourId: string): void;
   /** Snapshot for status-bar display + the local in-flight count for the gate. */
   snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null; inflightCount: number };
-  /** Remove our waiter entry if still present (best-effort, used on abort). Also splices the matching in-flight entry (C6: an abort-after-launch path that calls cancel must not leak the in-flight entry for 120s). */
+  /** Remove our waiter entry if still present (best-effort, used on abort). Also splices the matching in-flight entry (an abort-after-launch path that calls cancel must not leak the in-flight entry for 120s). */
   cancel(ourId: string): void;
   /** Best-effort shutdown cleanup: clear this process's own waiter/token/in-flight entries (PID-scoped — does NOT wipe siblings' in-flight). Does NOT unlink the shared state file (siblings may still be queued). */
   reset(): void;

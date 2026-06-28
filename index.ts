@@ -1433,9 +1433,9 @@ export default async function (pi: ExtensionAPI) {
           localInFlight: qSnap.inflightCount,
         });
         if (decision.repause) {
-          // C10 write-amplification guard: skip the pauseUntil call when the
+          // write-amplification guard: skip the pauseUntil call when the
           // active pause already covers the requested deadline + reason. The
-          // capacity-poll loop calls capacityFree every ~300ms; with D12, each
+          // capacity-poll loop calls capacityFree every ~300ms; with the reason-aware
           // iteration where priority.low && reason=cap_abuse returns a repause,
           // + the caller pushes pauseUntil — a mutate (O_EXCL lock + readState
           // + reapStale + writeStateAtomic + renameSync) every ~300ms. Over a
@@ -1454,7 +1454,7 @@ export default async function (pi: ExtensionAPI) {
             // is a best-effort coordination signal (the server's priority.low +
             // the 120s watchdog bound it); it must not abort a turn that already
             // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
-            // ADV3-1 release-resilience pattern.
+            // release-resilience pattern.
             try {
               concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
             } catch (err) {
@@ -1566,7 +1566,7 @@ export default async function (pi: ExtensionAPI) {
       // already reflects the wait; the launch itself is silent so as not to
       // spam notifies on every poll.
       //
-      // D11 local in-flight tracking: add an in-flight entry BEFORE releasing
+      // local in-flight tracking: add an in-flight entry BEFORE releasing
       // the token (the order is load-bearing — the next head's readState
       // must see our entry before it can claim the token, so max(localInFlight,
       // concurrent_sessions) counts us + blocks a sibling from launching into
@@ -1583,13 +1583,13 @@ export default async function (pi: ExtensionAPI) {
       // lets the next head poll right away — the server's /usage lag means it
       // sees a stale-low concurrent_sessions + launches, achieving
       // limit-concurrent saturation. The hard_cap absorbs overshoot.
-      try { releaseToken(); } catch { /* best-effort — ADV3-1 release-resilience */ }
+      try { releaseToken(); } catch { /* best-effort — release-resilience */ }
       releaseToken = () => {}; // no-op for the returned release fn (token already released)
       released = true;
       return () => {
         releaseToken(); // no-op (token released above)
         try { concurrencyQueue.removeInFlight(ourId); } catch { /* best-effort: watchdog reaps at 120s */ }
-        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present (also splices in-flight, C6)
+        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present (also splices in-flight)
       };
     } // end tokenAcquire
     // Unreachable: the loop above always either returns or throws. Defensive.
@@ -2076,7 +2076,7 @@ export default async function (pi: ExtensionAPI) {
     // the burst headroom (hard_cap - limit) since the gate compares against
     // `limit`, not `hard_cap`. turn_end and agent_end are safety
     // nets for turns that never reach message_end.
-    // wrap acquireSlot in try/catch so a wedged lock (ADV12-1
+    // wrap acquireSlot in try/catch so a wedged lock (a lock-timeout
     // future-dated mtime) or transient disk error (EACCES/ENOSPC/EROFS/ENOENT
     // on the lockfile or state file) does NOT break the user's turn as an
     // uncaught extension error. The queue must not break inference, only the
