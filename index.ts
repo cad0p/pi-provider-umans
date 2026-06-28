@@ -1444,7 +1444,7 @@ export default async function (pi: ExtensionAPI) {
           // deadline does not move). Skip when queuePaused &&
           // qSnap.pausedUntil >= decision.repause.until &&
           // qSnap.pausedReason === decision.repause.reason. qSnap was read
-          // once per iteration (CORR11-3 pattern — no straddle-await race).
+          // once per iteration (no straddle-await race).
           const alreadyCovered = queuePaused &&
             qSnap.pausedUntil >= decision.repause.until &&
             qSnap.pausedReason === decision.repause.reason;

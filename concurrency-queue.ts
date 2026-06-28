@@ -722,7 +722,7 @@ export function readState(path: string): QueueState {
         token,
         inflight,
         pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
-        // sanitize pausedReason on the READ boundary too. SEC5-1
+        // sanitize pausedReason on the READ boundary too
         // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
         // but readState passed parsed.pausedReason straight through → snapshot() →
         // status bar/notify render raw. A hand-edited file, a compromised sibling
@@ -1428,7 +1428,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // + a non-null reason (e.g. "Account deprioritized") would wipe a
           // freshly-written sticky tag, letting the next stale
           // priority.low===false tick clear the pause early — exactly the
-          // race CORR4-1 exists to prevent. The sticky tag stays
+          // race that exists to prevent. The sticky tag stays
           // authoritative; the longer deadline still extends pausedUntil.
           // When the sticky pause naturally elapses (pausedUntil <= now),
           // clearPause clears it normally.

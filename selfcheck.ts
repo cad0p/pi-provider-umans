@@ -2838,7 +2838,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
-// --- lockfile reclaim relies on the mtime ceiling (SEC9-3 dropped the PID fast-path) ---
+// --- lockfile reclaim relies on the mtime ceiling (PID fast-path dropped) ---
 // Recovery was mtime-only — yanked when now - mtimeMs > lockTimeoutMs. CMP7-1
 // added a PID-based fast-path that read the lockfile content; SEC9-3 dropped
 // that read (TOCTOU between lstatSync + readFileSync). The mtime ceiling is
@@ -5503,7 +5503,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- readFileSync import removed from concurrency-queue.ts (dead after SEC9-3) ---
+// --- readFileSync import removed from concurrency-queue.ts (dead) ---
 // SEC9-3 dropped the PID-based fast-path (the only readFileSync call site).
 // The dead import is misleading + trips stricter configs/linters.
 {
@@ -5686,7 +5686,7 @@ if (process.platform !== "win32") {
 // --- raiseForUmansStatus 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE (D10, C3, C7, C9) ---
 // A 403 with a suspend-family body is the HTTP symptom of the same cap_abuse
 // suspension the /v1/usage priority.reason=cap_abuse branch detects. Both push
-// the SAME PAUSE_REASON_CAP_ABUSE tag (C9: single tag eliminates reason-flip
+// the SAME PAUSE_REASON_CAP_ABUSE tag (single tag eliminates reason-flip
 // fragility). boxed_until is tolerant (JSON field / message-string regex / 30s
 // floor). A PAST boxed_until → 30s floor (Adv4). A 403 WITHOUT a suspend body
 // does NOT push a pause (C7).
@@ -5990,7 +5990,7 @@ if (process.platform !== "win32") {
     "COV-F3: synthetic snapshot repause carries the extracted boxed_until (~3h)");
 }
 
-// --- after_provider_response 403 bridge pause (C1/ADV-2/SB-1: non-sticky bridge) ---
+// --- after_provider_response 403 bridge pause (non-sticky bridge) ---
 // The pi after_provider_response event carries status + headers but NO body
 // (the body has not streamed yet at headers time), so isSuspendBody cannot
 // gate here + the boxed_until deadline is unreachable. Push a SHORT non-sticky
@@ -6529,7 +6529,7 @@ if (process.platform !== "win32") {
 }
 
 // --- D11 local in-flight: addInFlight/removeInFlight + snapshot().inflightCount ---
-// acquireSlot increments local in-flight BEFORE releasing the token (C8: the
+// acquireSlot increments local in-flight BEFORE releasing the token (the
 // order is load-bearing — the next head's readState must see our entry before
 // it can claim the token). snapshot().inflightCount is the post-reap count.
 // Release decrements; abort decrements (via cancel, C6).
@@ -6564,7 +6564,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + C6: cancel(ourId) splices the matching in-flight entry ---
+// --- cancel(ourId) splices the matching in-flight entry ---
 // An abort-after-launch path that calls cancel must not leak the in-flight
 // entry for 120s (localInFlight would be inflated by 1, blocking one slot).
 {
@@ -6587,7 +6587,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + Adv2: poisoned inflight (non-array / malformed) coerces to [] ---
+// --- poisoned inflight (non-array / malformed) coerces to [] ---
 // A poisoned/hand-edited state file can put arbitrary objects into inflight.
 // readState coerces a non-array to [] + drops malformed entries so reapStale/
 // isPidDead operate on well-typed input (no NaN wedge that blocks the gate
@@ -6628,7 +6628,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + Adv2: poisoned inflight with 100 live-PID entries blocks the gate (DoS surface) ---
+// --- poisoned inflight with 100 live-PID entries blocks the gate (DoS surface) ---
 // The inflight array is a gate input (max(localInFlight, ...) < cap). A hostile
 // local process with write access to the state file can inflate inflight to
 // block all launches. This documents the accepted trust boundary (same threat
@@ -6687,7 +6687,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + C11: reset() is PID-scoped (does not wipe siblings' in-flight) ---
+// --- reset() is PID-scoped (does not wipe siblings' in-flight) ---
 // reset() splices only in-flight entries whose pid === ourPid() (or whose id is
 // in ourWaiterIds). A global wipe would re-arm the within-machine burst race
 // for siblings (their launches would vanish from the local count).
@@ -6721,7 +6721,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + C12: gate uses max(localInFlight, concurrent_sessions), not sum ---
+// --- gate uses max(localInFlight, concurrent_sessions), not sum ---
 // max avoids double-counting the local in-flight that /usage already includes
 // once it catches up. If /usage is fresh (reports 4), max(2, 4) = 4 >= cap →
 // wait (correct); if /usage is stale-low (reports 2), max(2, 2) = 2 < cap →
@@ -6760,7 +6760,7 @@ if (process.platform !== "win32") {
   // (Already asserted above — this documents the sum-vs-max distinction.)
 }
 
-// --- D11 + Adv5: addInFlight throws → acquireSlot aborts (fail-closed) ---
+// --- addInFlight throws → acquireSlot aborts (fail-closed) ---
 // A throw (lock timeout, EACCES, ENOSPC) propagates to acquireSlot's finally,
 // which cancels the waiter + token + aborts the turn. Do NOT swallow — a
 // missing entry deflates the gate for siblings. Verify addInFlight propagates
@@ -6787,7 +6787,7 @@ if (process.platform !== "win32") {
 // is SUSPENDED (the server returns 403), not just slow. Lowering the cap by 1
 // is wrong — no launches should happen until boxed_until clears. Return
 // { free: false, repause: { until, PAUSE_REASON_CAP_ABUSE } } so the caller
-// pushes a full pause. C4: return the repause, do NOT push it here —
+// pushes a full pause. return the repause, do NOT push it here —
 // isCapacityFree is a pure decision (no I/O); the caller pushes it.
 {
   const futureUntil = Date.now() + 3 * 60 * 60 * 1000;
@@ -6900,7 +6900,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D12 + C10: write-amplification guard skips repause re-push when already covered ---
+// --- write-amplification guard skips repause re-push when already covered ---
 // The capacity-poll loop calls capacityFree every ~300ms. Without the guard,
 // each iteration where priority.low && reason=cap_abuse pushes a pauseUntil —
 // a mutate every ~300ms, all no-ops at the pause level. Skip when the active
@@ -6962,7 +6962,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D12 + Adv11: dead-PID in-flight reaped at 120s while a 5h cap_abuse pause is active ---
+// --- dead-PID in-flight reaped at 120s while a 5h cap_abuse pause is active ---
 // The cap_abuse pause survives the 120s in-flight reap cycle (reapStale reaps
 // in-flight entries but does NOT touch the pause). After the 5h pause clears,
 // reapStale has long since reaped the leaked in-flight entry (120s << 5h) → no
