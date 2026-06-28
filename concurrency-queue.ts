@@ -722,13 +722,14 @@ export function readState(path: string): QueueState {
         token,
         inflight,
         pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
-        // sanitize pausedReason on the READ boundary too
-        // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
-        // but readState passed parsed.pausedReason straight through → snapshot() →
-        // status bar/notify render raw. A hand-edited file, a compromised sibling
-        // writing JSON directly, or a file poisoned by an earlier unfixed build
-        // surfaces the raw string. The write-boundary sanitize is the primary
-        // guard; this closes the hand-edited-file gap (defense-in-depth).
+        // sanitize pausedReason on the READ boundary too.
+        // The write-boundary sanitize (pauseUntil) + parse path (parsePriority)
+        // cover the happy path, but readState passed parsed.pausedReason straight
+        // through → snapshot() → status bar/notify render raw. A hand-edited
+        // file, a compromised sibling writing JSON directly, or a file poisoned
+        // by an earlier unfixed build surfaces the raw string. The
+        // write-boundary sanitize is the primary guard; this closes the
+        // hand-edited-file gap (defense-in-depth).
         pausedReason: sanitizeReason(parsed.pausedReason ?? null),
         pausedTs: typeof parsed.pausedTs === "number" ? parsed.pausedTs : 0,
       };
@@ -1428,7 +1429,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // + a non-null reason (e.g. "Account deprioritized") would wipe a
           // freshly-written sticky tag, letting the next stale
           // priority.low===false tick clear the pause early — exactly the
-          // race that exists to prevent. The sticky tag stays
+          // race this guard exists to prevent. The sticky tag stays
           // authoritative; the longer deadline still extends pausedUntil.
           // When the sticky pause naturally elapses (pausedUntil <= now),
           // clearPause clears it normally.
