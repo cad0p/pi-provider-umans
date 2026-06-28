@@ -65,11 +65,36 @@ interface TokenState {
   ts: number;
 }
 
+/**
+ * An in-flight request: launched-but-not-completed, PID + timestamp tagged so
+ * the same reapStale watchdog pattern that reaps stale waiters/tokens also
+ * reaps a crashed/aborted in-flight entry (same 120s bound). The id reuses
+ * the waiter id (addInFlight(ourId) is called after acquireSlot's capacity
+ * check passes, reusing the same ourId), so cancel(ourId) cleans up both the
+ * waiter + the in-flight entry in one pass.
+ */
+interface InFlightEntry {
+  id: string;
+  pid: number;
+  ts: number;
+}
+
 export interface QueueState {
   /** FIFO of waiters; index 0 is the head (next to launch). */
   waiters: WaiterEntry[];
   /** The launch token: held by the process currently sending or polling /usage. null when free. */
   token: TokenState | null;
+  /**
+   * In-flight requests launched by THIS machine but not yet completed. PID +
+   * timestamp tagged (same reapStale watchdog pattern as waiters/token). The
+   * gate checks max(localInFlight, concurrent_sessions_from_usage) < effectiveCap
+   * — whichever is higher wins. Local in-flight catches within-machine bursts
+   * (no /usage lag); /usage catches cross-machine + draindown. This does NOT
+   * replace /usage — /usage is still the only cross-machine authority. Local
+   * in-flight is an additional signal for the within-machine case, where the
+   * /usage lag (300ms-2s) is fatal.
+   */
+  inflight: InFlightEntry[];
   /**
    * Shared deprioritization deadline (epoch-ms). Written by any process that
    * observes priority.low or a 429; read by every process before launching.
@@ -415,11 +440,19 @@ interface CapacitySnapshot {
 
 /**
  * Inputs to the capacity decision: the effective concurrency cap (env override
- * or the live /usage value) and whether the shared pausedUntil is active.
+ * or the live /usage value), whether the shared pausedUntil is active, + the
+ * local in-flight count (requests launched-but-not-completed on THIS machine).
+ * localInFlight is passed IN by the caller (capacityFree reads it via
+ * snapshot().inflightCount) so isCapacityFree stays a pure decision with no I/O
+ * — the existing selfcheck suite constructs a CapacitySnapshot inline + asserts
+ * the decision without a state file, + a readState inside the 300ms poll loop
+ * would be a slow operation in a hot path.
  */
 interface CapacityInputs {
   limit: number | undefined;
   queuePaused: boolean;
+  /** Local in-flight count (passed IN, not read inside). See CapacityInputs doc. */
+  localInFlight?: number;
 }
 
 /**
@@ -460,7 +493,17 @@ export function isCapacityFree(
 ): { free: boolean; repause?: { until: number; reason: string | null } } {
   if (inputs.queuePaused) return { free: false };
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
-  const cur = snap.concurrentSessions ?? 0;
+  // max(localInFlight, concurrentSessions): whichever is higher wins. Local
+  // in-flight catches within-machine bursts (no /usage lag — the 300ms-2s
+  // server accounting lag is what let 6 researchers all poll a stale-low
+  // concurrent_sessions + launch simultaneously, hitting hard_cap → 19
+  // concurrency 429s → cap_abuse 5h suspension). /usage catches cross-machine
+  // + draindown. Using max (not sum) avoids double-counting the local
+  // in-flight that /usage already includes once it catches up: if /usage is
+  // fresh (reports 4), max(2, 4) = 4 >= cap → wait (correct); if /usage is
+  // stale-low (reports 2, only seeing remote), max(2, 2) = 2 < cap → free
+  // → 3rd local launches (true total 5, absorbed by hard_cap headroom).
+  const cur = Math.max(inputs.localInFlight ?? 0, snap.concurrentSessions ?? 0);
   // Gate against `limit` (the soft cap), NOT `hard_cap` (the 429 threshold).
   // The message_end release race can transiently push concurrent_sessions
   // 1-2 over the gate before the server decrements. Gating to `limit` leaves
@@ -541,6 +584,14 @@ function isTokenState(t: unknown): t is TokenState {
     typeof (t as TokenState).ts === "number";
 }
 
+/** Shape guard for an InFlightEntry (same rationale as isWaiterEntry — Adv2). */
+function isInFlightEntry(e: unknown): e is InFlightEntry {
+  return typeof e === "object" && e !== null &&
+    typeof (e as InFlightEntry).id === "string" &&
+    typeof (e as InFlightEntry).pid === "number" &&
+    typeof (e as InFlightEntry).ts === "number";
+}
+
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string): QueueState {
   // SEC10-1: open the fd FIRST + fstat it + read from the fd, so the
@@ -575,7 +626,7 @@ export function readState(path: string): QueueState {
       // (wedging the mutate call + the O_EXCL lock).
       const lstat = lstatSync(path);
       if (!lstat.isFile() || lstat.size > MAX_STATE_BYTES) {
-        return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+        return { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
       }
       // SEC10-1 / ADV11-1 / SEC12-1: open the fd AFTER the lstat guard with
       // O_NOFOLLOW | O_NONBLOCK so a path swap between the lstat + the open
@@ -590,7 +641,7 @@ export function readState(path: string): QueueState {
       const st = fstatSync(fd);
       if (!st.isFile() || st.size > MAX_STATE_BYTES) {
         closeSync(fd);
-        return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+        return { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
       }
       const buf = Buffer.alloc(st.size);
       readSync(fd, buf, 0, st.size, 0);
@@ -598,9 +649,17 @@ export function readState(path: string): QueueState {
       const parsed = JSON.parse(raw) as Partial<QueueState>;
       const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
       const token = isTokenState(parsed.token) ? parsed.token : null;
+      // Adv2: shape-guard inflight (same pattern as waiters). A poisoned
+      // non-array inflight (e.g. inflight: "garbage" or inflight: 42) would
+      // make state.inflight.length undefined/throw → max(NaN, cap) = NaN →
+      // NaN < cap is false → gate blocks forever (silent DoS). A non-array is
+      // coerced to []; malformed entries are dropped by isInFlightEntry so
+      // isPidDead operates on well-typed input (same rationale as isWaiterEntry).
+      const inflight = Array.isArray(parsed.inflight) ? parsed.inflight.filter(isInFlightEntry) : [];
       return {
         waiters,
         token,
+        inflight,
         pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
         // COV6-1 / SEC6-1: sanitize pausedReason on the READ boundary too. SEC5-1
         // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
@@ -616,7 +675,7 @@ export function readState(path: string): QueueState {
       if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
     }
   } catch {
-    return { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+    return { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
   }
 }
 
@@ -681,6 +740,17 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
   const waiters = state.waiters.filter((w) =>
     !isPidDead(w.pid) && (now - w.ts) <= cfg.staleWaiterMs
   );
+  // Reap in-flight entries with the same watchdog pattern as waiters/token:
+  // a dead-PID entry (crashed process) or one older than staleTokenMs (120s)
+  // is reaped. The 120s bound matches the token (a legitimately long streaming
+  // turn exceeds 120s; the in-flight entry for a completed turn is removed by
+  // the release fn at message_end/turn_end/agent_end, so a live entry older
+  // than 120s is by construction a crashed/aborted turn). A SIGKILL between
+  // addInFlight + the HTTP send leaves a phantom entry that blocks one slot
+  // for up to 120s (fail-closed, consistent with the token watchdog).
+  const inflight = state.inflight.filter((e) =>
+    !isPidDead(e.pid) && (now - e.ts) <= cfg.staleTokenMs
+  );
   // Reap a pause that violates the MAX_PAUSE_MS ceiling. Three conditions
   // (SEC2-MED-1 + ADV10-1): (1) pausedTs is older than the ceiling (the original
   // defense — a clamp-bypassed poisoned value ages out); (2) the pause
@@ -709,7 +779,7 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
       pausedTs = 0;
     }
   }
-  return { ...state, token, waiters, pausedUntil, pausedReason, pausedTs };
+  return { ...state, token, waiters, inflight, pausedUntil, pausedReason, pausedTs };
 }
 
 /**
@@ -1043,11 +1113,30 @@ export interface ConcurrencyQueue {
    * it rather than racing a concurrent send that defeats the gate).
    */
   touchToken(ourId: string): boolean;
-  /** Snapshot for status-bar display. */
-  snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null };
-  /** Remove our waiter entry if still present (best-effort, used on abort). */
+  /**
+   * Add an in-flight entry for `ourId` (called by acquireSlot AFTER the
+   * capacity check passes + BEFORE releasing the token, so the next head's
+   * readState sees our entry before it can claim the token — the order is
+   * load-bearing). Throws on lock timeout / disk error (fail-closed: a
+   * missing entry would deflate the gate for siblings, re-arming the
+   * within-machine burst race this exists to prevent; the caller's finally
+   * cancels the waiter + token). PID + timestamp tagged so the same reapStale
+   * watchdog that reaps stale waiters/tokens also reaps a crashed/aborted
+   * entry (same 120s bound).
+   */
+  addInFlight(ourId: string): void;
+  /**
+   * Remove the in-flight entry for `ourId` (best-effort, called by the release
+   * fn at message_end/turn_end/agent_end + by cancel). Wrapped in try/catch by
+   * the caller (mirrors releaseToken's best-effort posture — the watchdog reaps
+   * a stale entry).
+   */
+  removeInFlight(ourId: string): void;
+  /** Snapshot for status-bar display + the local in-flight count for the gate. */
+  snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null; inflightCount: number };
+  /** Remove our waiter entry if still present (best-effort, used on abort). Also splices the matching in-flight entry (C6: an abort-after-launch path that calls cancel must not leak the in-flight entry for 120s). */
   cancel(ourId: string): void;
-  /** Best-effort shutdown cleanup: clear this process's own waiter/token entry. Does NOT unlink the shared state file (siblings may still be queued). */
+  /** Best-effort shutdown cleanup: clear this process's own waiter/token/in-flight entries (PID-scoped — does NOT wipe siblings' in-flight). Does NOT unlink the shared state file (siblings may still be queued). */
   reset(): void;
 }
 
@@ -1059,7 +1148,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       pauseUntil: () => {},
       clearPause: () => {},
       touchToken: () => true,
-      snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null }),
+      addInFlight: () => {},
+      removeInFlight: () => {},
+      snapshot: () => ({ queued: 0, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null, inflightCount: 0 }),
       cancel: () => {},
       reset: () => {},
     };
@@ -1342,7 +1433,31 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       }
     },
 
-    snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null } {
+    addInFlight(ourId: string): void {
+      // Fail-closed (Adv5): a throw (lock timeout, EACCES, ENOSPC) propagates
+      // to acquireSlot's finally, which cancels the waiter + token + aborts
+      // the turn. Do NOT swallow — a missing entry deflates the gate for
+      // siblings (localInFlight under-counts → max(localInFlight, ...) does
+      // not count us → the next waiter's poll sees stale-low + launches →
+      // the within-machine burst race this exists to prevent). The caller's
+      // finally cancels; releaseToken failure is recoverable (watchdog reaps
+      // a stale token), but addInFlight failure is not (no watchdog for a
+      // missing entry — the gate just under-counts).
+      mutate((now, _state) => {
+        _state.inflight.push({ id: ourId, pid: ourPid(), ts: now });
+      });
+    },
+
+    removeInFlight(ourId: string): void {
+      // Best-effort (mirrors releaseToken): the watchdog reaps a stale entry
+      // at 120s. Wrapped in try/catch by the caller (the release fn).
+      mutate((_now, state) => {
+        const idx = state.inflight.findIndex((e) => e.id === ourId);
+        if (idx >= 0) state.inflight.splice(idx, 1);
+      });
+    },
+
+    snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null; inflightCount: number } {
       // CMP9-4: snapshot reads without the lock (atomic rename prevents torn
       // reads; value may be one mutate stale — capacity-poll compensates via
       // /usage priority.low). Correct for the status bar; the brief staleness
@@ -1365,6 +1480,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         paused: state.pausedUntil > now,
         pausedUntil: state.pausedUntil,
         pausedReason: state.pausedUntil > now ? state.pausedReason : null,
+        // Post-reap count (dead-PID + >120s entries removed). The gate reads
+        // this via CapacityInputs.localInFlight so isCapacityFree stays pure.
+        inflightCount: state.inflight.length,
       };
     },
 
@@ -1372,6 +1490,13 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       mutate((_now, state) => {
         const idx = state.waiters.findIndex((w) => w.id === ourId);
         if (idx >= 0) state.waiters.splice(idx, 1);
+        // C6: also splice the matching in-flight entry. An abort-after-launch
+        // path that calls cancel (the token-reaped re-join path, the abort
+        // signal, acquireSlot's finally) must not leak the in-flight entry for
+        // 120s — localInFlight would be inflated by 1, needlessly blocking one
+        // slot until reapStale catches up.
+        const ifidx = state.inflight.findIndex((e) => e.id === ourId);
+        if (ifidx >= 0) state.inflight.splice(ifidx, 1);
         if (state.token && state.token.id === ourId) {
           state.token = null;
           holdsToken = false;
@@ -1420,6 +1545,15 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           if (tokId && state.token && state.token.id === tokId) {
             state.token = null;
           }
+          // C11: PID-scoped in-flight cleanup. Splice only in-flight entries
+          // whose pid === ourPid() (or whose id is in ourWaiterIds —
+          // addInFlight reuses the waiter id). Do NOT wipe siblings' in-flight
+          // entries — a global wipe would re-arm the within-machine burst race
+          // for siblings (their launches would vanish from the local count).
+          const myPid = ourPid();
+          state.inflight = state.inflight.filter((e) =>
+            e.pid !== myPid && !ourWaiterIds.has(e.id)
+          );
         });
       } catch { /* ignore: lock unavailable on shutdown; watchdog will clean up */ }
       holdsToken = false;

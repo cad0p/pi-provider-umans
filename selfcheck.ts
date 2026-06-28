@@ -531,7 +531,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   try {
     poisoned = readState(stateFile);
   } catch (e) {
-    poisoned = { waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 };
+    poisoned = { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
     assert(false, "SEC5-2: readState threw on poisoned waiters (should drop silently)");
   }
   assert(poisoned.waiters.length === 1, "SEC5-2: readState drops poisoned waiters, keeps well-formed");
@@ -839,6 +839,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       { id: "w3", pid: process.pid, ts: now - 999_999 }, // stale ts -> reap
     ],
     token: { id: "t1", pid: dead, ts: now - 1000 }, // dead pid -> reap
+    inflight: [],
     pausedUntil: 0, pausedReason: null, pausedTs: 0,
   };
   const reaped = reapStale(state, cfg as any, now);
@@ -862,6 +863,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const state = {
     waiters: [],
     token: { id: "t1", pid: process.pid, ts: now - 31_000 },
+    inflight: [],
     pausedUntil: 0, pausedReason: null, pausedTs: 0,
   };
   const reaped = reapStale(state, cfg as any, now);
@@ -997,6 +999,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const state = {
     waiters: [],
     token: null,
+    inflight: [],
     pausedUntil: now + 1e13, // absurd future deadline
     pausedReason: "poisoned",
     pausedTs: now - MAX_PAUSE_MS - 1, // set just past the ceiling ago
@@ -1031,6 +1034,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const state = {
     waiters: [],
     token: null,
+    inflight: [],
     pausedUntil: now + 100 * 60 * 60 * 1000, // 100h — exceeds MAX_PAUSE_MS (5h)
     pausedReason: "poisoned-forward-dated",
     pausedTs: now + 100 * 60 * 60 * 1000, // also forward-dated (future)
@@ -1068,6 +1072,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const gapState = {
     waiters: [],
     token: null,
+    inflight: [],
     pausedUntil: now + 2 * 60 * 60 * 1000,
     pausedReason: "poisoned-claimed-duration",
     pausedTs: now - 4 * 60 * 60 * 1000,
@@ -6061,6 +6066,266 @@ if (process.platform !== "win32") {
     }
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// --- D11 local in-flight: addInFlight/removeInFlight + snapshot().inflightCount ---
+// acquireSlot increments local in-flight BEFORE releasing the token (C8: the
+// order is load-bearing — the next head's readState must see our entry before
+// it can claim the token). snapshot().inflightCount is the post-reap count.
+// Release decrements; abort decrements (via cancel, C6).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-inflight-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // addInFlight pushes an entry; snapshot().inflightCount reflects it.
+  assert(q.snapshot().inflightCount === 0, "D11: empty queue has inflightCount 0");
+  q.addInFlight("id-1");
+  assert(q.snapshot().inflightCount === 1, "D11: addInFlight increments inflightCount to 1");
+  q.addInFlight("id-2");
+  assert(q.snapshot().inflightCount === 2, "D11: second addInFlight increments to 2");
+
+  // The entry is persisted to the state file.
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(Array.isArray(st.inflight) && st.inflight.length === 2,
+    "D11: inflight entries persisted to state file");
+  assert(st.inflight[0].id === "id-1" && typeof st.inflight[0].pid === "number" && typeof st.inflight[0].ts === "number",
+    "D11: inflight entry has id + pid + ts");
+
+  // removeInFlight splices the matching entry (best-effort).
+  q.removeInFlight("id-1");
+  assert(q.snapshot().inflightCount === 1, "D11: removeInFlight decrements to 1");
+  q.removeInFlight("id-2");
+  assert(q.snapshot().inflightCount === 0, "D11: removeInFlight decrements to 0");
+  // removeInFlight on a non-existent id is a no-op (no throw).
+  q.removeInFlight("never-existed");
+  assert(q.snapshot().inflightCount === 0, "D11: removeInFlight on non-existent id is a no-op");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + C6: cancel(ourId) splices the matching in-flight entry ---
+// An abort-after-launch path that calls cancel must not leak the in-flight
+// entry for 120s (localInFlight would be inflated by 1, blocking one slot).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-cancel-inflight-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  q.addInFlight("our-id");
+  q.addInFlight("sibling-id");
+  assert(q.snapshot().inflightCount === 2, "C6 setup: 2 in-flight entries");
+
+  // cancel(ourId) splices the in-flight entry (C6) in addition to the waiter.
+  q.cancel("our-id");
+  assert(q.snapshot().inflightCount === 1, "C6: cancel splices the matching in-flight entry");
+  // Sibling's entry is untouched.
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.inflight.length === 1 && st.inflight[0].id === "sibling-id",
+    "C6: cancel leaves sibling's in-flight entry intact");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + Adv2: poisoned inflight (non-array / malformed) coerces to [] ---
+// A poisoned/hand-edited state file can put arbitrary objects into inflight.
+// readState coerces a non-array to [] + drops malformed entries so reapStale/
+// isPidDead operate on well-typed input (no NaN wedge that blocks the gate
+// forever).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-poison-inflight-"));
+  const stateFile = join(dir, "state.json");
+
+  // (a) non-array inflight (string) → coerced to [].
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: "garbage",
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  let st = readState(stateFile);
+  assert(Array.isArray(st.inflight) && st.inflight.length === 0,
+    "Adv2: non-array inflight (string) coerced to []");
+
+  // (b) non-array inflight (number) → coerced to [].
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: 42,
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  st = readState(stateFile);
+  assert(Array.isArray(st.inflight) && st.inflight.length === 0,
+    "Adv2: non-array inflight (number) coerced to []");
+
+  // (c) array with malformed entries → dropped by isInFlightEntry.
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: [
+      { id: "ok", pid: process.pid, ts: Date.now() },
+      { id: "bad-pid", pid: "not-a-number", ts: Date.now() },
+      { id: "missing-ts", pid: process.pid },
+      "not-an-object",
+      null,
+    ],
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  st = readState(stateFile);
+  assert(st.inflight.length === 1 && st.inflight[0].id === "ok",
+    "Adv2: malformed inflight entries dropped by isInFlightEntry (well-formed kept)");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + Adv2: poisoned inflight with 100 live-PID entries blocks the gate (DoS surface) ---
+// The inflight array is a gate input (max(localInFlight, ...) < cap). A hostile
+// local process with write access to the state file can inflate inflight to
+// block all launches. This documents the accepted trust boundary (same threat
+// model as waiters/token, but higher impact — a poisoned waiters array only
+// queues, a poisoned inflight array blocks).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-dos-inflight-"));
+  const stateFile = join(dir, "state.json");
+
+  // Inject 100 live-PID (launchd pid 1 is always alive) in-flight entries.
+  const now = Date.now();
+  const poisoned = Array.from({ length: 100 }, (_, i) => ({
+    id: `poison-${i}`, pid: 1, ts: now, // pid 1 is launchd (always alive)
+  }));
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: poisoned,
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  const q = createConcurrencyQueue({ stateFile });
+  // The 100 live-PID entries are NOT reaped (isPidDead(1) is false) + within
+  // the 120s bound → inflightCount is 100 → the gate blocks (max(100, ...) >= cap).
+  assert(q.snapshot().inflightCount === 100,
+    "Adv2: 100 live-PID inflight entries block the gate (documented DoS surface)");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + reapStale: dead-PID + >120s in-flight entries are reaped ---
+// The same watchdog pattern that reaps stale waiters/tokens also reaps a
+// crashed/aborted in-flight entry (same 120s bound). A SIGKILL between
+// addInFlight + the HTTP send leaves a phantom entry that blocks one slot
+// for up to 120s (fail-closed, consistent with the token watchdog).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-reap-inflight-"));
+  const stateFile = join(dir, "state.json");
+  const now = Date.now();
+  // A state file with: (a) a dead-PID in-flight entry, (b) a >120s-stale
+  // in-flight entry (live PID but old ts), (c) a fresh in-flight entry.
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: [
+      { id: "dead-pid", pid: 9_999_999, ts: now }, // dead pid -> reap
+      { id: "stale-ts", pid: process.pid, ts: now - 121_000 }, // >120s -> reap
+      { id: "fresh", pid: process.pid, ts: now }, // fresh -> keep
+    ],
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  const q = createConcurrencyQueue({ stateFile, now: () => now });
+  const snap = q.snapshot(); // snapshot calls reapStale
+  assert(snap.inflightCount === 1,
+    "D11: dead-PID + >120s in-flight entries reaped; fresh entry kept");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + C11: reset() is PID-scoped (does not wipe siblings' in-flight) ---
+// reset() splices only in-flight entries whose pid === ourPid() (or whose id is
+// in ourWaiterIds). A global wipe would re-arm the within-machine burst race
+// for siblings (their launches would vanish from the local count).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-reset-scope-"));
+  const stateFile = join(dir, "state.json");
+  const now = Date.now();
+  // Two processes' in-flight entries: ours (pid A) + a sibling's (pid B).
+  // Use the real process.pid for ours + a different (dead) pid for the sibling
+  // so reset (which keys on ourPid()) leaves the sibling's entry intact.
+  const siblingPid = 999_999; // dead, but reset should NOT reap it (it's not ours)
+  // Use a live sibling pid: launchd (1) is always alive.
+  const liveSiblingPid = 1;
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: [
+      { id: "ours-1", pid: process.pid, ts: now },
+      { id: "ours-2", pid: process.pid, ts: now },
+      { id: "sibling", pid: liveSiblingPid, ts: now },
+    ],
+    pausedUntil: 0, pausedReason: null, pausedTs: 0,
+  }));
+  const q = createConcurrencyQueue({ stateFile, now: () => now });
+  assert(q.snapshot().inflightCount === 3, "C11 setup: 3 in-flight entries (2 ours + 1 sibling)");
+  q.reset();
+  const snap = q.snapshot();
+  assert(snap.inflightCount === 1,
+    "C11: reset() splices only our own in-flight entries (sibling's intact)");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.inflight.length === 1 && st.inflight[0].id === "sibling",
+    "C11: sibling's in-flight entry survives our reset()");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D11 + C12: gate uses max(localInFlight, concurrent_sessions), not sum ---
+// max avoids double-counting the local in-flight that /usage already includes
+// once it catches up. If /usage is fresh (reports 4), max(2, 4) = 4 >= cap →
+// wait (correct); if /usage is stale-low (reports 2), max(2, 2) = 2 < cap →
+// free (the 3rd local launches, true total 5, absorbed by hard_cap headroom).
+// sum would double-count: sum(2, 4) = 6 >= cap → wait even when /usage is fresh
+// (over-serialization, peak 1-2 instead of 4/4).
+{
+  // (a) localInFlight=2, concurrent_sessions=4, limit=4 → max(2,4)=4 >= 4 → not free.
+  let decision = isCapacityFree(
+    { concurrentSessions: 4, limit: 4, hardCap: 8, priority: { low: false, until: 0, reason: null } },
+    { limit: 4, queuePaused: false, localInFlight: 2 },
+  );
+  assert(decision.free === false,
+    "C12: max(2,4)=4 >= cap 4 → not free (fresh /usage, local in-flight counted via max not sum)");
+
+  // (b) localInFlight=2, concurrent_sessions=2 (stale-low), limit=4 → max(2,2)=2 < 4 → free.
+  decision = isCapacityFree(
+    { concurrentSessions: 2, limit: 4, hardCap: 8, priority: { low: false, until: 0, reason: null } },
+    { limit: 4, queuePaused: false, localInFlight: 2 },
+  );
+  assert(decision.free === true,
+    "C12: max(2,2)=2 < cap 4 → free (stale /usage, local in-flight catches the burst)");
+
+  // (c) localInFlight=4, concurrent_sessions=0, limit=4 → max(4,0)=4 >= 4 → not free.
+  // This is the within-machine burst case: /usage hasn't caught up (reports 0),
+  // but local in-flight is 4 → the gate blocks a 5th local launch.
+  decision = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: false, until: 0, reason: null } },
+    { limit: 4, queuePaused: false, localInFlight: 4 },
+  );
+  assert(decision.free === false,
+    "C12: max(4,0)=4 >= cap 4 → not free (local in-flight blocks a 5th local launch even when /usage reports 0)");
+
+  // (d) sum would have over-serialized case (b): sum(2,2)=4 >= 4 → not free.
+  // Verify max is used by asserting (b) is free (sum would have blocked it).
+  // (Already asserted above — this documents the sum-vs-max distinction.)
+}
+
+// --- D11 + Adv5: addInFlight throws → acquireSlot aborts (fail-closed) ---
+// A throw (lock timeout, EACCES, ENOSPC) propagates to acquireSlot's finally,
+// which cancels the waiter + token + aborts the turn. Do NOT swallow — a
+// missing entry deflates the gate for siblings. Verify addInFlight propagates
+// a throw (simulated via a state file on a read-only path that causes the
+// mutate to fail).
+{
+  // Use a state file path whose parent dir cannot be created to force a
+  // write failure inside addInFlight's mutate. /dev/null/<file> cannot be
+  // created as a directory.
+  const q = createConcurrencyQueue({ stateFile: "/dev/null/cannot-exist/state.json" });
+  let threw = false;
+  try {
+    q.addInFlight("id-that-will-fail");
+  } catch (err) {
+    threw = true;
+  }
+  assert(threw,
+    "Adv5: addInFlight propagates a throw (fail-closed — turn aborts, does not proceed without the entry)");
 }
 
 console.log("\nall checks passed");

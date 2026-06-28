@@ -1408,9 +1408,16 @@ export default async function (pi: ExtensionAPI) {
         // blip not yet reflected in /usage). Without this, process B would see
         // priority.low === false and launch right into the 429 that A just hit.
         const snap = await fetchUsageSnapshot(apiKey, signal);
+        // Adv3: pass localInFlight IN via CapacityInputs (not read inside
+        // isCapacityFree) so the pure decision stays pure + the selfcheck
+        // suite constructs a CapacitySnapshot inline without a state file.
+        // snapshot() calls reapStale, so inflightCount is the post-reap count
+        // (dead-PID + >120s entries removed).
+        const qSnap = concurrencyQueue.snapshot();
         const decision = isCapacityFree(snap, {
           limit,
           queuePaused,
+          localInFlight: qSnap.inflightCount,
         });
         if (decision.repause) {
           // COV4-2: pauseUntil runs mutate -> writeStateAtomic -> renameSync,
@@ -1529,6 +1536,17 @@ export default async function (pi: ExtensionAPI) {
       // already reflects the wait; the launch itself is silent so as not to
       // spam notifies on every poll.
       //
+      // D11 local in-flight tracking: add an in-flight entry BEFORE releasing
+      // the token (C8: the order is load-bearing — the next head's readState
+      // must see our entry before it can claim the token, so max(localInFlight,
+      // concurrent_sessions) counts us + blocks a sibling from launching into
+      // our still-in-flight request). addInFlight is fail-closed (Adv5): a throw
+      // (lock timeout, EACCES, ENOSPC) propagates to the finally, which cancels
+      // the waiter + token + aborts the turn — do NOT swallow, a missing entry
+      // deflates the gate for siblings. The returned release fn calls
+      // removeInFlight (best-effort, mirroring releaseToken) in addition to the
+      // existing token + waiter cleanup.
+      concurrencyQueue.addInFlight(ourId);
       // Throughput fix: release the token IMMEDIATELY (not at message_end) so
       // the next head can poll + launch. The token serializes the /usage poll;
       // holding it across the send serializes to 1-at-a-time. Releasing here
@@ -1540,7 +1558,8 @@ export default async function (pi: ExtensionAPI) {
       released = true;
       return () => {
         releaseToken(); // no-op (token released above)
-        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
+        try { concurrencyQueue.removeInFlight(ourId); } catch { /* best-effort: watchdog reaps at 120s */ }
+        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present (also splices in-flight, C6)
       };
     } // end tokenAcquire
     // Unreachable: the loop above always either returns or throws. Defensive.
