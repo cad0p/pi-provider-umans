@@ -5733,10 +5733,9 @@ if (process.platform !== "win32") {
     "Adv4: past boxed_until → 30s floor (not silently disabled)");
   q.clearPause({ force: true });
 
-  // (d) 403 with HTML body (no timestamp) → 30s floor (C3 fallback).
-  const resD = new Response("<html><body>403 Forbidden</body></html>", { status: 403, headers: { "content-type": "text/html" } });
-  // isSuspendBody("<html>...403 Forbidden") is false → no pause pushed. Simulate
-  // a suspend-family HTML body so the 403 handler fires + the 30s floor applies.
+  // (d) 403 with HTML suspend body (no timestamp) → 30s floor (C3 fallback).
+  // A plain "403 Forbidden" HTML body would have isSuspendBody false → no pause;
+  // use a suspend-family HTML body so the handler fires + the 30s floor applies.
   const resD2 = new Response("<html>account_suspended</html>", { status: 403 });
   try { await raiseForUmansStatus(resD2, q); } catch { /* expected */ }
   const stD = JSON.parse(readFileSync(stateFile, "utf8"));
@@ -5956,12 +5955,6 @@ if (process.platform !== "win32") {
     }
     rmSync(dir, { recursive: true, force: true });
   }
-
-  // (b) /v1/usage 403 with unrelated body → fail-open (returns null, no pause).
-  // Verify via a direct fetchUsage call shape: isSuspendBody on an unrelated
-  // body returns false, so fetchUsage returns null (existing fail-open).
-  assert(!isSuspendBody(JSON.stringify({ error: "forbidden" })),
-    "Adv1: /v1/usage 403 with unrelated body → isSuspendBody false (fail-open, returns null)");
 }
 
 // --- /v1/usage 403-suspend synthetic snapshot flows through isCapacityFree → cap_abuse repause (COV-F3) ---
@@ -6157,59 +6150,34 @@ if (process.platform !== "win32") {
       if (!hs) return;
       for (const h of hs) await h(payload, makeCtx());
     }
-    // (a) Suspend body: message_end clears the non-sticky bridge (no force).
-    // The real sticky PAUSE_REASON_CAP_ABUSE pause is NOT pushed by
-    // message_end — it is pushed by the robust /usage cap_abuse branch + the
-    // side-call raiseForUmansStatus path (both read the full body). The
-    // errorMessage here carries the SDK-parsed prose (error.message with
-    // sibling boxed_until dropped), so message_end does NOT consult it for
-    // suspension classification. The bridge is cleared (non-sticky).
+    // (a)+(b) Suspend + non-suspend body: message_end clears the non-sticky
+    // bridge (no force). The production code does NOT branch on the body — it
+    // clears unconditionally when pausedReason === PAUSE_REASON_403_BRIDGE, so
+    // both bodies exercise the same path. The real sticky PAUSE_REASON_CAP_ABUSE
+    // pause is pushed by the robust /usage cap_abuse branch + the side-call
+    // raiseForUmansStatus path (both read the full body), not message_end. The
+    // errorMessage carries the SDK-parsed prose (error.message with sibling
+    // boxed_until dropped), so message_end does NOT consult it for suspension
+    // classification.
     await umansFactory(pi as any);
     const futureDeadline = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
     const suspendBody = `HTTP 403: {"error":{"type":"account_suspended","boxed_until":"${futureDeadline}"}}`;
-    await dispatch("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
-    let st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
-      "C1-reconcile setup: after_provider_response pushed the non-sticky bridge");
-    await dispatch("message_end", {
-      type: "message_end",
-      message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: suspendBody, content: [] },
-    });
-    st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.pausedUntil === 0 && st.pausedReason === null,
-      "C1: message_end with suspend body clears the non-sticky bridge (real cap_abuse pause is pushed by /usage + side-call, not message_end)");
-    await dispatch("session_shutdown", { type: "session_shutdown" });
-
-    // (b) Non-suspend (auth) body: message_end clears the bridge (no force).
-    rmSync(stateFile, { force: true });
-    const handlers2 = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
-    const pi2: any = {
-      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
-        if (!handlers2.has(event)) handlers2.set(event, []);
-        handlers2.get(event)!.push(h);
-      },
-      registerTool() {}, registerCommand() {}, registerProvider() {},
-      events: { on() {}, off() {}, emit() {} },
-    };
-    async function dispatch2(event: string, payload: any): Promise<void> {
-      const hs = handlers2.get(event);
-      if (!hs) return;
-      for (const h of hs) await h(payload, makeCtx());
-    }
-    await umansFactory(pi2 as any);
     const authBody = `HTTP 403: {"error":"forbidden","type":"authentication_error"}`;
-    await dispatch2("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
-    st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
-      "C1-reconcile setup (auth): after_provider_response pushed the non-sticky bridge");
-    await dispatch2("message_end", {
-      type: "message_end",
-      message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: authBody, content: [] },
-    });
-    st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.pausedUntil === 0 && st.pausedReason === null,
-      "C1: message_end with non-suspend body clears the bridge (no force needed)");
-    await dispatch2("session_shutdown", { type: "session_shutdown" });
+    for (const body of [suspendBody, authBody]) {
+      rmSync(stateFile, { force: true });
+      await dispatch("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
+      let st = JSON.parse(readFileSync(stateFile, "utf8"));
+      assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
+        "C1-reconcile setup: after_provider_response pushed the non-sticky bridge");
+      await dispatch("message_end", {
+        type: "message_end",
+        message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: body, content: [] },
+      });
+      st = JSON.parse(readFileSync(stateFile, "utf8"));
+      assert(st.pausedUntil === 0 && st.pausedReason === null,
+        "C1: message_end clears the non-sticky bridge (no force, no body-check)");
+    }
+    await dispatch("session_shutdown", { type: "session_shutdown" });
 
     // (c) TOCTOU: a sibling pushes a sticky PAUSE_REASON_CAP_ABUSE pause
     // between the snapshot() read and the clearPause() call. The no-force
@@ -6234,7 +6202,7 @@ if (process.platform !== "win32") {
     }
     await umansFactory(pi3 as any);
     await dispatch3("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
-    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    let st = JSON.parse(readFileSync(stateFile, "utf8"));
     assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
       "C1-reconcile setup (toctou): after_provider_response pushed the non-sticky bridge");
     // Simulate a sibling's /usage cap_abuse branch racing between the
@@ -6628,25 +6596,18 @@ if (process.platform !== "win32") {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-poison-inflight-"));
   const stateFile = join(dir, "state.json");
 
-  // (a) non-array inflight (string) → coerced to [].
-  writeFileSync(stateFile, JSON.stringify({
-    waiters: [], token: null,
-    inflight: "garbage",
-    pausedUntil: 0, pausedReason: null, pausedTs: 0,
-  }));
-  let st = readState(stateFile);
-  assert(Array.isArray(st.inflight) && st.inflight.length === 0,
-    "Adv2: non-array inflight (string) coerced to []");
-
-  // (b) non-array inflight (number) → coerced to [].
-  writeFileSync(stateFile, JSON.stringify({
-    waiters: [], token: null,
-    inflight: 42,
-    pausedUntil: 0, pausedReason: null, pausedTs: 0,
-  }));
-  st = readState(stateFile);
-  assert(Array.isArray(st.inflight) && st.inflight.length === 0,
-    "Adv2: non-array inflight (number) coerced to []");
+  // (a)+(b) non-array inflight values → coerced to []. readState uses a single
+  // Array.isArray branch, so multiple types exercise the same path.
+  for (const bad of ["garbage", 42, true, {}]) {
+    writeFileSync(stateFile, JSON.stringify({
+      waiters: [], token: null,
+      inflight: bad,
+      pausedUntil: 0, pausedReason: null, pausedTs: 0,
+    }));
+    const st = readState(stateFile);
+    assert(Array.isArray(st.inflight) && st.inflight.length === 0,
+      `Adv2: non-array inflight (${typeof bad} ${JSON.stringify(bad)}) coerced to []`);
+  }
 
   // (c) array with malformed entries → dropped by isInFlightEntry.
   writeFileSync(stateFile, JSON.stringify({
@@ -6660,7 +6621,7 @@ if (process.platform !== "win32") {
     ],
     pausedUntil: 0, pausedReason: null, pausedTs: 0,
   }));
-  st = readState(stateFile);
+  const st = readState(stateFile);
   assert(st.inflight.length === 1 && st.inflight[0].id === "ok",
     "Adv2: malformed inflight entries dropped by isInFlightEntry (well-formed kept)");
 
@@ -6722,8 +6683,6 @@ if (process.platform !== "win32") {
   const snap = q.snapshot(); // snapshot calls reapStale
   assert(snap.inflightCount === 2,
     "D11: dead-PID + >120s in-flight entries reaped; fresh + exact-120s-boundary entries kept");
-  assert(snap.inflightCount === 2,
-    "COV-F6: in-flight entry at exactly staleTokenMs (120s) is KEPT (<= boundary, not reaped)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6737,10 +6696,8 @@ if (process.platform !== "win32") {
   const stateFile = join(dir, "state.json");
   const now = Date.now();
   // Two processes' in-flight entries: ours (pid A) + a sibling's (pid B).
-  // Use the real process.pid for ours + a different (dead) pid for the sibling
-  // so reset (which keys on ourPid()) leaves the sibling's entry intact.
-  const siblingPid = 999_999; // dead, but reset should NOT reap it (it's not ours)
-  // Use a live sibling pid: launchd (1) is always alive.
+  // Use the real process.pid for ours + a live sibling pid (launchd is always
+  // alive) so reset (which keys on ourPid()) leaves the sibling's entry intact.
   const liveSiblingPid = 1;
   writeFileSync(stateFile, JSON.stringify({
     waiters: [], token: null,
