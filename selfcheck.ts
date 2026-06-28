@@ -53,8 +53,8 @@ function assert(cond: boolean, msg: string) {
 }
 
 // QueueState + QueueConfig are exported as named types (used in exported fn signatures).
-assert(typeof (null as unknown as QueueState) === "object", "CLN9-3: QueueState type imported by name");
-assert(typeof (null as unknown as QueueConfig) === "object", "CLN9-3: QueueConfig type imported by name");
+assert(typeof (null as unknown as QueueState) === "object", "QueueState type imported by name");
+assert(typeof (null as unknown as QueueConfig) === "object", "QueueConfig type imported by name");
 
 // --- isNativeVision / pickVisionModel / hashImageId (unchanged) ---
 assert(isNativeVision(vision("a", true)) === true, "native vision is native");
@@ -221,16 +221,16 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   assert(isCapacityFree(
     { concurrentSessions: 10, limit: undefined, hardCap: 8, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === false, "CORR8-1: unlimited plan (limit undefined) + cur (10) >= hard_cap (8) → not free (D5)");
+  ).free === false, "unlimited plan (limit undefined) + cur (10) >= hard_cap (8) → not free (D5)");
   assert(isCapacityFree(
     { concurrentSessions: 5, limit: undefined, hardCap: 8, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === true, "CORR8-1: unlimited plan (limit undefined) + cur (5) < hard_cap (8) → free (falls back to hard_cap)");
+  ).free === true, "unlimited plan (limit undefined) + cur (5) < hard_cap (8) → free (falls back to hard_cap)");
   // True unlimited (all caps undefined) → free (no cap to exceed).
   assert(isCapacityFree(
     { concurrentSessions: 999, limit: undefined, hardCap: undefined, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === true, "CORR8-1: all caps undefined → free (no cap to exceed)");
+  ).free === true, "all caps undefined → free (no cap to exceed)");
 }
 
 // --- decideLaunch capacity-poll branch logic (extracted from acquireSlot) ---
@@ -241,31 +241,31 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 {
   // free-first-poll: capacity is free on the first check → launch immediately.
   assert(decideLaunch({ isFree: true, elapsedMs: 0, queuePaused: false, signalAborted: false }) === "launch",
-    "COV5-1: free on first poll → launch");
+    "free on first poll → launch");
   // poll-then-free: after waiting, capacity frees → launch.
   assert(decideLaunch({ isFree: true, elapsedMs: 5_000, queuePaused: false, signalAborted: false }) === "launch",
-    "COV5-1: free after polling → launch");
+    "free after polling → launch");
   // not free, under the cap, not aborted → wait.
   assert(decideLaunch({ isFree: false, elapsedMs: 1_000, queuePaused: false, signalAborted: false }) === "wait",
-    "COV5-1: not free under cap → wait");
+    "not free under cap → wait");
   // not free, cap elapsed, no pause → failOpen (ADV-3).
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: false, signalAborted: false }) === "failOpen",
-    "COV5-1: cap elapsed + no pause → failOpen");
+    "cap elapsed + no pause → failOpen");
   assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: false, signalAborted: false }) === "failOpen",
-    "COV5-1: well past cap + no pause → failOpen");
+    "well past cap + no pause → failOpen");
   // cap elapsed BUT a known pause is active → keep waiting (do not
   // fail open into a still-deprioritized account).
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: false }) === "wait",
-    "COV5-1: cap elapsed but paused → wait (CORR4-3 no fail-open during pause)");
+    "cap elapsed but paused → wait (CORR4-3 no fail-open during pause)");
   assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: true, signalAborted: false }) === "wait",
-    "COV5-1: well past cap but paused → wait (CORR4-3)");
+    "well past cap but paused → wait (CORR4-3)");
   // mid-poll abort: signal fired → abort (cancel + reject), even if cap elapsed.
   assert(decideLaunch({ isFree: false, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "abort",
-    "COV5-1: signal aborted → abort");
+    "signal aborted → abort");
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: false, signalAborted: true }) === "abort",
-    "COV5-1: signal aborted overrides failOpen → abort");
+    "signal aborted overrides failOpen → abort");
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: true }) === "abort",
-    "COV5-1: signal aborted overrides wait-during-pause → abort");
+    "signal aborted overrides wait-during-pause → abort");
   // signalAborted takes precedence over isFree (was: isFree first).
   // When the turn's AbortSignal fires mid-poll AND /usage is unreachable
   // (isCapacityFree(null) returns {free:true}), the prior isFree-first
@@ -288,23 +288,23 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 // cap at 2000ms; reset to 300ms on "launch" / "failOpen".
 {
   // wait grows by 1.5×, capped at 2000ms.
-  assert(nextPollInterval(300, "wait") === 450, "CMP6-3: 300 -> 450 on wait (1.5×)");
-  assert(nextPollInterval(450, "wait") === 675, "CMP6-3: 450 -> 675 on wait (1.5×)");
-  assert(nextPollInterval(675, "wait") === 1013, "CMP6-3: 675 -> 1013 on wait (1.5×, rounded)");
-  assert(nextPollInterval(1333, "wait") === 2000, "CMP6-3: 1333 -> 2000 on wait (capped at 2000)");
-  assert(nextPollInterval(2000, "wait") === 2000, "CMP6-3: 2000 -> 2000 on wait (cap holds)");
+  assert(nextPollInterval(300, "wait") === 450, "300 -> 450 on wait (1.5×)");
+  assert(nextPollInterval(450, "wait") === 675, "450 -> 675 on wait (1.5×)");
+  assert(nextPollInterval(675, "wait") === 1013, "675 -> 1013 on wait (1.5×, rounded)");
+  assert(nextPollInterval(1333, "wait") === 2000, "1333 -> 2000 on wait (capped at 2000)");
+  assert(nextPollInterval(2000, "wait") === 2000, "2000 -> 2000 on wait (cap holds)");
   // launch / failOpen / abort reset to base (300ms).
-  assert(nextPollInterval(2000, "launch") === 300, "CMP6-3: launch resets to base (300)");
-  assert(nextPollInterval(2000, "failOpen") === 300, "CMP6-3: failOpen resets to base (300)");
-  assert(nextPollInterval(2000, "abort") === 300, "CMP6-3: abort resets to base (300)");
+  assert(nextPollInterval(2000, "launch") === 300, "launch resets to base (300)");
+  assert(nextPollInterval(2000, "failOpen") === 300, "failOpen resets to base (300)");
+  assert(nextPollInterval(2000, "abort") === 300, "abort resets to base (300)");
   // A simulated sustained-pause sequence: 300 -> 450 -> 675 -> 1013 -> 1520 -> 2000 -> 2000.
   let ms = 300;
   const seq: number[] = [ms];
   for (let i = 0; i < 6; i++) { ms = nextPollInterval(ms, "wait"); seq.push(ms); }
   assert(seq[0] === 300 && seq[1] === 450 && seq[2] === 675 && seq[3] === 1013 && seq[4] === 1520 && seq[5] === 2000 && seq[6] === 2000,
-    "CMP6-3: sustained-wait sequence backs off 300→450→675→1013→1520→2000→2000");
+    "sustained-wait sequence backs off 300→450→675→1013→1520→2000→2000");
   // A launch mid-sequence resets to base.
-  assert(nextPollInterval(2000, "launch") === 300, "CMP6-3: launch after sustained wait resets to base");
+  assert(nextPollInterval(2000, "launch") === 300, "launch after sustained wait resets to base");
 }
 
 // --- shouldReleaseOnMessageEnd release guard (extracted from message_end) ---
@@ -314,22 +314,22 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 // them). shouldReleaseOnMessageEnd is the pure seam tested here.
 {
   assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "umans" }, "umans") === true,
-    "COV5-2: umans assistant message → release");
+    "umans assistant message → release");
   assert(shouldReleaseOnMessageEnd({ role: "user", provider: "umans" }, "umans") === false,
-    "COV5-2: umans user message → no release");
+    "umans user message → no release");
   assert(shouldReleaseOnMessageEnd({ role: "toolResult", provider: "umans" }, "umans") === false,
-    "COV5-2: umans tool result → no release");
+    "umans tool result → no release");
   assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "openai" }, "openai") === false,
-    "COV5-2: non-umans provider (resolved from msg.provider) → no release");
+    "non-umans provider (resolved from msg.provider) → no release");
   // ctx.model.provider is the fallback when msg.provider is unset.
   assert(shouldReleaseOnMessageEnd({ role: "assistant" }, "umans") === true,
-    "COV5-2: ctx.model.provider=umans, msg.provider unset → release");
+    "ctx.model.provider=umans, msg.provider unset → release");
   assert(shouldReleaseOnMessageEnd({ role: "assistant" }, "anthropic") === false,
-    "COV5-2: ctx.model.provider=anthropic → no release");
+    "ctx.model.provider=anthropic → no release");
   assert(shouldReleaseOnMessageEnd(undefined, "umans") === false,
-    "COV5-2: undefined message → no release");
+    "undefined message → no release");
   assert(shouldReleaseOnMessageEnd({ role: "assistant", provider: "umans" }, undefined) === false,
-    "COV5-2: undefined provider → no release");
+    "undefined provider → no release");
 }
 
 
@@ -353,22 +353,22 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   const future = new Date(Date.now() + 60_000).toISOString();
   const pIso = parsePriority({ low: true, boxed_until: future, reason: "boxed" });
   assert(pIso.low === true && pIso.until === Date.parse(future),
-    "COV-HIGH-2: parsePriority ISO boxed_until -> ms via Date.parse");
-  assert(pIso.reason === "boxed", "COV-HIGH-2: parsePriority ISO reason captured");
+    "parsePriority ISO boxed_until -> ms via Date.parse");
+  assert(pIso.reason === "boxed", "parsePriority ISO reason captured");
 
   // Malformed string → Date.parse returns NaN → falls back to now+backoff.
   const pBad = parsePriority({ low: true, boxed_until: "not-a-date" });
   assert(pBad.low === true && pBad.until > Date.now(),
-    "COV-HIGH-2: parsePriority malformed ISO -> falls back to now+backoff");
+    "parsePriority malformed ISO -> falls back to now+backoff");
 
   // Empty string boxed_until with low=true → fallback (string is falsy-empty).
   const pEmpty = parsePriority({ low: true, boxed_until: "" });
   assert(pEmpty.until > Date.now(),
-    "COV-HIGH-2: parsePriority empty-string boxed_until -> fallback");
+    "parsePriority empty-string boxed_until -> fallback");
 
   // low=false ignores boxed_until entirely (until stays 0).
   assert(parsePriority({ low: false, boxed_until: future }).until === 0,
-    "COV-HIGH-2: parsePriority low=false ignores boxed_until");
+    "parsePriority low=false ignores boxed_until");
 }
 
 // --- pausedReason is capped + sanitized (no ANSI/control injection) ---
@@ -392,16 +392,16 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   // parsePriority must cap + strip.
   const p = parsePriority({ low: true, boxed_until: null, reason: crafted });
   assert(p.reason !== null && p.reason!.length <= 64,
-    "SEC5-1: parsePriority caps reason to <= 64 chars");
+    "parsePriority caps reason to <= 64 chars");
   assert(!/[\x00-\x1f\x7f]/.test(p.reason ?? ""),
-    "SEC5-1: parsePriority strips control/ANSI-escape chars from reason");
-  assert(!p.reason!.includes("\x1b"), "SEC5-1: ESC byte (ANSI introducer) removed");
+    "parsePriority strips control/ANSI-escape chars from reason");
+  assert(!p.reason!.includes("\x1b"), "ESC byte (ANSI introducer) removed");
   // After stripping control/ANSI-escape chars, the printable portion is
   // "[31mred[0m" (9 chars, the ESC bytes removed but the printable CSI params
   // remain) + 200 A's = 209 chars; truncated to the 64-char cap. The exact
   // prefix doesn't matter — what matters is the cap + the trailing A's survive.
   assert(p.reason!.length === 64 && p.reason!.endsWith("A"),
-    "SEC5-1: parsePriority keeps printable chars, truncated to 64-char cap");
+    "parsePriority keeps printable chars, truncated to 64-char cap");
 
   // pauseUntil (the write boundary) must also sanitize — defense-in-depth so a
   // future caller that bypasses parsePriority cannot poison the file.
@@ -409,15 +409,15 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   q.pauseUntil(Date.now() + 10_000, crafted);
   const raw = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(typeof raw.pausedReason === "string" && raw.pausedReason.length <= 64,
-    "ADV5-5: pauseUntil writes a capped reason to the shared file");
+    "pauseUntil writes a capped reason to the shared file");
   assert(!/[\x00-\x1f\x7f]/.test(raw.pausedReason ?? ""),
-    "ADV5-5: pauseUntil writes no control/ANSI-escape chars");
+    "pauseUntil writes no control/ANSI-escape chars");
   // snapshot().pausedReason is the rendered value — must be clean too.
   const snap = q.snapshot();
   assert(snap.pausedReason !== null && snap.pausedReason.length <= 64,
-    "SEC5-1: snapshot().pausedReason is capped");
+    "snapshot().pausedReason is capped");
   assert(!/[\x00-\x1f\x7f]/.test(snap.pausedReason ?? ""),
-    "SEC5-1: snapshot().pausedReason has no control/ANSI-escape chars");
+    "snapshot().pausedReason has no control/ANSI-escape chars");
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -479,26 +479,26 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   writeFileSync(stateFile, '{"waiters":[');
   const truncated = readState(stateFile);
   assert(truncated.waiters.length === 0 && truncated.token === null,
-    "COV-HIGH-3: readState truncated JSON -> empty state (no throw)");
+    "readState truncated JSON -> empty state (no throw)");
 
   // Garbage waiters array (entries lack id/pid/ts) → dropped by the shape
   // guard (SEC5-2); reapStale/isPidDead never see a non-number pid.
   writeFileSync(stateFile, JSON.stringify({ waiters: [{ foo: 1 }, { bar: 2 }] }));
   const garbage = readState(stateFile);
   assert(garbage.waiters.length === 0,
-    "COV-HIGH-3: readState garbage waiters entries dropped (shape-validated)");
+    "readState garbage waiters entries dropped (shape-validated)");
 
   // Non-object token (a string) → null (shape guard rejects it, SEC5-2).
   writeFileSync(stateFile, JSON.stringify({ token: "not-an-object" }));
   const badTok = readState(stateFile);
   assert(badTok.token === null,
-    "COV-HIGH-3: readState non-object token -> null (shape-validated)");
+    "readState non-object token -> null (shape-validated)");
 
   // String pausedUntil → typeof !== number → falls to 0.
   writeFileSync(stateFile, JSON.stringify({ pausedUntil: "123", pausedTs: "456" }));
   const strPause = readState(stateFile);
   assert(strPause.pausedUntil === 0 && strPause.pausedTs === 0,
-    "COV-HIGH-3: readState string pausedUntil/pausedTs -> 0 (typeof guard)");
+    "readState string pausedUntil/pausedTs -> 0 (typeof guard)");
 
   rmSync(dir, { recursive: true, force: true });
 }
@@ -534,21 +534,21 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     poisoned = readState(stateFile);
   } catch (e) {
     poisoned = { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
-    assert(false, "SEC5-2: readState threw on poisoned waiters (should drop silently)");
+    assert(false, "readState threw on poisoned waiters (should drop silently)");
   }
-  assert(poisoned.waiters.length === 1, "SEC5-2: readState drops poisoned waiters, keeps well-formed");
+  assert(poisoned.waiters.length === 1, "readState drops poisoned waiters, keeps well-formed");
   assert(poisoned.waiters[0].id === "ok" && typeof poisoned.waiters[0].pid === "number",
-    "SEC5-2: surviving waiter is the well-formed entry");
+    "surviving waiter is the well-formed entry");
 
   // Poisoned token: pid is a string. Must be null (shape guard rejects it).
   writeFileSync(stateFile, JSON.stringify({ token: { id: "tok", pid: "not-a-number", ts: Date.now() } }));
   const badToken = readState(stateFile);
-  assert(badToken.token === null, "SEC5-2: readState drops poisoned token (non-number pid)");
+  assert(badToken.token === null, "readState drops poisoned token (non-number pid)");
 
   // reapStale on the poisoned state must not throw (entries already dropped).
   const q = createConcurrencyQueue({ stateFile, now: () => Date.now(), pid: () => process.pid });
   q.snapshot(); // drives a readState + reapStale
-  assert(q.snapshot().queued === 0, "SEC5-2: reapStale on poisoned state does not throw");
+  assert(q.snapshot().queued === 0, "reapStale on poisoned state does not throw");
   q.reset();
 
   rmSync(dir, { recursive: true, force: true });
@@ -566,7 +566,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   writeFileSync(stateFile, "{\"x\":" + "\"".repeat(2_000_000) + "\"}");
   const st = readState(stateFile);
   assert(st.waiters.length === 0 && st.token === null && st.pausedUntil === 0,
-    "SEC9-2: oversized state file returns empty state (no OOM)");
+    "oversized state file returns empty state (no OOM)");
 
   // a FIFO (named pipe) would block readFileSync forever. readState
   // must detect non-regular files via lstatSync + return empty state (no hang).
@@ -576,7 +576,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     execSync(`mkfifo "${fifoPath}"`);
     const fst = readState(fifoPath);
     assert(fst.waiters.length === 0 && fst.token === null,
-      "SEC9-4: FIFO state file returns empty state (no hang)");
+      "FIFO state file returns empty state (no hang)");
   } catch {
     // mkfifo unavailable (non-POSIX) — skip the FIFO assertion gracefully.
   }
@@ -606,9 +606,9 @@ if (process.platform !== "win32") {
   symlinkSync(canary, stateFile);
   const st = readState(stateFile);
   assert(st.waiters.length === 0 && st.token === null && st.pausedUntil === 0,
-    "SEC10-1: symlink state file returns empty state (not followed)");
+    "symlink state file returns empty state (not followed)");
   assert(readFileSync(canary, "utf8") === "CANARY-ORIGINAL",
-    "SEC10-1: symlink target not read through (canary intact)");
+    "symlink target not read through (canary intact)");
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -627,28 +627,28 @@ if (process.platform !== "win32") {
   const id2 = q.join()!;
   // Manually claim the token for id1 by waiting for launch.
   await q.waitForLaunch(id1);
-  assert(q.snapshot().tokenHeld === true, "COV-HIGH-4: id1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "id1 holds the token");
 
   // cancel a non-existent id → no-op (id1, id2, and token all unchanged).
   q.cancel("does-not-exist");
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 2 && st.token.id === id1,
-    "COV-HIGH-4: cancel non-existent id is a no-op");
+    "cancel non-existent id is a no-op");
 
   // cancel a non-head waiter (id2) → removes from queue, does NOT release token.
   q.cancel(id2);
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(!st.waiters.some((w: { id: string }) => w.id === id2) && st.waiters.length === 1,
-    "COV-HIGH-4: cancel non-head waiter removes it from the queue");
+    "cancel non-head waiter removes it from the queue");
   assert(st.token !== null && st.token.id === id1,
-    "COV-HIGH-4: cancel non-head waiter does NOT release the token");
+    "cancel non-head waiter does NOT release the token");
 
   // cancel the token-holder (id1) → releases token + removes waiter.
   q.cancel(id1);
   st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.token === null, "COV-HIGH-4: cancel token-holder releases the token");
-  assert(st.waiters.length === 0, "COV-HIGH-4: cancel token-holder removes its waiter");
-  assert(q.snapshot().tokenHeld === false, "COV-HIGH-4: holdsToken false after cancel");
+  assert(st.token === null, "cancel token-holder releases the token");
+  assert(st.waiters.length === 0, "cancel token-holder removes its waiter");
+  assert(q.snapshot().tokenHeld === false, "holdsToken false after cancel");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -668,17 +668,17 @@ if (process.platform !== "win32") {
   // Claim the token by joining + waiting for launch.
   const id = q.join()!;
   await q.waitForLaunch(id);
-  assert(q.snapshot().tokenHeld === true, "C1: token held after waitForLaunch");
+  assert(q.snapshot().tokenHeld === true, "token held after waitForLaunch");
   const before = JSON.parse(readFileSync(stateFile, "utf8"));
   const tsBefore = before.token.ts;
 
   // Sleep briefly so the re-stamp is observably later.
   await new Promise((r) => setTimeout(r, 10));
   const ok = q.touchToken(id);
-  assert(ok === true, "C1: touchToken returns true while we hold the token");
+  assert(ok === true, "touchToken returns true while we hold the token");
   const after = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(after.token.ts > tsBefore, "C1: touchToken advanced state.token.ts");
-  assert(after.token.id === id, "C1: touchToken kept our id");
+  assert(after.token.ts > tsBefore, "touchToken advanced state.token.ts");
+  assert(after.token.id === id, "touchToken kept our id");
 
   // Simulate a sibling's reapStale reaping our token: hand-edit the file to
   // point the token at a different id, then touchToken(ourId) must return false.
@@ -686,12 +686,12 @@ if (process.platform !== "win32") {
   poisoned.token = { id: "someone-else", pid: process.pid, ts: Date.now() };
   writeFileSync(stateFile, JSON.stringify(poisoned));
   const ok2 = q.touchToken(id);
-  assert(ok2 === false, "C1: touchToken returns false when token id mismatches (reaped)");
+  assert(ok2 === false, "touchToken returns false when token id mismatches (reaped)");
 
   // touchToken on an absent token (file cleared) returns false.
   writeFileSync(stateFile, JSON.stringify({ waiters: [], token: null, pausedUntil: 0, pausedReason: null, pausedTs: 0 }));
   const ok3 = q.touchToken(id);
-  assert(ok3 === false, "C1: touchToken returns false when token is absent");
+  assert(ok3 === false, "touchToken returns false when token is absent");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -713,20 +713,20 @@ if (process.platform !== "win32") {
   // handoff). Both ids land in the waiter FIFO.
   const id1 = q.join()!;
   const id2 = q.join()!;
-  assert(id1 !== id2, "COV6-2: two join() calls return distinct ids");
+  assert(id1 !== id2, "two join() calls return distinct ids");
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.waiters.length === 2, "COV6-2: both waiters present in the file after double-join");
+  assert(st.waiters.length === 2, "both waiters present in the file after double-join");
   assert(st.waiters.some((w: { id: string }) => w.id === id1) &&
          st.waiters.some((w: { id: string }) => w.id === id2),
-    "COV6-2: both waiter ids recorded in FIFO");
+    "both waiter ids recorded in FIFO");
 
   // reset() must splice BOTH (the old single-slot design leaked id1).
   q.reset();
   st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.waiters.length === 0, "COV6-2: reset() removes both waiters after double-join");
+  assert(st.waiters.length === 0, "reset() removes both waiters after double-join");
   assert(!st.waiters.some((w: { id: string }) => w.id === id1) &&
          !st.waiters.some((w: { id: string }) => w.id === id2),
-    "COV6-2: neither double-joined waiter leaks past reset()");
+    "neither double-joined waiter leaks past reset()");
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -776,14 +776,14 @@ if (process.platform !== "win32") {
         threw = true;
       }
       assert(!threw && typeof id === "string",
-        "ADV-R13-2: reaper unlinks planted symlink .tmp (join succeeds, no EEXIST wedge)");
+        "reaper unlinks planted symlink .tmp (join succeeds, no EEXIST wedge)");
       // The canary must be untouched (symlink was never followed).
       assert(readFileSync(canary, "utf8") === "ORIGINAL",
-        "SEC6-2: symlink target not written through (canary intact)");
+        "symlink target not written through (canary intact)");
       // The state file should exist (writeStateAtomic created it after reaper
       // cleared the symlink).
       assert(existsSync(stateFile),
-        "ADV-R13-2: state file created after reaper cleared planted symlink");
+        "state file created after reaper cleared planted symlink");
       if (id) q.cancel(id);
       q.reset();
     } finally {
@@ -812,8 +812,8 @@ if (process.platform !== "win32") {
         threw = true;
         code = (e as NodeJS.ErrnoException).code;
       }
-      assert(threw, "SEC6-2: writeStateAtomic rejects a pre-existing temp name");
-      assert(code === "EEXIST", "SEC6-2: pre-existing temp name throws EEXIST");
+      assert(threw, "writeStateAtomic rejects a pre-existing temp name");
+      assert(code === "EEXIST", "pre-existing temp name throws EEXIST");
       q.reset();
     } finally {
       Math.random = realRandom;
@@ -870,13 +870,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   };
   const reaped = reapStale(state, cfg as any, now);
   assert(reaped.token === null,
-    "COV2-M1: live-PID token with old ts (31s > staleTokenMs 30s) is reaped by time check");
+    "live-PID token with old ts (31s > staleTokenMs 30s) is reaped by time check");
 
   // Same live PID but ts within the ceiling — token is kept.
   const fresh = { ...state, token: { id: "t1", pid: process.pid, ts: now - 5_000 } };
   const reapedFresh = reapStale(fresh, cfg as any, now);
   assert(reapedFresh.token !== null && reapedFresh.token?.id === "t1",
-    "COV2-M1: live-PID token with fresh ts is kept");
+    "live-PID token with fresh ts is kept");
 }
 
 // --- S2: clampPauseUntil caps an over-large pause to now + MAX_PAUSE_MS ---
@@ -935,10 +935,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   q.pauseUntil(before + 10 * 60 * 60 * 1000, PAUSE_REASON_429); // 10h requested
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil <= before + MAX_PAUSE_429_MS + 1000, // +1s slack
-    "ADV4-2: 429-sourced pause clamped to MAX_PAUSE_429_MS (2.5 min), not 5h");
+    "429-sourced pause clamped to MAX_PAUSE_429_MS (2.5 min), not 5h");
   assert(st.pausedUntil < before + MAX_PAUSE_MS,
-    "ADV4-2: 429 pause is tighter than the 5h ceiling");
-  assert(st.pausedReason === PAUSE_REASON_429, "ADV4-2: 429 pause tagged with PAUSE_REASON_429");
+    "429 pause is tighter than the 5h ceiling");
+  assert(st.pausedReason === PAUSE_REASON_429, "429 pause tagged with PAUSE_REASON_429");
 
   // A non-429 pause (priority.low-origin) keeps the 5h ceiling.
   q.clearPause({ force: true });
@@ -946,15 +946,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   q.pauseUntil(beforeLow + 10 * 60 * 60 * 1000, "priority.low from /usage"); // 10h requested
   const stLow = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stLow.pausedUntil <= beforeLow + MAX_PAUSE_MS + 1000 && stLow.pausedUntil > beforeLow + MAX_PAUSE_429_MS,
-    "ADV4-2: priority.low pause keeps the 5h ceiling (not the tighter 429 cap)");
+    "priority.low pause keeps the 5h ceiling (not the tighter 429 cap)");
 
   // clampPauseUntil with the tighter ceiling is also used by the 429 handler
   // in index.ts for the Retry-After parse.
   const now = 1_700_000_000_000;
   assert(clampPauseUntil(now + 10 * 60 * 60 * 1000, now, MAX_PAUSE_429_MS) === now + MAX_PAUSE_429_MS,
-    "ADV4-2: clampPauseUntil(until, now, MAX_PAUSE_429_MS) clamps to the 2.5 min ceiling");
+    "clampPauseUntil(until, now, MAX_PAUSE_429_MS) clamps to the 2.5 min ceiling");
   assert(clampPauseUntil(now + 60_000, now, MAX_PAUSE_429_MS) === now + 60_000,
-    "ADV4-2: clampPauseUntil sub-2.5min pause unchanged");
+    "clampPauseUntil sub-2.5min pause unchanged");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -975,15 +975,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const past = Date.now() - 60_000;
   q.pauseUntil(past, "stale reason that should not persist");
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedUntil === 0, "COV6-3: past pauseUntil leaves pausedUntil at 0");
-  assert(st.pausedReason === null, "COV6-3: past pauseUntil leaves pausedReason null");
+  assert(st.pausedUntil === 0, "past pauseUntil leaves pausedUntil at 0");
+  assert(st.pausedReason === null, "past pauseUntil leaves pausedReason null");
 
   // Sanity: a FUTURE deadline still writes (the happy path is unchanged).
   const future = Date.now() + 30_000;
   q.pauseUntil(future, "real pause");
   const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st2.pausedUntil === future, "COV6-3: future pauseUntil still writes pausedUntil");
-  assert(st2.pausedReason === "real pause", "COV6-3: future pauseUntil still writes pausedReason");
+  assert(st2.pausedUntil === future, "future pauseUntil still writes pausedUntil");
+  assert(st2.pausedReason === "real pause", "future pauseUntil still writes pausedReason");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1081,13 +1081,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   };
   const gapReaped = reapStale(gapState, cfg as any, now);
   assert(gapReaped.pausedUntil === 0 && gapReaped.pausedReason === null && gapReaped.pausedTs === 0,
-    "ADV10-1: pause whose claimed duration (pausedUntil - pausedTs) exceeds MAX_PAUSE_MS is reaped even when age + duration-from-now are both under the ceiling");
+    "pause whose claimed duration (pausedUntil - pausedTs) exceeds MAX_PAUSE_MS is reaped even when age + duration-from-now are both under the ceiling");
   // A pause whose claimed duration is within the ceiling + age + duration-from-now
   // also within is NOT reaped (no false positive).
   const safeState = { ...gapState, pausedTs: now - 1_000 };
   const safeReaped = reapStale(safeState, cfg as any, now);
   assert(safeReaped.pausedUntil === gapState.pausedUntil,
-    "ADV10-1: pause with claimed duration under ceiling is not reaped (no false positive)");
+    "pause with claimed duration under ceiling is not reaped (no false positive)");
 }
 
 // --- createConcurrencyQueue: FIFO + launch token (file-backed, temp dir) ---
@@ -1137,7 +1137,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // 1 claims the token.
   const id1 = q.join()!;
   const r1 = await q.waitForLaunch(id1);
-  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: w1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "w1 holds the token");
 
   // 2 + 3 queue behind 1.
   const id2 = q.join()!;
@@ -1146,37 +1146,37 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const p2 = q.waitForLaunch(id2).then((r) => { got2 = r; return r; });
   const p3 = q.waitForLaunch(id3).then((r) => { got3 = r; return r; });
   await new Promise((r) => setTimeout(r, 80));
-  assert(!got2 && !got3, "COV-HIGH-5: w2 + w3 blocked while w1 holds token");
-  assert(q.snapshot().queued === 3, "COV-HIGH-5: 3 waiters queued");
+  assert(!got2 && !got3, "w2 + w3 blocked while w1 holds token");
+  assert(q.snapshot().queued === 3, "3 waiters queued");
 
   // 1 releases → 2 claims (promote-once).
   r1();
   await p2;
-  assert(typeof got2 === "function", "COV-HIGH-5: w2 claims after w1 releases");
-  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: w2 now holds token");
+  assert(typeof got2 === "function", "w2 claims after w1 releases");
+  assert(q.snapshot().tokenHeld === true, "w2 now holds token");
   await new Promise((r) => setTimeout(r, 80));
-  assert(!got3, "COV-HIGH-5: w3 still blocked while w2 holds token");
+  assert(!got3, "w3 still blocked while w2 holds token");
 
   // 2 releases → 3 claims (promote-twice, steady-state drain).
   got2!();
   await p3;
-  assert(typeof got3 === "function", "COV-HIGH-5: w3 claims after w2 releases");
+  assert(typeof got3 === "function", "w3 claims after w2 releases");
   got3!();
-  assert(q.snapshot().queued === 0, "COV-HIGH-5: queue drains after all release");
+  assert(q.snapshot().queued === 0, "queue drains after all release");
 
   // Late-joiner: a waiter that joins AFTER the token is already held by a
   // long-running poller. idHolder claims first; idLate joins behind it.
   const idHolder = q.join()!;
   const rHolder = await q.waitForLaunch(idHolder);
-  assert(q.snapshot().tokenHeld === true, "COV-HIGH-5: late-joiner setup — holder holds token");
+  assert(q.snapshot().tokenHeld === true, "late-joiner setup — holder holds token");
   const idLate = q.join()!;
   let gotLate = false;
   const pLate = q.waitForLaunch(idLate).then((r) => { gotLate = true; return r; });
   await new Promise((r) => setTimeout(r, 80));
-  assert(!gotLate, "COV-HIGH-5: late-joiner blocked (token held when it joined)");
+  assert(!gotLate, "late-joiner blocked (token held when it joined)");
   rHolder();
   await pLate;
-  assert(gotLate, "COV-HIGH-5: late-joiner claims after holder releases");
+  assert(gotLate, "late-joiner claims after holder releases");
   // Drain the late-joiner's token via reset (its release fn is captured in pLate).
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1200,7 +1200,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // join() must succeed (acquireLock reclaims the stale lockfile + retries).
   const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id = q.join()!;
-  assert(id !== null, "COV-MED-3: join succeeds despite stale lockfile (reclaimed)");
+  assert(id !== null, "join succeeds despite stale lockfile (reclaimed)");
 
   // The stale lockfile must be gone after acquireLock reclaimed it (and the
   // new one released after the critical section). join() completes the mutate,
@@ -1211,7 +1211,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const { readFileSync } = await import("node:fs");
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 1 && st.waiters[0].id === id,
-    "COV-MED-3: stale-lockfile recovery let the mutate write our waiter");
+    "stale-lockfile recovery let the mutate write our waiter");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1275,13 +1275,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   } catch (e) {
     rejected = true;
     assert((e as Error).message.includes("aborted"),
-      "C3: waitForLaunch rejects with an abort error (the seam acquireSlot catches)");
+      "waitForLaunch rejects with an abort error (the seam acquireSlot catches)");
   }
-  assert(rejected, "C3: already-aborted signal rejects waitForLaunch (acquireSlot returns undefined)");
+  assert(rejected, "already-aborted signal rejects waitForLaunch (acquireSlot returns undefined)");
   // The mid-poll abort decision (signal aborts AFTER the token is held) drives
   // the `return undefined` branch in acquireSlot's poll loop.
   assert(decideLaunch({ isFree: false, elapsedMs: 1_000, queuePaused: false, signalAborted: true }) === "abort",
-    "C3: decideLaunch returns 'abort' for a mid-poll abort (acquireSlot returns undefined, not throw)");
+    "decideLaunch returns 'abort' for a mid-poll abort (acquireSlot returns undefined, not throw)");
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -1299,13 +1299,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const stateFile = join(base, "nonexistent-parent", "nested", "state.json");
   const q = createConcurrencyQueue({ stateFile });
   const id = q.join();
-  assert(id !== null, "COV4-1: join succeeds when parent dir is missing (mkdirSync hoisted)");
+  assert(id !== null, "join succeeds when parent dir is missing (mkdirSync hoisted)");
 
   // The state file must have been written (the first mutate wrote through).
   const { readFileSync } = await import("node:fs");
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 1 && st.waiters[0].id === id,
-    "COV4-1: first mutate wrote the waiter through the created nested dir");
+    "first mutate wrote the waiter through the created nested dir");
 
   q.reset();
   rmSync(base, { recursive: true, force: true });
@@ -1340,7 +1340,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     } catch (err) {
       caught = err;
     }
-    assert(caught instanceof Error, "COV4-2: queue pauseUntil throws on disk failure (caller must swallow)");
+    assert(caught instanceof Error, "queue pauseUntil throws on disk failure (caller must swallow)");
 
     // The index.ts pattern: wrap pauseUntil in try/catch + warn + swallow so
     // capacityFree/refreshUsage/the 429 handler return a decision instead of
@@ -1355,7 +1355,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     } catch {
       guarded = false;
     }
-    assert(guarded === true, "COV4-2: try/catch around pauseUntil swallows the throw (turn does not abort)");
+    assert(guarded === true, "try/catch around pauseUntil swallows the throw (turn does not abort)");
   } finally {
     chmodSync(dir, 0o700); // restore so rmSync can clean up
   }
@@ -1370,24 +1370,24 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 {
   const fallback = 4;
   assert(parseConcurrencyLimit("2.5", fallback) === fallback,
-    "CLN4-3: '2.5' → fallback (fractional rejected, was kept as-is)");
+    "'2.5' → fallback (fractional rejected, was kept as-is)");
   assert(parseConcurrencyLimit(" ", fallback) === fallback,
-    "COV-MED-6: whitespace → fallback");
+    "whitespace → fallback");
   assert(parseConcurrencyLimit("0", fallback) === fallback,
-    "COV-MED-6: '0' → fallback (non-positive)");
+    "'0' → fallback (non-positive)");
   assert(parseConcurrencyLimit("abc", fallback) === fallback,
-    "COV-MED-6: 'abc' → fallback (NaN)");
+    "'abc' → fallback (NaN)");
   assert(parseConcurrencyLimit("", fallback) === fallback,
-    "COV-MED-6: empty → fallback");
+    "empty → fallback");
   assert(parseConcurrencyLimit(undefined, fallback) === fallback,
-    "COV-MED-6: undefined → fallback");
+    "undefined → fallback");
   assert(parseConcurrencyLimit("-5", fallback) === fallback,
-    "COV-MED-6: '-5' → fallback (negative)");
+    "'-5' → fallback (negative)");
   assert(parseConcurrencyLimit("3", fallback) === 3,
-    "COV-MED-6: '3' → 3 (valid)");
+    "'3' → 3 (valid)");
   // fallback undefined (unlimited plan) propagates.
   assert(parseConcurrencyLimit("0", undefined) === undefined,
-    "COV-MED-6: '0' with undefined fallback → undefined");
+    "'0' with undefined fallback → undefined");
   // hex / scientific notation / fractional are rejected by
   // the strict /^\d+$/ regex BEFORE Number(trimmed) — Number() accepts them
   // (Number("0x10")===16, Number("1e3")===1000, Number("2.0")===2) and
@@ -1483,11 +1483,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(snapB.paused && snapB.pausedUntil === until, "pause written by A visible to B (shared file)");
   // pausedReason is surfaced in the snapshot so the status bar
   // can show WHY the account is backed off (e.g. "HTTP 429 from gateway").
-  assert(snapB.pausedReason === "429 from A", "CMP-LOW-4: pausedReason visible to sibling (shared file)");
+  assert(snapB.pausedReason === "429 from A", "pausedReason visible to sibling (shared file)");
 
   qA.clearPause();
   assert(qB.snapshot().paused === false, "clearPause by A reflected in B");
-  assert(qB.snapshot().pausedReason === null, "CMP-LOW-4: pausedReason null after clearPause");
+  assert(qB.snapshot().pausedReason === null, "pausedReason null after clearPause");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1510,13 +1510,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const until = Date.now() + 10_000;
   qA.pauseUntil(until, "HTTP 429 from gateway");
   const snapB = qB.snapshot();
-  assert(snapB.paused === true, "C2: sibling sees shared paused before /usage catches up");
-  assert(snapB.pausedUntil === until, "C2: sibling sees the exact shared deadline");
+  assert(snapB.paused === true, "sibling sees shared paused before /usage catches up");
+  assert(snapB.pausedUntil === until, "sibling sees the exact shared deadline");
 
   // A clears it (force: a 429-origin pause survives a plain clearPause per
   // CORR4-1; the C2 test asserts the shared-file visibility, so force-clear).
   qA.clearPause({ force: true });
-  assert(qB.snapshot().paused === false, "C2: sibling sees pause lift when cleared");
+  assert(qB.snapshot().paused === false, "sibling sees pause lift when cleared");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1542,15 +1542,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // A writes a 429-origin pause (e.g. it just got a 429). 30s deadline.
   const until = Date.now() + 30_000;
   qA.pauseUntil(until, PAUSE_REASON_429);
-  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause visible to sibling");
-  assert(qB.snapshot().pausedReason === PAUSE_REASON_429, "CORR4-1: pause tagged 429");
+  assert(qB.snapshot().paused === true, "429 pause visible to sibling");
+  assert(qB.snapshot().pausedReason === PAUSE_REASON_429, "pause tagged 429");
 
   // B's stale /usage tick (priority.low===false) calls clearPause(). The 429
   // pause MUST survive — /usage hasn't caught up yet.
   qB.clearPause();
-  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause survives a stale /usage clearPause");
+  assert(qB.snapshot().paused === true, "429 pause survives a stale /usage clearPause");
   assert(qB.snapshot().pausedReason === PAUSE_REASON_429,
-    "CORR4-1: 429 pause reason preserved after stale clearPause");
+    "429 pause reason preserved after stale clearPause");
 
   // A non-429 pause (priority.low-origin) IS cleared by a plain clearPause —
   // refreshUsage must still drain the queue when /usage says traffic is healthy.
@@ -1558,16 +1558,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const untilLow = Date.now() + 30_000;
   qA.pauseUntil(untilLow, "priority.low from /usage");
   assert(qB.snapshot().paused === true && qB.snapshot().pausedReason === "priority.low from /usage",
-    "CORR4-1: priority.low-origin pause set");
+    "priority.low-origin pause set");
   qB.clearPause();
   assert(qB.snapshot().paused === false,
-    "CORR4-1: non-429 pause cleared by plain clearPause (queue drains on healthy /usage)");
+    "non-429 pause cleared by plain clearPause (queue drains on healthy /usage)");
 
   // force:true clears a 429 pause unconditionally (operator/explicit reset).
   qA.pauseUntil(Date.now() + 30_000, PAUSE_REASON_429);
-  assert(qB.snapshot().paused === true, "CORR4-1: 429 pause re-set for force-clear");
+  assert(qB.snapshot().paused === true, "429 pause re-set for force-clear");
   qB.clearPause({ force: true });
-  assert(qB.snapshot().paused === false, "CORR4-1: force:true clears a 429 pause unconditionally");
+  assert(qB.snapshot().paused === false, "force:true clears a 429 pause unconditionally");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1599,7 +1599,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   await new Promise((r) => setTimeout(r, 60)); // pre-reap: entry present
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.some((w: { id: string }) => w.id === id2),
-    "ADV-4: waiter 2 queued before staleWaiterMs");
+    "waiter 2 queued before staleWaiterMs");
 
   // Wait well past staleWaiterMs (80ms). Without re-insertion, the next
   // reapStale would drop id2 and waitForLaunch would poll forever. With
@@ -1607,7 +1607,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   await new Promise((r) => setTimeout(r, 200));
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.some((w: { id: string }) => w.id === id2),
-    "ADV-4: live-PID waiter re-inserted after staleWaiterMs (not lost)");
+    "live-PID waiter re-inserted after staleWaiterMs (not lost)");
 
   // Cleanly stop the poll loop via abort (cancel + reject).
   ctrl.abort();
@@ -1642,7 +1642,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // staleTokenMs defaults to 120s, so it survives the test window.
   const idHolder = q.join()!;
   const rHolder = await q.waitForLaunch(idHolder);
-  assert(q.snapshot().tokenHeld === true, "COV4-4: token held by the holder");
+  assert(q.snapshot().tokenHeld === true, "token held by the holder");
 
   // Waiter 1 joins → becomes head (behind the held token).
   const id1 = q.join()!;
@@ -1668,7 +1668,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // waiter 1 (re-inserted at the tail). Give the 50ms poll time to fire.
   rHolder();
   await new Promise((r) => setTimeout(r, 150));
-  assert(got2, "COV4-4: second waiter claims the token first after the head was reaped + re-inserted at tail");
+  assert(got2, "second waiter claims the token first after the head was reaped + re-inserted at tail");
 
   // Cleanly stop both poll loops.
   ctrl1.abort();
@@ -1707,11 +1707,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // The stale .tmp must be reaped; the fresh one must survive.
   let staleGone = false;
   try { statSync(staleTmp); } catch { staleGone = true; }
-  assert(staleGone, "ADV-1: stale .tmp (old mtime) reaped by writeStateAtomic");
+  assert(staleGone, "stale .tmp (old mtime) reaped by writeStateAtomic");
 
   let freshExists = false;
   try { statSync(freshTmp); freshExists = true; } catch { /* gone */ }
-  assert(freshExists, "ADV-1: fresh .tmp (current mtime) left untouched");
+  assert(freshExists, "fresh .tmp (current mtime) left untouched");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1748,11 +1748,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   let staleGone = false;
   try { statSync(staleTmp); } catch { staleGone = true; }
-  assert(staleGone, "C4: stale .tmp (mtime > STALE_TMP_MS before frozen now) reaped via cfg.now()");
+  assert(staleGone, "stale .tmp (mtime > STALE_TMP_MS before frozen now) reaped via cfg.now()");
 
   let freshExists = false;
   try { statSync(freshTmp); freshExists = true; } catch { /* gone */ }
-  assert(freshExists, "C4: fresh .tmp (mtime within window before frozen now) left untouched");
+  assert(freshExists, "fresh .tmp (mtime within window before frozen now) left untouched");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1834,22 +1834,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // stays null). Then session_shutdown fires and reset() is called.
   const q = createConcurrencyQueue({ stateFile });
   const ourId = q.join();
-  assert(ourId !== null, "COV5-5: join returned a waiter id");
+  assert(ourId !== null, "join returned a waiter id");
   // Confirm our waiter is in the file before reset.
   const before = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(before.waiters.some((w: { id: string }) => w.id === ourId),
-    "COV5-5: our waiter entry present in the file after join");
+    "our waiter entry present in the file after join");
 
   q.reset();
 
   // Our waiter entry must be gone; the sibling's entries must remain.
   const after = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(!after.waiters.some((w: { id: string }) => w.id === ourId),
-    "COV5-5: reset() splices our queued-but-not-launched waiter entry");
+    "reset() splices our queued-but-not-launched waiter entry");
   assert(after.waiters.some((w: { id: string }) => w.id === "sibling-head"),
-    "COV5-5: reset() does not remove a sibling's waiter entry");
+    "reset() does not remove a sibling's waiter entry");
   assert(after.token !== null && after.token.id === "sibling-tok",
-    "COV5-5: reset() does not remove a sibling's token");
+    "reset() does not remove a sibling's token");
 
   rmSync(dir, { recursive: true, force: true });
 }
@@ -1920,12 +1920,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   ctrl.abort();
   let rejected = false;
   await q.waitForLaunch(id2, ctrl.signal).catch(() => { rejected = true; });
-  assert(rejected, "ADV-5: already-aborted signal rejects waitForLaunch");
+  assert(rejected, "already-aborted signal rejects waitForLaunch");
 
   const { readFileSync } = await import("node:fs");
   const after = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(!after.waiters.some((w: { id: string }) => w.id === id2),
-    "ADV-5: pre-aborted waiter entry is cancelled (no leaked waiter)");
+    "pre-aborted waiter entry is cancelled (no leaked waiter)");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1951,7 +1951,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     try {
       const release = await q.waitForLaunch(id, signal);
       // While the side-call is in-flight, THIS process holds the token.
-      assert(q.snapshot().tokenHeld === true, "COV2-H2: side-call holds the token during work");
+      assert(q.snapshot().tokenHeld === true, "side-call holds the token during work");
       // Simulate the side-request body (no actual HTTP).
       await new Promise((r) => setTimeout(r, 10));
       release();
@@ -1963,8 +1963,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   await sideCall();
   // After the side-call, the token is free and no waiters remain.
-  assert(q.snapshot().tokenHeld === false, "COV2-H2: token released after side-call completes");
-  assert(q.snapshot().queued === 0, "COV2-H2: no leaked waiter after side-call");
+  assert(q.snapshot().tokenHeld === false, "token released after side-call completes");
+  assert(q.snapshot().queued === 0, "no leaked waiter after side-call");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -1985,22 +1985,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Main turn acquires (before_provider_request).
   const id1 = q.join()!;
   const r1 = await q.waitForLaunch(id1);
-  assert(q.snapshot().tokenHeld === true, "COV2-H1: main turn holds token after acquire");
+  assert(q.snapshot().tokenHeld === true, "main turn holds token after acquire");
 
   // message_end fires (stream complete): release the slot.
   r1();
-  assert(q.snapshot().tokenHeld === false, "COV2-H1: token freed at message_end");
+  assert(q.snapshot().tokenHeld === false, "token freed at message_end");
 
   // A sibling turn can now acquire immediately (the slot was freed during
   // this turn's tool execution, not held to turn_end).
   const id2 = q.join()!;
   const r2 = await q.waitForLaunch(id2);
-  assert(q.snapshot().tokenHeld === true, "COV2-H1: sibling acquires immediately after message_end release");
+  assert(q.snapshot().tokenHeld === true, "sibling acquires immediately after message_end release");
 
   // turn_end safety net on the first turn is a no-op (already released).
   // r1 was already called; calling its underlying cancel is a no-op.
   q.cancel(id1);
-  assert(q.snapshot().tokenHeld === true, "COV2-H1: turn_end safety net after message_end is a no-op (token held by sibling)");
+  assert(q.snapshot().tokenHeld === true, "turn_end safety net after message_end is a no-op (token held by sibling)");
 
   r2();
   q.reset();
@@ -2034,14 +2034,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // The state file must still be valid JSON (reset must not corrupt it).
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(Array.isArray(st.waiters), "COV2-M4: state file valid JSON after reset mid-wait");
+  assert(Array.isArray(st.waiters), "state file valid JSON after reset mid-wait");
 
   // Abort the blocked waiter cleanly (cancel + reject). Its entry must be gone.
   ctrl.abort();
   await p2;
   const after = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(!after.waiters.some((w: { id: string }) => w.id === id2),
-    "COV2-M4: aborted waiter entry removed after reset mid-wait");
+    "aborted waiter entry removed after reset mid-wait");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -2070,7 +2070,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile });
   const id1 = q.join()!;
   await q.waitForLaunch(id1);
-  assert(q.snapshot().tokenHeld === true, "ADV4-1: waiter 1 holds the token");
+  assert(q.snapshot().tokenHeld === true, "waiter 1 holds the token");
 
   // Waiter 2 joins + starts polling. Its FIRST poll runs synchronously inside
   // the Promise executor: it sees the token held by 1, returns false, and arms
@@ -2085,7 +2085,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     errMsg = e instanceof Error ? e.message : String(e);
   });
   await new Promise((r) => setTimeout(r, 30)); // let the first poll complete + re-arm
-  assert(!rejected, "ADV4-1: waiter 2 blocks while token held (no throw yet)");
+  assert(!rejected, "waiter 2 blocks while token held (no throw yet)");
 
   // Remove the state file's parent directory so the next setTimeout(poll)
   // re-entry's mutate -> acquireLock -> openSync(lockFile, "wx") throws ENOENT
@@ -2097,7 +2097,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Waiter 2's next poll fires within 50ms, tries to mutate, and throws. The
   // throw must REJECT p2, not crash.
   await p2;
-  assert(rejected, "ADV4-1: setTimeout(poll) throw rejects the promise (does not crash the process)");
+  assert(rejected, "setTimeout(poll) throw rejects the promise (does not crash the process)");
   assert(errMsg.startsWith("concurrency-queue: poll failed:"),
     `ADV4-1: rejection carries the poll-failed message (got "${errMsg}")`);
 
@@ -2149,12 +2149,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   mainTurnRelease = A;
   let threw = false;
   try { releaseSlot(A); } catch { threw = true; }
-  assert(!threw, "ADV3-1: releaseSlot swallows a throw from release() (no re-throw)");
-  assert(releasedA, "ADV3-1: release() was invoked before throwing");
+  assert(!threw, "releaseSlot swallows a throw from release() (no re-throw)");
+  assert(releasedA, "release() was invoked before throwing");
   // The matching slot was cleared in finally (mainTurnRelease === A → undefined).
-  assert(mainTurnRelease === undefined, "ADV3-1: matching mainTurnRelease cleared in finally even on throw");
+  assert(mainTurnRelease === undefined, "matching mainTurnRelease cleared in finally even on throw");
   // updateStatus ran once (in finally) despite the throw.
-  assert(updateCount === 1, "ADV3-1: updateStatus ran once in finally despite throw");
+  assert(updateCount === 1, "updateStatus ran once in finally despite throw");
 
   // (2) releaseSlot on a release that does NOT match mainTurnRelease leaves
   // mainTurnRelease intact (a side-call release must not clear the main-turn
@@ -2164,16 +2164,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   mainTurnRelease = main;
   updateCount = 0;
   releaseSlot(sideCall);
-  assert(mainTurnRelease === main, "ADV3-1: non-matching release does not clear mainTurnRelease (side-call invariant)");
-  assert(updateCount === 1, "ADV3-1: updateStatus ran in finally for non-matching release");
+  assert(mainTurnRelease === main, "non-matching release does not clear mainTurnRelease (side-call invariant)");
+  assert(updateCount === 1, "updateStatus ran in finally for non-matching release");
 
   // (3) releaseSlot(undefined) is a no-op (the safety-net path when no slot
   // is held — must not throw, must not call updateStatus).
   mainTurnRelease = undefined;
   updateCount = 0;
   releaseSlot(undefined);
-  assert(updateCount === 0, "ADV3-1: releaseSlot(undefined) is a no-op (no updateStatus call)");
-  assert(mainTurnRelease === undefined, "ADV3-1: releaseSlot(undefined) leaves mainTurnRelease undefined");
+  assert(updateCount === 0, "releaseSlot(undefined) is a no-op (no updateStatus call)");
+  assert(mainTurnRelease === undefined, "releaseSlot(undefined) leaves mainTurnRelease undefined");
 }
 
 // --- preserve 429-origin tag when priority.low extends pause ---
@@ -2196,24 +2196,24 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const until429 = t0 + 30_000;
   qA.pauseUntil(until429, PAUSE_REASON_429);
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedUntil === until429, "CORR7-1: 429 pause written with requested deadline");
-  assert(st.pausedReason === PAUSE_REASON_429, "CORR7-1: 429 pause tagged PAUSE_REASON_429");
+  assert(st.pausedUntil === until429, "429 pause written with requested deadline");
+  assert(st.pausedReason === PAUSE_REASON_429, "429 pause tagged PAUSE_REASON_429");
 
   // /usage priority.low tick with a LONGER deadline + a non-null reason.
   // Must extend pausedUntil but NOT overwrite the 429 tag.
   const untilLow = t0 + 60_000;
   qA.pauseUntil(untilLow, "Account deprioritized");
   st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedUntil === untilLow, "CORR7-1: longer priority.low deadline extends pausedUntil");
+  assert(st.pausedUntil === untilLow, "longer priority.low deadline extends pausedUntil");
   assert(st.pausedReason === PAUSE_REASON_429,
-    "CORR7-1: 429 tag preserved when priority.low extends (not overwritten to Account deprioritized)");
+    "429 tag preserved when priority.low extends (not overwritten to Account deprioritized)");
 
   // clearPause() (no force) must NOT clear the pause — the 429 tag is still
   // authoritative (CORR4-1 protection holds even after the extend).
   qB.clearPause();
   st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedUntil === untilLow, "CORR7-1: 429 pause survives a stale clearPause after extend");
-  assert(st.pausedReason === PAUSE_REASON_429, "CORR7-1: 429 tag survives a stale clearPause after extend");
+  assert(st.pausedUntil === untilLow, "429 pause survives a stale clearPause after extend");
+  assert(st.pausedReason === PAUSE_REASON_429, "429 tag survives a stale clearPause after extend");
 
   // Advance time past the (extended) deadline + clearPause() — clears normally.
   // We simulate elapse by writing a past pausedUntil directly so reapStale /
@@ -2224,7 +2224,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   qB.clearPause();
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil === 0 && st.pausedReason === null,
-    "CORR7-1: 429 pause clears naturally after the deadline elapses");
+    "429 pause clears naturally after the deadline elapses");
 
   qA.reset(); qB.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -2331,11 +2331,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await umansFactory(pi as any);
 
     // Sanity: the factory registered handlers for the events we drive.
-    assert(handlers.has("before_provider_request"), "COV7-1: before_provider_request handler registered");
-    assert(handlers.has("message_end"), "COV7-1: message_end handler registered");
-    assert(handlers.has("turn_end"), "COV7-1: turn_end handler registered");
-    assert(handlers.has("agent_end"), "COV7-1: agent_end handler registered");
-    assert(handlers.has("session_shutdown"), "COV7-1: session_shutdown handler registered");
+    assert(handlers.has("before_provider_request"), "before_provider_request handler registered");
+    assert(handlers.has("message_end"), "message_end handler registered");
+    assert(handlers.has("turn_end"), "turn_end handler registered");
+    assert(handlers.has("agent_end"), "agent_end handler registered");
+    assert(handlers.has("session_shutdown"), "session_shutdown handler registered");
 
     // (a) before_provider_request: acquireSlot joins + claims token + polls
     // /usage (free) -> token released immediately (throughput fix: the token
@@ -2352,7 +2352,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // anymore; instead assert the queue state is clean (no wedge).
     const probeQ = createConcurrencyQueue({ stateFile });
     assert(probeQ.snapshot().tokenHeld === false || probeQ.snapshot().queued >= 1,
-      "COV7-1: before_provider_request completed (token released immediately for throughput; not held across send)");
+      "before_provider_request completed (token released immediately for throughput; not held across send)");
     probeQ.reset();
 
     // (b) message_end with an Umans assistant message: the main-turn release
@@ -2361,7 +2361,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await dispatch("message_end", makeCtx({ model: { provider: "umans", id: "umans-flash" } }));
     const probeQ2 = createConcurrencyQueue({ stateFile });
     assert(probeQ2.snapshot().tokenHeld === false,
-      "COV7-1: message_end is a no-op (token already released at acquireSlot for throughput)");
+      "message_end is a no-op (token already released at acquireSlot for throughput)");
     probeQ2.reset();
 
     // (c) turn_end + agent_end AFTER message_end are no-ops (token already
@@ -2371,7 +2371,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await dispatch("agent_end", makeCtx());
     const probeQ3 = createConcurrencyQueue({ stateFile });
     assert(probeQ3.snapshot().tokenHeld === false,
-      "COV7-1: turn_end + agent_end after message_end are no-ops (token stays free)");
+      "turn_end + agent_end after message_end are no-ops (token stays free)");
     probeQ3.reset();
 
     // (d) session_shutdown calls reset() — clears any waiter/token entry this
@@ -2380,11 +2380,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // cleared (setWidget("umans", undefined)) as a proxy for reset() running.
     await dispatch("session_shutdown", makeCtx());
     assert(widgets.get("umans") === undefined,
-      "COV7-1: session_shutdown cleared the status widget (reset ran)");
+      "session_shutdown cleared the status widget (reset ran)");
 
     // The /usage poll was actually called by acquireSlot (proves the wiring
     // drove the real capacity-free path, not a stubbed queue).
-    assert(usageCalls > 0, "COV7-1: acquireSlot polled /v1/usage through the real wiring");
+    assert(usageCalls > 0, "acquireSlot polled /v1/usage through the real wiring");
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -2469,7 +2469,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     const probe1 = createConcurrencyQueue({ stateFile });
     const s1 = probe1.snapshot();
     assert(s1.tokenHeld === false || s1.queued >= 1,
-      "CORR8-3: first before_provider_request completed (token released immediately for throughput)");
+      "first before_provider_request completed (token released immediately for throughput)");
     probe1.reset();
 
     // message_end is a no-op (token already released at acquireSlot). Assert
@@ -2478,7 +2478,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await new Promise((r) => setTimeout(r, 50));
     const probeMid = createConcurrencyQueue({ stateFile });
     assert(probeMid.snapshot().tokenHeld === false,
-      "CORR8-3: message_end is a no-op (token already released at acquireSlot for throughput)");
+      "message_end is a no-op (token already released at acquireSlot for throughput)");
     // No orphaned waiter entry for this process after release.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
@@ -2566,8 +2566,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // The shared pause must have landed in the state file.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
-    assert(parsed.pausedUntil > before, "COV9-1: after_provider_response 429 set pausedUntil > now");
-    assert(parsed.pausedReason === PAUSE_REASON_429, "COV9-1: pause tagged PAUSE_REASON_429");
+    assert(parsed.pausedUntil > before, "after_provider_response 429 set pausedUntil > now");
+    assert(parsed.pausedReason === PAUSE_REASON_429, "pause tagged PAUSE_REASON_429");
     // Retry-After 60s honored (pause is ~60s out, within the 429 ceiling).
     const pauseSec = Math.round((parsed.pausedUntil - Date.now()) / 1000);
     assert(pauseSec >= 50 && pauseSec <= 60, `COV9-1: Retry-After 60s honored through wiring (pause ~${pauseSec}s)`);
@@ -2651,7 +2651,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     const usageBefore = usageCalls;
     await dispatch("session_start", { type: "session_start" });
     await new Promise((r) => setTimeout(r, 50));
-    assert(usageCalls > usageBefore, "COV9-2: session_start drove refreshUsage (fetch /v1/usage)");
+    assert(usageCalls > usageBefore, "session_start drove refreshUsage (fetch /v1/usage)");
 
     // (b) model_select with a NON-umans model: short-circuit branch — clears the
     // widget + stops the refresh loop. Must not throw + must not call refreshUsage
@@ -2660,12 +2660,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await dispatch("model_select", { type: "model_select", model: { provider: "openai", id: "gpt-4" } });
     await new Promise((r) => setTimeout(r, 30));
     // The non-umans branch clears the widget (setWidget undefined).
-    assert(widgets.get("umans") === undefined, "COV9-2: model_select non-umans cleared the widget");
+    assert(widgets.get("umans") === undefined, "model_select non-umans cleared the widget");
 
     // (c) model_select back to umans: re-initializes the refresh loop.
     await dispatch("model_select", { type: "model_select", model: { provider: "umans", id: "umans-flash" } });
     await new Promise((r) => setTimeout(r, 50));
-    assert(usageCalls > usageBefore2, "COV9-2: model_select umans re-drove refreshUsage");
+    assert(usageCalls > usageBefore2, "model_select umans re-drove refreshUsage");
 
     // (d) turn_start → message_update(text_delta) → message_update(thinking_delta)
     // → message_end: assert TTFT set + estimatedTokens accumulated from BOTH
@@ -2710,7 +2710,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       `COV10-8: thinking_delta branch contributed tokens (widget shows TPS at message_end, got: ${widgetText})`);
     // No throw + handlers ran => wiring is intact. Assert the handlers exist.
     assert(handlers.has("turn_start") && handlers.has("message_update") && handlers.has("message_end"),
-      "COV9-2: lifecycle handlers registered");
+      "lifecycle handlers registered");
     // Dispatch session_shutdown to stop the refresh loop (session_start started
     // it; without this the setTimeout keeps the process alive + selfcheck hangs).
     await dispatch("session_shutdown", { type: "session_shutdown" });
@@ -2741,26 +2741,26 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const qSibling = createConcurrencyQueue({ stateFile });
   const idSibling = qSibling.join()!;
   await qSibling.waitForLaunch(idSibling);
-  assert(qSibling.snapshot().tokenHeld === true, "CORR7-2: sibling holds the token");
+  assert(qSibling.snapshot().tokenHeld === true, "sibling holds the token");
 
   // Our queue joins + starts waitForLaunch (blocks — token held by sibling).
   const ourId = q.join()!;
   let rejected = false;
   const p = q.waitForLaunch(ourId).catch(() => { rejected = true; });
   await new Promise((r) => setTimeout(r, 80)); // let the 50ms poll fire + re-insert
-  assert(!rejected, "CORR7-2: waitForLaunch blocks while sibling holds token");
+  assert(!rejected, "waitForLaunch blocks while sibling holds token");
 
   // reset() must abort the in-flight poll loop.
   q.reset();
   await p;
-  assert(rejected, "CORR7-2: reset() aborts the in-flight waitForLaunch (promise rejects)");
+  assert(rejected, "reset() aborts the in-flight waitForLaunch (promise rejects)");
 
   // The waiter must NOT be re-inserted after reset (the poll loop stopped).
   // Give a moment to ensure no straggler poll fires.
   await new Promise((r) => setTimeout(r, 80));
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(!st.waiters.some((w: { id: string }) => w.id === ourId),
-    "CORR7-2: our waiter is NOT re-inserted after reset (poll loop stopped)");
+    "our waiter is NOT re-inserted after reset (poll loop stopped)");
 
   // A subsequent waitForLaunch on the same queue works (fresh resetAbort
   // controller was created, not pre-aborted).
@@ -2770,7 +2770,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Release the sibling token so our new waiter can claim it.
   qSibling.cancel(idSibling);
   await pAgain;
-  assert(resolvedAgain, "CORR7-2: subsequent waitForLaunch works after reset (fresh controller)");
+  assert(resolvedAgain, "subsequent waitForLaunch works after reset (fresh controller)");
 
   q.reset(); qSibling.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -2803,17 +2803,17 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // O_EXCL successfully.
     const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
     const id = q.join()!;
-    assert(id !== null, "SEC7-1: join succeeds despite a planted symlink at the lockfile");
+    assert(id !== null, "join succeeds despite a planted symlink at the lockfile");
 
     // The canary must be untouched (symlink was not followed).
     assert(readFileSync(canary, "utf8") === "ORIGINAL",
-      "SEC7-1: symlink target not unlinked (canary intact — lstat did not follow)");
+      "symlink target not unlinked (canary intact — lstat did not follow)");
 
     // The state file must have been written (the critical section ran after
     // reclaiming the symlink).
     const st = JSON.parse(readFileSync(stateFile, "utf8"));
     assert(st.waiters.length === 1 && st.waiters[0].id === id,
-      "SEC7-1: stale-symlink lockfile reclaimed + mutate wrote through");
+      "stale-symlink lockfile reclaimed + mutate wrote through");
 
     q.reset();
     rmSync(dir, { recursive: true, force: true });
@@ -2830,9 +2830,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     utimesSync(lockFile, oldTime, oldTime);
     const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
     const id = q.join()!;
-    assert(id !== null, "SEC7-1: join reclaims a stale regular lockfile (lstat path)");
+    assert(id !== null, "join reclaims a stale regular lockfile (lstat path)");
     const st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.waiters.length === 1, "SEC7-1: stale regular lockfile reclaimed + mutate wrote through");
+    assert(st.waiters.length === 1, "stale regular lockfile reclaimed + mutate wrote through");
     q.reset();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2862,11 +2862,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id = q.join()!;
   const elapsed = Date.now() - t0;
-  assert(id !== null, "CMP7-1: join reclaims a stale lockfile (mtime ceiling)");
+  assert(id !== null, "join reclaims a stale lockfile (mtime ceiling)");
   assert(elapsed < 1_000, `CMP7-1: stale lockfile reclaim is immediate (no 2s wait) (took ${elapsed}ms)`);
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 1 && st.waiters[0].id === id,
-    "CMP7-1: stale lockfile reclaimed + mutate wrote through");
+    "stale lockfile reclaimed + mutate wrote through");
 
   q.reset();
 
@@ -2882,7 +2882,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const t1 = Date.now();
   const id2 = q2.join()!; // spins until the mtime ceiling, then reclaims
   const elapsed2 = Date.now() - t1;
-  assert(id2 !== null, "CMP7-1: fresh lockfile eventually reclaimed via mtime ceiling");
+  assert(id2 !== null, "fresh lockfile eventually reclaimed via mtime ceiling");
   assert(elapsed2 >= 150, `CMP7-1: fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
   q2.reset();
 
@@ -2893,7 +2893,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   utimesSync(lockFile, staleTime, staleTime);
   const q3 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id3 = q3.join()!;
-  assert(id3 !== null, "CMP7-1: malformed lockfile content reclaimed via mtime ceiling when stale");
+  assert(id3 !== null, "malformed lockfile content reclaimed via mtime ceiling when stale");
   q3.reset();
 
   // a symlink lockfile is unlinked directly (NOT followed). lstatSync
@@ -2904,12 +2904,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   symlinkSync(target, lockFile);
   const q4 = createConcurrencyQueue({ stateFile, lockTimeoutMs: 2_000 });
   const id4 = q4.join()!;
-  assert(id4 !== null, "SEC9-3: symlink lockfile reclaimed (not followed)");
+  assert(id4 !== null, "symlink lockfile reclaimed (not followed)");
   // The symlink itself is gone; the target is untouched.
   let symlinkGone = false;
   try { lstatSync(lockFile); } catch { symlinkGone = true; }
-  assert(symlinkGone, "SEC9-3: symlink lockfile unlinked (not followed)");
-  assert(readFileSync(target, "utf8") === "secret", "SEC9-3: symlink target untouched");
+  assert(symlinkGone, "symlink lockfile unlinked (not followed)");
+  assert(readFileSync(target, "utf8") === "secret", "symlink target untouched");
   q4.reset();
 
   rmSync(dir, { recursive: true, force: true });
@@ -2953,7 +2953,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const ac = new AbortController();
   ac.abort();
   const r1 = await fetchUsageBridge(3_000, ac.signal);
-  assert(r1.aborted === true, "CMP7-3: already-aborted parentSignal aborts fetchUsage ctrl");
+  assert(r1.aborted === true, "already-aborted parentSignal aborts fetchUsage ctrl");
   assert(r1.elapsedMs < 500, `CMP7-3: already-aborted signal aborts immediately (not after 3s) (took ${r1.elapsedMs}ms)`);
 
   // (2) A parentSignal that aborts mid-fetch aborts ctrl (not after the 3s timeout).
@@ -2962,12 +2962,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   await new Promise((r) => setTimeout(r, 50)); // mid-flight
   ac2.abort();
   const r2 = await p2;
-  assert(r2.aborted === true, "CMP7-3: mid-flight parent abort aborts fetchUsage ctrl");
+  assert(r2.aborted === true, "mid-flight parent abort aborts fetchUsage ctrl");
   assert(r2.elapsedMs < 500, `CMP7-3: mid-flight abort resolves immediately (not after 3s) (took ${r2.elapsedMs}ms)`);
 
   // (3) No parentSignal — the timeout still fires (the bridge is a no-op).
   const r3 = await fetchUsageBridge(50, undefined);
-  assert(r3.aborted === true, "CMP7-3: no parentSignal — timeout still aborts ctrl");
+  assert(r3.aborted === true, "no parentSignal — timeout still aborts ctrl");
   assert(r3.elapsedMs >= 40, `CMP7-3: timeout path honored when no parentSignal (took ${r3.elapsedMs}ms)`);
 }
 
@@ -2980,14 +2980,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   parent.abort();
   const ctrl = new AbortController();
   const composed = AbortSignal.any([parent.signal, ctrl.signal]);
-  assert(composed.aborted === true, "CMP8-2: already-aborted parent aborts composed signal immediately");
+  assert(composed.aborted === true, "already-aborted parent aborts composed signal immediately");
   // A composed signal with a non-aborted parent is not aborted until one source aborts.
   const parent2 = new AbortController();
   const ctrl2 = new AbortController();
   const composed2 = AbortSignal.any([parent2.signal, ctrl2.signal]);
-  assert(composed2.aborted === false, "CMP8-2: composed signal not aborted when no source aborted");
+  assert(composed2.aborted === false, "composed signal not aborted when no source aborted");
   ctrl2.abort();
-  assert(composed2.aborted === true, "CMP8-2: composed signal aborts when a source aborts");
+  assert(composed2.aborted === true, "composed signal aborts when a source aborts");
 }
 
 // --- acquireSlot re-join + MAX_TOKEN_REJOINS fail-open ---
@@ -3093,14 +3093,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // dispatch blocks until acquireSlot returns (launch / abort / fail-open).
     await dispatch("before_provider_request", makeCtx());
 
-    assert(reaped, "COV7-2: C1 setup — token was reaped mid-poll");
-    assert(firstOurId !== undefined, "COV7-2: C1 setup — captured the original waiter id");
+    assert(reaped, "C1 setup — token was reaped mid-poll");
+    assert(firstOurId !== undefined, "C1 setup — captured the original waiter id");
     // After the reap, acquireSlot must have re-joined: a DIFFERENT waiter id is
     // now in the file (or the token was released after launch).
     const finalState = JSON.parse(readFileSync(stateFile, "utf8"));
     const hasDifferentId = finalState.waiters.some((w: { id: string }) => w.id !== firstOurId)
       || finalState.token === null || finalState.token.id !== firstOurId;
-    assert(hasDifferentId, "COV7-2: acquireSlot re-joined after token reap (new waiter id, not the reaped one)");
+    assert(hasDifferentId, "acquireSlot re-joined after token reap (new waiter id, not the reaped one)");
     // The turn proceeded (acquireSlot returned a release fn -> mainTurnRelease
     // set -> the token was held or already released by message_end). Prove the
     // poll loop made progress past the reap: usage was called multiple times.
@@ -3167,7 +3167,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // Drive before_provider_request — acquireSlot re-joins 3+ times then fails open.
     const failOpenPromise = dispatch2("before_provider_request", makeCtx()).then(() => { failOpenReturned = true; });
     await failOpenPromise;
-    assert(failOpenReturned, "COV7-2: MAX_TOKEN_REJOINS fail-open — acquireSlot returned (did not loop forever)");
+    assert(failOpenReturned, "MAX_TOKEN_REJOINS fail-open — acquireSlot returned (did not loop forever)");
     assert(failOpenUsageCalls > 3, `COV7-2: acquireSlot polled /usage >3 times before fail-open (got ${failOpenUsageCalls})`);
     await dispatch2("session_shutdown", makeCtx());
   } finally {
@@ -3192,15 +3192,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 {
   const src = readFileSync("index.ts", "utf8");
   const rejoinIdx = src.indexOf("rejoins >= MAX_TOKEN_REJOINS");
-  assert(rejoinIdx >= 0, "CORR11-2: MAX_TOKEN_REJOINS fail-open guard present in index.ts");
+  assert(rejoinIdx >= 0, "MAX_TOKEN_REJOINS fail-open guard present in index.ts");
   // The clear must sit inside the if-block, before the break.
   const blockEnd = src.indexOf("break;", rejoinIdx);
-  assert(blockEnd > rejoinIdx, "CORR11-2: break present in MAX_TOKEN_REJOINS block");
+  assert(blockEnd > rejoinIdx, "break present in MAX_TOKEN_REJOINS block");
   const block = src.slice(rejoinIdx, blockEnd);
   assert(block.includes("releaseToken = () => {};"),
-    "CORR11-2: releaseToken cleared to no-op before MAX_TOKEN_REJOINS break (no stale closure)");
+    "releaseToken cleared to no-op before MAX_TOKEN_REJOINS break (no stale closure)");
   assert(block.includes("clear the stale releaseToken closure"),
-    "CORR11-2: clear documented with a comment at the MAX_TOKEN_REJOINS break");
+    "clear documented with a comment at the MAX_TOKEN_REJOINS break");
 }
 
 // --- queuePaused read once per poll iteration (no unlocked TOCTOU) ---
@@ -3215,24 +3215,24 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const src = readFileSync("index.ts", "utf8");
   // capacityFree now takes queuePaused as a parameter (no internal snapshot read).
   assert(src.includes("const capacityFree = async (queuePaused: boolean): Promise<boolean> =>"),
-    "CORR11-3: capacityFree takes queuePaused as a parameter (no internal snapshot read)");
+    "capacityFree takes queuePaused as a parameter (no internal snapshot read)");
   // The call site reads queuePaused once into a local const + passes it to both.
   const callIdx = src.indexOf("const queuePaused = concurrencyQueue.snapshot().paused;");
-  assert(callIdx >= 0, "CORR11-3: queuePaused read once into a local const before capacityFree");
+  assert(callIdx >= 0, "queuePaused read once into a local const before capacityFree");
   // The same const is passed to capacityFree + decideLaunch (no second snapshot read).
   assert(src.includes("const isFree = await capacityFree(queuePaused);"),
-    "CORR11-3: same queuePaused const passed to capacityFree");
+    "same queuePaused const passed to capacityFree");
   const decideIdx = src.indexOf("const decision = decideLaunch({");
-  assert(decideIdx > callIdx, "CORR11-3: decideLaunch call follows the single queuePaused read");
+  assert(decideIdx > callIdx, "decideLaunch call follows the single queuePaused read");
   const decideBlock = src.slice(decideIdx, src.indexOf("});", decideIdx) + 3);
   assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("concurrencyQueue.snapshot().paused"),
-    "CORR11-3: decideLaunch receives the same queuePaused const (no second snapshot read)");
+    "decideLaunch receives the same queuePaused const (no second snapshot read)");
   // No remaining `concurrencyQueue.snapshot().paused` inside capacityFree's body.
   const capIdx = src.indexOf("const capacityFree = async (queuePaused: boolean):");
   const capEnd = src.indexOf("return decision.free;", capIdx);
   const capBody = src.slice(capIdx, capEnd);
   assert(!capBody.includes("concurrencyQueue.snapshot().paused"),
-    "CORR11-3: capacityFree body no longer reads concurrencyQueue.snapshot().paused");
+    "capacityFree body no longer reads concurrencyQueue.snapshot().paused");
 }
 
 // --- concurrentSessions ?? 0 + full cap fallback chain ---
@@ -3246,22 +3246,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(isCapacityFree(
     { concurrentSessions: undefined, limit: 2, hardCap: 4, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === true, "COV7-3: undefined concurrentSessions -> 0 (cur 0 < cap 4 -> free)");
+  ).free === true, "undefined concurrentSessions -> 0 (cur 0 < cap 4 -> free)");
   // concurrentSessions undefined, hardCap undefined, limit present -> cap = snap.limit.
   assert(isCapacityFree(
     { concurrentSessions: undefined, limit: 2, hardCap: undefined, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === true, "COV7-3: undefined concurrentSessions + undefined hardCap -> cap = snap.limit (cur 0 < 2 -> free)");
+  ).free === true, "undefined concurrentSessions + undefined hardCap -> cap = snap.limit (cur 0 < 2 -> free)");
   // ALL caps undefined (snap.limit + snap.hardCap undefined) -> cap = inputs.limit.
   assert(isCapacityFree(
     { concurrentSessions: undefined, limit: undefined, hardCap: undefined, priority: okState },
     { limit: 2, queuePaused: false },
-  ).free === true, "COV7-3: all snap caps undefined -> cap = inputs.limit (cur 0 < 2 -> free)");
+  ).free === true, "all snap caps undefined -> cap = inputs.limit (cur 0 < 2 -> free)");
   // ALL caps undefined + inputs.limit undefined -> cap undefined -> free (unlimited).
   assert(isCapacityFree(
     { concurrentSessions: undefined, limit: undefined, hardCap: undefined, priority: okState },
     { limit: undefined, queuePaused: false },
-  ).free === true, "COV7-3: all caps undefined + inputs.limit undefined -> cap undefined -> free (no cap to exceed)");
+  ).free === true, "all caps undefined + inputs.limit undefined -> cap undefined -> free (no cap to exceed)");
 }
 
 // --- disabled-mode stub methods are no-ops + snapshot stays empty ---
@@ -3270,14 +3270,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // stays empty.
 {
   const q = createConcurrencyQueue({ disabled: true });
-  assert(q.join() === null, "COV7-4: disabled join returns null");
+  assert(q.join() === null, "disabled join returns null");
   const r = await q.waitForLaunch("ignored");
-  assert(typeof r === "function", "COV7-4: disabled waitForLaunch resolves with noop release");
+  assert(typeof r === "function", "disabled waitForLaunch resolves with noop release");
   r();
   // Every stub method must be a no-op (no throw).
   let threw = false;
   try {
-    assert(q.touchToken("ignored") === true, "COV7-4: disabled touchToken returns true");
+    assert(q.touchToken("ignored") === true, "disabled touchToken returns true");
     q.clearPause();
     q.clearPause({ force: true });
     q.cancel("ignored");
@@ -3287,13 +3287,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     q.addInFlight("ignored");
     q.removeInFlight("ignored");
   } catch { threw = true; }
-  assert(!threw, "COV7-4: disabled stub methods do not throw");
+  assert(!threw, "disabled stub methods do not throw");
   const snap = q.snapshot();
   assert(snap.queued === 0 && snap.tokenHeld === false && snap.paused === false &&
     snap.pausedUntil === 0 && snap.pausedReason === null,
-    "COV7-4: disabled snapshot stays empty after every stub method");
+    "disabled snapshot stays empty after every stub method");
   assert(snap.inflightCount === 0,
-    "COV-F2: disabled addInFlight/removeInFlight are no-ops (inflightCount stays 0)");
+    "disabled addInFlight/removeInFlight are no-ops (inflightCount stays 0)");
 }
 
 // --- queuePaused takes precedence over priority.low ---
@@ -3306,8 +3306,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     { concurrentSessions: 0, limit: 2, hardCap: 4, priority: lowState },
     { limit: 2, queuePaused: true },
   );
-  assert(r.free === false, "COV7-5: queuePaused + priority.low -> not free");
-  assert(r.repause === undefined, "COV7-5: queuePaused precedence -> no repause (shared pause already active)");
+  assert(r.free === false, "queuePaused + priority.low -> not free");
+  assert(r.repause === undefined, "queuePaused precedence -> no repause (shared pause already active)");
 }
 
 // --- parsePriority non-boolean low + non-string reason ---
@@ -3315,13 +3315,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // number) is coerced to false; a non-string reason is nulled. Previously only
 // strict booleans were tested.
 {
-  assert(parsePriority({ low: "true" }).low === false, "COV7-7: parsePriority low='true' (string) -> false");
-  assert(parsePriority({ low: 1 }).low === false, "COV7-7: parsePriority low=1 (number) -> false");
-  assert(parsePriority({ low: null }).low === false, "COV7-7: parsePriority low=null -> false");
+  assert(parsePriority({ low: "true" }).low === false, "parsePriority low='true' (string) -> false");
+  assert(parsePriority({ low: 1 }).low === false, "parsePriority low=1 (number) -> false");
+  assert(parsePriority({ low: null }).low === false, "parsePriority low=null -> false");
   const p = parsePriority({ low: true, reason: 123 });
-  assert(p.low === true && p.reason === null, "COV7-7: parsePriority non-string reason -> null");
+  assert(p.low === true && p.reason === null, "parsePriority non-string reason -> null");
   const p2 = parsePriority({ low: true, reason: { obj: true } });
-  assert(p2.reason === null, "COV7-7: parsePriority object reason -> null");
+  assert(p2.reason === null, "parsePriority object reason -> null");
 }
 
 // --- pauseUntil extension / shrink / undefined-reason ---
@@ -3338,25 +3338,25 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   q.pauseUntil(t0 + 10_000, "first");
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil === t0 + 10_000 && st.pausedReason === "first",
-    "COV7-8: pause A (10s, first) written");
+    "pause A (10s, first) written");
 
   // Set pause B (30s, "second") -> extended + reason "second".
   q.pauseUntil(t0 + 30_000, "second");
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil === t0 + 30_000 && st.pausedReason === "second",
-    "COV7-8: pause B (30s, second) extends + overwrites reason");
+    "pause B (30s, second) extends + overwrites reason");
 
   // Set pause C (5s, "shorter") -> deadline earlier -> unchanged + still "second".
   q.pauseUntil(t0 + 5_000, "shorter");
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil === t0 + 30_000 && st.pausedReason === "second",
-    "COV7-8: pause C (5s, shorter) ignored (deadline earlier, reason unchanged)");
+    "pause C (5s, shorter) ignored (deadline earlier, reason unchanged)");
 
   // pauseUntil(until, undefined) on a fresh queue -> pausedReason === null.
   q.clearPause({ force: true });
   q.pauseUntil(t0 + 20_000, undefined);
   st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedReason === null, "COV7-8: pauseUntil with undefined reason -> pausedReason null");
+  assert(st.pausedReason === null, "pauseUntil with undefined reason -> pausedReason null");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3371,16 +3371,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const CODER = { name: "umans-coder", capabilities: { supports_tools: true } };
   const NOTOOL = { name: "umans-notool", capabilities: { supports_tools: false } };
   assert(pickSearchModel({ "umans-flash": FLASH as any }) === "umans-flash",
-    "COV7-9: default flash present -> umans-flash");
+    "default flash present -> umans-flash");
   // flash deprecated -> first tool-capable.
   assert(pickSearchModel({ "umans-flash": { ...FLASH, deprecation: "old" } as any, "umans-coder": CODER as any }) === "umans-coder",
-    "COV7-9: flash deprecated -> first tool-capable (umans-coder)");
+    "flash deprecated -> first tool-capable (umans-coder)");
   // flash absent -> first tool-capable.
   assert(pickSearchModel({ "umans-coder": CODER as any }) === "umans-coder",
-    "COV7-9: flash absent -> first tool-capable");
+    "flash absent -> first tool-capable");
   // no tool-capable -> returns default id.
   assert(pickSearchModel({ "umans-notool": NOTOOL as any }) === "umans-flash",
-    "COV7-9: no tool-capable -> returns default id (umans-flash)");
+    "no tool-capable -> returns default id (umans-flash)");
 }
 
 // --- formatStatusText rendering (extracted pure helper) ---
@@ -3396,7 +3396,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 3, tokenHeld: true, paused: false, pausedUntil: 0, pausedReason: null },
     now,
-  }).includes("q 3*"), "COV7-10: queued>0 + tokenHeld -> q N* part");
+  }).includes("q 3*"), "queued>0 + tokenHeld -> q N* part");
   // queued + not tokenHeld -> q N (no star).
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
@@ -3406,7 +3406,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     effectiveLimit: 2, currentConcurrency: 1,
     queueSnap: { queued: 2, tokenHeld: false, paused: false, pausedUntil: 0, pausedReason: null },
     now,
-  }).includes("q 2*"), "COV7-10: queued + not tokenHeld -> q N (no star)");
+  }).includes("q 2*"), "queued + not tokenHeld -> q N (no star)");
   // paused -> PAUSED +countdown (reason). 30s from now = 1_700_000_030_000.
   const pausedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
@@ -3414,10 +3414,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     now,
   });
   assert(pausedText.includes("PAUSED") && pausedText.includes("30s") && pausedText.includes("(HTTP 429 from gateway)"),
-    "COV7-10: paused -> PAUSED +countdown (reason): got: " + pausedText);
+    "paused -> PAUSED +countdown (reason): got: " + pausedText);
   // Verify the countdown format (e.g. "30s", " 5m04s", " 3h12m").
   assert(/PAUSED \d+s|PAUSED \d+m\d{2}s|PAUSED \d+h\d{2}m/.test(pausedText),
-    "COV7-10: paused renders countdown (seconds/minutes/hours)");
+    "paused renders countdown (seconds/minutes/hours)");
   // paused with elapsed pausedUntil -> countdown shows 0s (already cleared).
   const elapsedText = formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
@@ -3425,32 +3425,32 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     now,
   });
   assert(elapsedText.includes("PAUSED") && elapsedText.includes("0s"),
-    "COV7-10: elapsed pause -> countdown 0s (not negative): got: " + elapsedText);
+    "elapsed pause -> countdown 0s (not negative): got: " + elapsedText);
   // strikes24h -> Strikes X/20 part.
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     strikes24h: 5,
-  }).includes("Strikes 5/20"), "COV7-10: strikes24h -> Strikes X/20 part");
+  }).includes("Strikes 5/20"), "strikes24h -> Strikes X/20 part");
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     strikes24h: 0,
-  }).includes("Strikes 0/20"), "COV7-10: strikes24h=0 still shows the part");
+  }).includes("Strikes 0/20"), "strikes24h=0 still shows the part");
   assert(!formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
-  }).includes("Strikes"), "COV7-10: no strikes24h -> no Strikes part (undefined)");
+  }).includes("Strikes"), "no strikes24h -> no Strikes part (undefined)");
   // deprioritized -> DEPRIO +countdown banner.
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     deprioritized: true, priorityUntil: now + 3_600_000, now,
-  }).includes("DEPRIO"), "COV7-10: deprioritized -> DEPRIO banner");
+  }).includes("DEPRIO"), "deprioritized -> DEPRIO banner");
   assert(formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     deprioritized: true, priorityUntil: now + 3_600_000, now,
-  }).includes("1h00m"), "COV7-10: DEPRIO shows countdown (1h00m for 1h remaining)");
+  }).includes("1h00m"), "DEPRIO shows countdown (1h00m for 1h remaining)");
   assert(!formatStatusText({
     effectiveLimit: 2, currentConcurrency: 1,
     deprioritized: false, priorityUntil: undefined, now,
-  }).includes("DEPRIO"), "COV7-10: not deprioritized -> no DEPRIO banner");
+  }).includes("DEPRIO"), "not deprioritized -> no DEPRIO banner");
   // countdown() helper unit tests.
   assert(countdown(now + 3_600_000, now) === " 1h00m", "countdown: 1h -> ' 1h00m'");
   assert(countdown(now + 45_000, now) === " 45s", "countdown: 45s -> ' 45s'");
@@ -3464,9 +3464,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     now,
   });
   assert(!empty.includes("q ") && !empty.includes("PAUSED"),
-    "COV7-10: empty queue -> no q/PAUSED part");
+    "empty queue -> no q/PAUSED part");
   assert(empty.startsWith("Umans ") && empty.includes("Conc 1/2"),
-    "COV7-10: base Umans + Conc current/guaranteed always present");
+    "base Umans + Conc current/guaranteed always present");
   // concurrencyDisabled -> no queue part even if snap has queued.
   const disabled = formatStatusText({
     effectiveLimit: undefined, currentConcurrency: undefined,
@@ -3475,8 +3475,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     now,
   });
   assert(!disabled.includes("q ") && !disabled.includes("PAUSED"),
-    "COV7-10: concurrencyDisabled -> no queue/PAUSED part");
-  assert(disabled.includes("Conc ?/?"), "COV7-10: undefined limits render ?/?");
+    "concurrencyDisabled -> no queue/PAUSED part");
+  assert(disabled.includes("Conc ?/?"), "undefined limits render ?/?");
 }
 
 // --- snapshot() reconciles holdsToken with the file after a watchdog reap ---
@@ -3496,7 +3496,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Claim the token (join + waitForLaunch). holdsToken is true.
   const id = q.join()!;
   await q.waitForLaunch(id);
-  assert(q.snapshot().tokenHeld === true, "CORR7-3: token held after claim");
+  assert(q.snapshot().tokenHeld === true, "token held after claim");
 
   // Advance time past 120s (staleTokenMs). The token's ts is now stale; the
   // next reapStale (inside snapshot) reaps it. holdsToken must be reconciled.
@@ -3506,7 +3506,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // advance t, so now - token.ts > staleTokenMs.)
   const snap = q.snapshot();
   assert(snap.tokenHeld === false,
-    "CORR7-3: snapshot().tokenHeld false after watchdog reaped our token (no stale *)");
+    "snapshot().tokenHeld false after watchdog reaped our token (no stale *)");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3533,17 +3533,17 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   try {
     q.pauseUntil(Date.now() + 1_000, "CORR7-5 probe");
   } catch { threw = true; }
-  assert(!threw, "CORR7-5: mutate does not wedge on a planted .tmp directory");
+  assert(!threw, "mutate does not wedge on a planted .tmp directory");
 
   // The empty .tmp directory must be removed (rmdir'd).
   let dirGone = false;
   try { statSync(tmpDir); } catch { dirGone = true; }
-  assert(dirGone, "CORR7-5: empty .tmp directory removed by reapStaleTmps (rmdir)");
+  assert(dirGone, "empty .tmp directory removed by reapStaleTmps (rmdir)");
 
   // The state file must have been written (proving the mutate completed).
   let stateWritten = false;
   try { statSync(stateFile); stateWritten = true; } catch { /* not written */ }
-  assert(stateWritten, "CORR7-5: state file written (mutate completed despite .tmp dir)");
+  assert(stateWritten, "state file written (mutate completed despite .tmp dir)");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3556,15 +3556,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // pauseUntil's clamp.
 {
   const p = parsePriority({ low: true, boxed_until: "2099-12-31T00:00:00Z" });
-  assert(p.low === true, "SEC7-2: parsePriority low=true");
+  assert(p.low === true, "parsePriority low=true");
   assert(p.until <= Date.now() + MAX_PAUSE_MS + 1_000,
-    "SEC7-2: parsePriority clamps until to now + MAX_PAUSE_MS (not 2099)");
+    "parsePriority clamps until to now + MAX_PAUSE_MS (not 2099)");
   assert(p.until < Date.parse("2099-12-31T00:00:00Z"),
-    "SEC7-2: parsePriority clamped below the raw boxed_until");
+    "parsePriority clamped below the raw boxed_until");
   // A sub-ceiling boxed_until is unchanged.
   const future = new Date(Date.now() + 60_000).toISOString();
   const p2 = parsePriority({ low: true, boxed_until: future });
-  assert(p2.until === Date.parse(future), "SEC7-2: parsePriority sub-ceiling boxed_until unchanged");
+  assert(p2.until === Date.parse(future), "parsePriority sub-ceiling boxed_until unchanged");
 }
 
 // --- isPidDead guards non-numeric / non-finite input + EPERM (PID 1) ---
@@ -3574,17 +3574,17 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // Add a defensive typeof/Number.isFinite guard returning true (dead). Also
 // pin the EPERM path (PID 1 on macOS -> alive) to lock CORR2-4.
 {
-  assert(isPidDead(NaN) === true, "SEC7-3: isPidDead(NaN) -> true (non-finite guarded)");
-  assert(isPidDead(Infinity) === true, "SEC7-3: isPidDead(Infinity) -> true (non-finite guarded)");
-  assert(isPidDead("123" as any) === true, "SEC7-3: isPidDead(string) -> true (non-number guarded)");
-  assert(isPidDead(undefined as any) === true, "SEC7-3: isPidDead(undefined) -> true (non-number guarded)");
-  assert(isPidDead(0) === true, "SEC7-3: isPidDead(0) -> true (falsy)");
-  assert(isPidDead(-1) === true, "SEC7-3: isPidDead(-1) -> true (non-positive)");
+  assert(isPidDead(NaN) === true, "isPidDead(NaN) -> true (non-finite guarded)");
+  assert(isPidDead(Infinity) === true, "isPidDead(Infinity) -> true (non-finite guarded)");
+  assert(isPidDead("123" as any) === true, "isPidDead(string) -> true (non-number guarded)");
+  assert(isPidDead(undefined as any) === true, "isPidDead(undefined) -> true (non-number guarded)");
+  assert(isPidDead(0) === true, "isPidDead(0) -> true (falsy)");
+  assert(isPidDead(-1) === true, "isPidDead(-1) -> true (non-positive)");
   // EPERM path: PID 1 (init/launchd) exists but we lack permission to signal
   // it -> treat as alive (CORR2-4 fail-safe). On macOS/Linux PID 1 is always
   // present; on Windows this is a no-op best-effort.
   if (process.platform !== "win32") {
-    assert(isPidDead(1) === false, "SEC7-3: isPidDead(1) -> false (EPERM -> alive, CORR2-4 fail-safe)");
+    assert(isPidDead(1) === false, "isPidDead(1) -> false (EPERM -> alive, CORR2-4 fail-safe)");
   }
 }
 
@@ -3599,14 +3599,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const long = "A".repeat(200);
   const crafted = `${ansiEscape}${control}${long}`;
   const safe = sanitizeErrorBody(crafted);
-  assert(safe.length <= 80, "SEC7-4: error body capped to <= 80 chars");
-  assert(!/[\x00-\x1f\x7f]/.test(safe), "SEC7-4: error body has no control/ANSI-escape chars");
-  assert(!safe.includes("\x1b"), "SEC7-4: ESC byte removed from error body");
+  assert(safe.length <= 80, "error body capped to <= 80 chars");
+  assert(!/[\x00-\x1f\x7f]/.test(safe), "error body has no control/ANSI-escape chars");
+  assert(!safe.includes("\x1b"), "ESC byte removed from error body");
   // A short, clean body passes through unchanged.
-  assert(sanitizeErrorBody("not found") === "not found", "SEC7-4: short clean body unchanged");
+  assert(sanitizeErrorBody("not found") === "not found", "short clean body unchanged");
   // An empty/whitespace body yields an empty string (caller omits the `: ` ).
-  assert(sanitizeErrorBody("   ") === "", "SEC7-4: whitespace-only body -> empty");
-  assert(sanitizeErrorBody("") === "", "SEC7-4: empty body -> empty");
+  assert(sanitizeErrorBody("   ") === "", "whitespace-only body -> empty");
+  assert(sanitizeErrorBody("") === "", "empty body -> empty");
 }
 
 // --- bidi/RTL + zero-width + BOM stripped from pause reason + error body ---
@@ -3616,11 +3616,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // priority.reason / gateway body to spoof the displayed text.
 {
   const r = sanitizeReason("\u202Egnirts RTL \u200B\uFEFF");
-  assert(r !== null && !/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(r), "SEC9-1: sanitizeReason strips bidi/zero-width/BOM");
-  assert(r !== null && r.includes("gnirts") && r.includes("RTL"), "SEC9-1: sanitizeReason keeps printable ASCII");
+  assert(r !== null && !/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(r), "sanitizeReason strips bidi/zero-width/BOM");
+  assert(r !== null && r.includes("gnirts") && r.includes("RTL"), "sanitizeReason keeps printable ASCII");
   const b = sanitizeErrorBody("\u202Ebody\u200B");
-  assert(!/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(b), "SEC9-1: sanitizeErrorBody strips bidi/zero-width");
-  assert(b === "body", "SEC9-1: sanitizeErrorBody keeps printable ASCII body");
+  assert(!/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(b), "sanitizeErrorBody strips bidi/zero-width");
+  assert(b === "body", "sanitizeErrorBody keeps printable ASCII body");
 }
 
 // --- side-call 429s (vision handoff, web search) push the shared pause ---
@@ -3644,44 +3644,44 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const resLike = new Response("{}", { status: 429, headers: { "retry-after": "60" } });
   const untilA = handle429({ status: 429, headers: resLike.headers }, q);
   const stA = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(stA.pausedUntil === untilA, "CORR8-2: handle429 returns the written pausedUntil (fetch-Response shape)");
-  assert(stA.pausedUntil > Date.now() + 50_000, "CORR8-2: Retry-After 60s honored (pause ~60s)");
-  assert(stA.pausedReason === PAUSE_REASON_429, "CORR8-2: pause tagged PAUSE_REASON_429 (fetch-Response shape)");
+  assert(stA.pausedUntil === untilA, "handle429 returns the written pausedUntil (fetch-Response shape)");
+  assert(stA.pausedUntil > Date.now() + 50_000, "Retry-After 60s honored (pause ~60s)");
+  assert(stA.pausedReason === PAUSE_REASON_429, "pause tagged PAUSE_REASON_429 (fetch-Response shape)");
   q.clearPause({ force: true });
 
   // (b) pi-event shape (record): Retry-After 120 → pause 120s.
   const untilB = handle429({ status: 429, headers: { "retry-after": "120" } }, q);
   const stB = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(stB.pausedUntil === untilB, "CORR8-2: handle429 returns the written pausedUntil (pi-event shape)");
-  assert(stB.pausedUntil > Date.now() + 110_000, "CORR8-2: Retry-After 120s honored (pi-event shape)");
-  assert(stB.pausedReason === PAUSE_REASON_429, "CORR8-2: pause tagged PAUSE_REASON_429 (pi-event shape)");
+  assert(stB.pausedUntil === untilB, "handle429 returns the written pausedUntil (pi-event shape)");
+  assert(stB.pausedUntil > Date.now() + 110_000, "Retry-After 120s honored (pi-event shape)");
+  assert(stB.pausedReason === PAUSE_REASON_429, "pause tagged PAUSE_REASON_429 (pi-event shape)");
   q.clearPause({ force: true });
 
   // (c) No Retry-After → falls back to PRIORITY_BACKOFF_MS (30s).
   const untilC = handle429({ status: 429, headers: {} }, q);
   const stC = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(untilC <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: no Retry-After → PRIORITY_BACKOFF_MS floor (30s)");
-  assert(stC.pausedReason === PAUSE_REASON_429, "CORR8-2: no Retry-After still tagged PAUSE_REASON_429");
+  assert(untilC <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "no Retry-After → PRIORITY_BACKOFF_MS floor (30s)");
+  assert(stC.pausedReason === PAUSE_REASON_429, "no Retry-After still tagged PAUSE_REASON_429");
   q.clearPause({ force: true });
 
   // (d) Hex/sci-notation Retry-After rejected → PRIORITY_BACKOFF_MS floor.
   const untilHex = handle429({ status: 429, headers: { "retry-after": "0x10" } }, q);
-  assert(untilHex <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: hex Retry-After rejected → 30s floor");
+  assert(untilHex <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "hex Retry-After rejected → 30s floor");
   q.clearPause({ force: true });
   const untilSci = handle429({ status: 429, headers: { "retry-after": "1e10" } }, q);
-  assert(untilSci <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "CORR8-2: sci-notation Retry-After rejected → 30s floor");
+  assert(untilSci <= Date.now() + PRIORITY_BACKOFF_MS + 1_000, "sci-notation Retry-After rejected → 30s floor");
   q.clearPause({ force: true });
 
   // (e) Huge Retry-After clamped to MAX_PAUSE_429_MS (2.5 min), not 5h.
   const untilHuge = handle429({ status: 429, headers: { "retry-after": "99999999" } }, q);
-  assert(untilHuge <= Date.now() + MAX_PAUSE_429_MS + 1_000, "CORR8-2: huge Retry-After clamped to MAX_PAUSE_429_MS (2.5 min)");
-  assert(untilHuge < Date.now() + MAX_PAUSE_MS, "CORR8-2: 429 pause tighter than the 5h ceiling");
+  assert(untilHuge <= Date.now() + MAX_PAUSE_429_MS + 1_000, "huge Retry-After clamped to MAX_PAUSE_429_MS (2.5 min)");
+  assert(untilHuge < Date.now() + MAX_PAUSE_MS, "429 pause tighter than the 5h ceiling");
   q.clearPause({ force: true });
 
   // (f) Case-insensitive header lookup (Retry-After / retry-after).
   handle429({ status: 429, headers: { "Retry-After": "45" } }, q);
   const stF = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(stF.pausedUntil > Date.now() + 40_000, "CORR8-2: case-insensitive Retry-After header lookup");
+  assert(stF.pausedUntil > Date.now() + 40_000, "case-insensitive Retry-After header lookup");
   q.clearPause({ force: true });
 
   // (g) Non-429 status does not push a pause (the helper is 429-specific; callers
@@ -3692,7 +3692,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Here we just verify a 429 with undefined headers doesn't throw.
   let threw = false;
   try { handle429({ status: 429, headers: undefined }, q); } catch { threw = true; }
-  assert(!threw, "CORR8-2: handle429 with undefined headers does not throw (PRIORITY_BACKOFF_MS floor)");
+  assert(!threw, "handle429 with undefined headers does not throw (PRIORITY_BACKOFF_MS floor)");
   q.clearPause({ force: true });
 
   q.reset();
@@ -3727,15 +3727,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   } catch (e) {
     threw = true;
   }
-  assert(!threw, "SEC11-2: handle429 does not throw when headers.get throws (guarded)");
+  assert(!threw, "handle429 does not throw when headers.get throws (guarded)");
   // Falls back to the PRIORITY_BACKOFF_MS deadline (~30s), not a throw.
   assert(until > 0 && until <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
-    "SEC11-2: throwing .get falls back to PRIORITY_BACKOFF_MS deadline (~30s)");
+    "throwing .get falls back to PRIORITY_BACKOFF_MS deadline (~30s)");
   // A pause still landed + is tagged PAUSE_REASON_429 (the pauseUntil call is
   // independent of the header parse + still fires).
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st.pausedUntil === until, "SEC11-2: pause written at the fallback deadline");
-  assert(st.pausedReason === PAUSE_REASON_429, "SEC11-2: pause tagged PAUSE_REASON_429 despite throwing .get");
+  assert(st.pausedUntil === until, "pause written at the fallback deadline");
+  assert(st.pausedReason === PAUSE_REASON_429, "pause tagged PAUSE_REASON_429 despite throwing .get");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3783,18 +3783,18 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile });
   let threw = false;
   try { q.pauseUntil(Date.now() + 1_000, "ADV7-1 probe"); } catch { threw = true; }
-  assert(!threw, "ADV7-1: writeStateAtomic succeeds despite a leftover at the old per-pid name (random suffix)");
+  assert(!threw, "writeStateAtomic succeeds despite a leftover at the old per-pid name (random suffix)");
 
   // The leftover at the old name must be untouched (writeStateAtomic used a
   // different name — it's not reaped because its mtime is fresh).
   let leftExists = false;
   try { statSync(oldPidTmp); leftExists = true; } catch { /* gone */ }
-  assert(leftExists, "ADV7-1: leftover at old per-pid name untouched (writeStateAtomic used a different name)");
+  assert(leftExists, "leftover at old per-pid name untouched (writeStateAtomic used a different name)");
 
   // The state file must have been written (proving writeStateAtomic completed).
   let stateWritten = false;
   try { statSync(stateFile); stateWritten = true; } catch { /* not written */ }
-  assert(stateWritten, "ADV7-1: state file written (writeStateAtomic completed with a random-suffixed name)");
+  assert(stateWritten, "state file written (writeStateAtomic completed with a random-suffixed name)");
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3857,7 +3857,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   } catch {
     threw = true;
   }
-  assert(threw, "ADV10-2: writeStateAtomic threw when state path is a directory (renameSync EISDIR)");
+  assert(threw, "writeStateAtomic threw when state path is a directory (renameSync EISDIR)");
   // No .tmp file may be left on disk (the catch unlinked it before re-throwing).
   const leftover = readdirSync(dir).filter((n: string) => n.endsWith(".tmp"));
   assert(leftover.length === 0,
@@ -3951,7 +3951,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       };
     }
     await umansFactory(pi as any);
-    assert(cmds.has("umans-concurrency"), "COV9-3: /umans-concurrency command registered through wiring");
+    assert(cmds.has("umans-concurrency"), "/umans-concurrency command registered through wiring");
     const cmd = cmds.get("umans-concurrency")!;
 
     // Seed a 429-origin pause in the shared state file so status renders it +
@@ -3960,13 +3960,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     const seedQ = createConcurrencyQueue({ stateFile });
     const pauseUntil = Date.now() + 30_000;
     seedQ.pauseUntil(pauseUntil, PAUSE_REASON_429);
-    assert(seedQ.snapshot().paused === true, "COV9-3: seeded 429 pause visible to snapshot");
+    assert(seedQ.snapshot().paused === true, "seeded 429 pause visible to snapshot");
 
     // (a) status: notify text must mention queued + tokenHeld + paused + 429 reason.
     notifications.length = 0;
     await cmd.handler("status", makeCtx());
     const statusNote = notifications.find((n) => n.msg.startsWith("Umans concurrency:"));
-    assert(!!statusNote, "COV9-3: status subcommand produced a notify");
+    assert(!!statusNote, "status subcommand produced a notify");
     assert(statusNote!.msg.includes("paused"), `COV9-3: status notify mentions paused (got: ${statusNote!.msg})`);
     assert(statusNote!.msg.includes(PAUSE_REASON_429!), `COV9-3: status notify mentions 429 reason (got: ${statusNote!.msg})`);
 
@@ -3974,8 +3974,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     notifications.length = 0;
     await cmd.handler("", makeCtx());
     const emptyNote = notifications.find((n) => n.msg.startsWith("Umans concurrency:"));
-    assert(!!emptyNote, "COV9-3: no-args defaulted to status (produced a notify)");
-    assert(emptyNote!.msg.includes("paused"), "COV9-3: no-args status notify mentions paused");
+    assert(!!emptyNote, "no-args defaulted to status (produced a notify)");
+    assert(emptyNote!.msg.includes("paused"), "no-args status notify mentions paused");
 
     // (c) reset: clearPause({force:true}) + reset() — must clear the 429 pause
     // (the force branch is the only caller that overrides CORR4-1's 429 guard)
@@ -4072,14 +4072,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await umansFactory(pi as any);
     // /umans-vision registers only when the catalog has a via-handoff model
     // (STATIC_CATALOG does: umans-glm-5.1/5.2). Assert it registered.
-    assert(cmds.has("umans-vision"), "COV10-1: /umans-vision command registered through wiring");
+    assert(cmds.has("umans-vision"), "/umans-vision command registered through wiring");
     const cmd = cmds.get("umans-vision")!;
 
     // (a) no-args → status: notify text mentions vision on + the default model.
     notifications.length = 0;
     await cmd.handler("", makeCtx());
     const statusNote = notifications.find((n) => n.msg.startsWith("Umans vision:"));
-    assert(!!statusNote, "COV10-1: no-args produced a status notify");
+    assert(!!statusNote, "no-args produced a status notify");
     assert(statusNote!.msg.includes("on"), `COV10-1: status notify shows vision on (got: ${statusNote!.msg})`);
     assert(statusNote!.msg.includes("umans-kimi-k2.7"), `COV10-1: status notify shows default model (got: ${statusNote!.msg})`);
 
@@ -4087,7 +4087,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     notifications.length = 0;
     await cmd.handler("off", makeCtx());
     const offNote = notifications.find((n) => n.msg.includes("disabled"));
-    assert(!!offNote, "COV10-1: off subcommand produced a disabled notify");
+    assert(!!offNote, "off subcommand produced a disabled notify");
     // Verify via a status dispatch: status now shows vision off.
     notifications.length = 0;
     await cmd.handler("", makeCtx());
@@ -4098,7 +4098,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     notifications.length = 0;
     await cmd.handler("on", makeCtx());
     const onNote = notifications.find((n) => n.msg.includes("enabled"));
-    assert(!!onNote, "COV10-1: on subcommand produced an enabled notify");
+    assert(!!onNote, "on subcommand produced an enabled notify");
     notifications.length = 0;
     await cmd.handler("", makeCtx());
     const onStatus = notifications.find((n) => n.msg.startsWith("Umans vision:"));
@@ -4108,14 +4108,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     notifications.length = 0;
     await cmd.handler("model", makeCtx());
     const modelListNote = notifications.find((n) => n.msg.startsWith("Vision model:"));
-    assert(!!modelListNote, "COV10-1: model (no id) produced a list notify");
+    assert(!!modelListNote, "model (no id) produced a list notify");
     assert(modelListNote!.msg.includes("umans-kimi-k2.7"), `COV10-1: model list mentions current model (got: ${modelListNote!.msg})`);
 
     // (e) model <valid id> → visionModelId flips; notify confirms.
     notifications.length = 0;
     await cmd.handler("model umans-coder", makeCtx());
     const setNote = notifications.find((n) => n.msg.includes("set to"));
-    assert(!!setNote, "COV10-1: model <valid id> produced a set notify");
+    assert(!!setNote, "model <valid id> produced a set notify");
     assert(setNote!.msg.includes("umans-coder"), `COV10-1: set notify mentions umans-coder (got: ${setNote!.msg})`);
     // Verify via status.
     notifications.length = 0;
@@ -4127,7 +4127,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     notifications.length = 0;
     await cmd.handler("model umans-does-not-exist", makeCtx());
     const unknownNote = notifications.find((n) => n.msg.includes("Unknown vision model"));
-    assert(!!unknownNote, "COV10-1: model <bogus id> produced an unknown notify");
+    assert(!!unknownNote, "model <bogus id> produced an unknown notify");
     assert(unknownNote!.msg.includes("umans-does-not-exist"), `COV10-1: unknown notify mentions the bogus id (got: ${unknownNote!.msg})`);
     // visionModelId unchanged (still umans-coder from step e).
     notifications.length = 0;
@@ -4260,7 +4260,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await umansFactory(pi as any);
 
     // umans_web_search must have been registered with an execute fn.
-    assert(tools.has("umans_web_search"), "COV9-4: umans_web_search tool registered through wiring");
+    assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
     const searchTool = tools.get("umans_web_search")!;
 
     // (a) umans_web_search execute with fetch 200: acquireSlot joins + claims the
@@ -4271,13 +4271,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     messagesStatus = 200;
     usageCalls = 0;
     const searchRes200 = await searchTool.execute("call-1", { query: "latest news" }, new AbortController().signal, undefined, makeCtx());
-    assert(usageCalls > 0, "COV9-4: web_search 200 drove acquireSlot /v1/usage poll through wiring");
+    assert(usageCalls > 0, "web_search 200 drove acquireSlot /v1/usage poll through wiring");
     assert(typeof searchRes200?.content?.[0]?.text === "string" && searchRes200.content[0].text.length > 0,
-      "COV9-4: web_search 200 returned result text");
+      "web_search 200 returned result text");
     // Token must be released after the side-call completes (acquire+release).
     const probeA = createConcurrencyQueue({ stateFile });
     assert(probeA.snapshot().tokenHeld === false,
-      "COV9-4: web_search 200 released the side-call slot (token not held after)");
+      "web_search 200 released the side-call slot (token not held after)");
     probeA.reset();
 
     // (b) umans_web_search execute with fetch 429: searchWeb sees 429, calls
@@ -4292,11 +4292,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       `COV9-4: web_search 429 returned error text mentioning 429 (got: ${searchRes429?.content?.[0]?.text})`);
     const rawB = readFileSync(stateFile, "utf8");
     const parsedB = JSON.parse(rawB);
-    assert(parsedB.pausedUntil > before429, "COV9-4: web_search 429 set pausedUntil > now (shared pause landed)");
-    assert(parsedB.pausedReason === PAUSE_REASON_429, "COV9-4: web_search 429 tagged PAUSE_REASON_429");
+    assert(parsedB.pausedUntil > before429, "web_search 429 set pausedUntil > now (shared pause landed)");
+    assert(parsedB.pausedReason === PAUSE_REASON_429, "web_search 429 tagged PAUSE_REASON_429");
     const probeB = createConcurrencyQueue({ stateFile });
     assert(probeB.snapshot().tokenHeld === false,
-      "COV9-4: web_search 429 released the side-call slot (token not held after 429)");
+      "web_search 429 released the side-call slot (token not held after 429)");
     probeB.clearPause({ force: true });
     probeB.reset();
 
@@ -4318,8 +4318,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
         ],
       },
     }, makeCtx({ provider: "umans", id: "umans-glm-5.2" })); // via-handoff model
-    assert(messagesCalls > 0, "COV9-4: vision handoff drove analyzeImage /v1/messages fetch (acquireSlot wired)");
-    assert(transformed?.message?.content, "COV9-4: vision handoff returned a transformed message");
+    assert(messagesCalls > 0, "vision handoff drove analyzeImage /v1/messages fetch (acquireSlot wired)");
+    assert(transformed?.message?.content, "vision handoff returned a transformed message");
     // Extract the image id from the [Image analysis (image:ID)]: text block.
     const analysisText: string = transformed.message.content
       .find((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))?.text ?? "";
@@ -4329,11 +4329,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // The token must be released after the handoff side-call completes.
     const probeC = createConcurrencyQueue({ stateFile });
     assert(probeC.snapshot().tokenHeld === false,
-      "COV9-4: vision handoff released the side-call slot (token not held after)");
+      "vision handoff released the side-call slot (token not held after)");
     probeC.reset();
 
     // umans_vision must have been registered (catalog has a via-handoff model).
-    assert(tools.has("umans_vision"), "COV9-4: umans_vision tool registered through wiring");
+    assert(tools.has("umans_vision"), "umans_vision tool registered through wiring");
     const visionTool = tools.get("umans_vision")!;
 
     // (d) umans_vision execute with fetch 200: acquireSlot + analyzeImage (200)
@@ -4341,10 +4341,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     messagesStatus = 200;
     const visionRes200 = await visionTool.execute("call-3", { image_id: imgId, question: "describe it" }, new AbortController().signal, undefined, makeCtx());
     assert(typeof visionRes200?.content?.[0]?.text === "string" && visionRes200.content[0].text.length > 0,
-      "COV9-4: vision 200 returned result text");
+      "vision 200 returned result text");
     const probeD = createConcurrencyQueue({ stateFile });
     assert(probeD.snapshot().tokenHeld === false,
-      "COV9-4: vision 200 released the side-call slot (token not held after)");
+      "vision 200 released the side-call slot (token not held after)");
     probeD.reset();
 
     // (e) umans_vision execute with fetch 429: analyzeImage sees 429, calls
@@ -4356,11 +4356,11 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       `COV9-4: vision 429 returned error text mentioning 429 (got: ${visionRes429?.content?.[0]?.text})`);
     const rawE = readFileSync(stateFile, "utf8");
     const parsedE = JSON.parse(rawE);
-    assert(parsedE.pausedUntil > before429v, "COV9-4: vision 429 set pausedUntil > now (shared pause landed)");
-    assert(parsedE.pausedReason === PAUSE_REASON_429, "COV9-4: vision 429 tagged PAUSE_REASON_429");
+    assert(parsedE.pausedUntil > before429v, "vision 429 set pausedUntil > now (shared pause landed)");
+    assert(parsedE.pausedReason === PAUSE_REASON_429, "vision 429 tagged PAUSE_REASON_429");
     const probeE = createConcurrencyQueue({ stateFile });
     assert(probeE.snapshot().tokenHeld === false,
-      "COV9-4: vision 429 released the side-call slot (token not held after 429)");
+      "vision 429 released the side-call slot (token not held after 429)");
     probeE.clearPause({ force: true });
     probeE.reset();
 
@@ -4490,7 +4490,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       searchEmpty.content[0].text === "(no search results returned)",
       `COV10-6: searchWeb content:[] fallback text (got: ${searchEmpty?.content?.[0]?.text})`);
     const probeA = createConcurrencyQueue({ stateFile });
-    assert(probeA.snapshot().tokenHeld === false, "COV10-6: searchWeb empty-fallback released the side-call slot");
+    assert(probeA.snapshot().tokenHeld === false, "searchWeb empty-fallback released the side-call slot");
     probeA.reset();
 
     // (b) searchWeb with a web_search_tool_result-only response (no text block):
@@ -4498,7 +4498,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     messagesMode = "results-only";
     const searchResults = await searchTool.execute("call-2", { query: "test" }, new AbortController().signal, undefined, makeCtx());
     assert(typeof searchResults?.content?.[0]?.text === "string",
-      "COV10-6: searchWeb results-only fallback returned a text string");
+      "searchWeb results-only fallback returned a text string");
     const resultsText: string = searchResults.content[0].text;
     assert(resultsText.includes("1. First Result") && resultsText.includes("https://example.com/1"),
       `COV10-6: searchWeb results-only fallback lists result 1 (got: ${resultsText})`);
@@ -4507,7 +4507,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     assert(resultsText.includes("URL: "),
       `COV10-6: searchWeb results-only fallback uses 'URL: ' prefix (got: ${resultsText})`);
     const probeB = createConcurrencyQueue({ stateFile });
-    assert(probeB.snapshot().tokenHeld === false, "COV10-6: searchWeb results-only fallback released the side-call slot");
+    assert(probeB.snapshot().tokenHeld === false, "searchWeb results-only fallback released the side-call slot");
     probeB.reset();
 
     // (c) analyzeImage with a content array that has no text block (e.g. a
@@ -4540,7 +4540,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       visionEmpty.content[0].text === "(no analysis returned)",
       `COV10-6: analyzeImage no-text fallback text (got: ${visionEmpty?.content?.[0]?.text})`);
     const probeC = createConcurrencyQueue({ stateFile });
-    assert(probeC.snapshot().tokenHeld === false, "COV10-6: analyzeImage no-text fallback released the side-call slot");
+    assert(probeC.snapshot().tokenHeld === false, "analyzeImage no-text fallback released the side-call slot");
     probeC.reset();
 
     await dispatch("session_shutdown", { type: "session_shutdown" });
@@ -4662,7 +4662,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // All 3 analyzeImage fetches fired (one per image via Promise.all).
     assert(messagesCalls === 3, `COV10-2: 3 analyzeImage /v1/messages fetches fired (got ${messagesCalls})`);
     // The transformed message has 3 [Image analysis (image:ID)]: text blocks.
-    assert(transformed?.message?.content, "COV10-2: multi-image handoff returned a transformed message");
+    assert(transformed?.message?.content, "multi-image handoff returned a transformed message");
     const analysisBlocks: string[] = (transformed.message.content as any[])
       .filter((b: any) => typeof b?.text === "string" && b.text.includes("[Image analysis (image:"))
       .map((b: any) => b.text);
@@ -4689,7 +4689,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // acquireSlot's finally released its slot — no leak across the Promise.all).
     const probe = createConcurrencyQueue({ stateFile });
     assert(probe.snapshot().tokenHeld === false,
-      "COV10-2: token not held after multi-image handoff (all side-call slots released)");
+      "token not held after multi-image handoff (all side-call slots released)");
     // No waiter leaked: the state file's waiters array is empty (each acquireSlot
     // cancelled its waiter in the finally release).
     const raw = readFileSync(stateFile, "utf8");
@@ -4816,7 +4816,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       return result;
     }
     await umansFactory(pi as any);
-    assert(modelsInfoCalls > 0, "COV11-2: /v1/models/info fetched (catalog with no native-vision model)");
+    assert(modelsInfoCalls > 0, "/v1/models/info fetched (catalog with no native-vision model)");
 
     // Dispatch message_end with an image block + a via-handoff model selected.
     // The message_end handler: provider is umans ✓, isViaHandoffUmans(glm-5.2)
@@ -4846,10 +4846,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // before any acquireSlot / fetch).
     assert(messagesCalls === 0, `COV11-2: no /v1/messages fetch fired (no side-call) (got ${messagesCalls})`);
     // No state file written (no acquireSlot → no queue mutation).
-    assert(!existsSync(stateFile), "COV11-2: no state file written (!visionModelId early-return)");
+    assert(!existsSync(stateFile), "no state file written (!visionModelId early-return)");
     // The handler returned undefined (no transformed message — the image is
     // left as-is for the text model / gateway-side handoff).
-    assert(result === undefined, "COV11-2: message_end returned undefined (no transformation, no acquireSlot)");
+    assert(result === undefined, "message_end returned undefined (no transformation, no acquireSlot)");
 
     await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
@@ -4940,32 +4940,32 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     }
     await umansFactory(pi as any);
 
-    assert(handlers.has("before_provider_request"), "COV10-7: before_provider_request handler registered");
-    assert(handlers.has("after_provider_response"), "COV10-7: after_provider_response handler registered");
-    assert(handlers.has("message_end"), "COV10-7: message_end handler registered");
-    assert(handlers.has("session_shutdown"), "COV10-7: session_shutdown handler registered");
+    assert(handlers.has("before_provider_request"), "before_provider_request handler registered");
+    assert(handlers.has("after_provider_response"), "after_provider_response handler registered");
+    assert(handlers.has("message_end"), "message_end handler registered");
+    assert(handlers.has("session_shutdown"), "session_shutdown handler registered");
 
     // (a) before_provider_request: concurrencyDisabled short-circuits BEFORE
     // acquireSlot — no /usage poll, no state file written, no token acquired.
     usageCalls = 0;
     await dispatch("before_provider_request", { type: "before_provider_request", payload: {} });
     await new Promise((r) => setTimeout(r, 50));
-    assert(usageCalls === 0, "COV10-7: concurrencyDisabled before_provider_request did not poll /v1/usage");
-    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled before_provider_request wrote no state file");
+    assert(usageCalls === 0, "concurrencyDisabled before_provider_request did not poll /v1/usage");
+    assert(!existsSync(stateFile), "concurrencyDisabled before_provider_request wrote no state file");
 
     // (b) after_provider_response 429: concurrencyDisabled short-circuits BEFORE
     // handle429 — no shared pause written, no notify. The 429 is invisible to
     // the queue (fire-and-forget mode).
     await dispatch("after_provider_response", { type: "after_provider_response", status: 429, headers: { "retry-after": "60" } });
-    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled after_provider_response 429 wrote no state file");
+    assert(!existsSync(stateFile), "concurrencyDisabled after_provider_response 429 wrote no state file");
     const pauseNotes = notifications.filter((n) => n.msg.includes("Umans 429"));
-    assert(pauseNotes.length === 0, "COV10-7: concurrencyDisabled after_provider_response 429 did not notify a pause");
+    assert(pauseNotes.length === 0, "concurrencyDisabled after_provider_response 429 did not notify a pause");
 
     // (c) message_end: concurrencyDisabled short-circuits BEFORE releaseMainTurn
     // — but mainTurnRelease was never set (no acquireSlot in (a)), so this is a
     // no-op either way. Assert no state file appears (no reset path writes).
     await dispatch("message_end", { type: "message_end", message: { role: "assistant", provider: "umans" } });
-    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled message_end wrote no state file");
+    assert(!existsSync(stateFile), "concurrencyDisabled message_end wrote no state file");
 
     // turn_end + agent_end also call releaseMainTurn(). They have NO
     // `if (concurrencyDisabled) return` guard (unlike before_provider_request /
@@ -4979,15 +4979,15 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     await dispatch("agent_end", { type: "agent_end" });
     assert(!existsSync(stateFile), "COV10-7/COV11-1: concurrencyDisabled agent_end wrote no state file (undefined-release no-op)");
     // turn_end + agent_end are registered (the safety-net wiring is present).
-    assert(handlers.has("turn_end"), "COV11-1: turn_end handler registered (safety net)");
-    assert(handlers.has("agent_end"), "COV11-1: agent_end handler registered (safety net)");
+    assert(handlers.has("turn_end"), "turn_end handler registered (safety net)");
+    assert(handlers.has("agent_end"), "agent_end handler registered (safety net)");
 
     // (d) session_shutdown: the handler runs stopRefreshLoop + releaseMainTurn
     // + concurrencyQueue.reset(). reset() on a disabled queue is a no-op (no
     // state file). The refresh loop never started (session_start wasn't
     // dispatched), so stopRefreshLoop is a no-op. Assert no state file appears.
     await dispatch("session_shutdown", { type: "session_shutdown" });
-    assert(!existsSync(stateFile), "COV10-7: concurrencyDisabled session_shutdown wrote no state file");
+    assert(!existsSync(stateFile), "concurrencyDisabled session_shutdown wrote no state file");
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -5029,10 +5029,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // UMANS_SEARCH_DISABLE=1 → tool NOT registered
     await umansFactory(pi as any);
     assert(!registeredTools.includes("umans_web_search"),
-      "COV-R14-1: UMANS_SEARCH_DISABLE=1 → umans_web_search NOT registered");
+      "UMANS_SEARCH_DISABLE=1 → umans_web_search NOT registered");
     // Other tools should still be registered (only search is disabled).
     assert(registeredTools.length > 0,
-      "COV-R14-1: UMANS_SEARCH_DISABLE=1 → other tools still registered");
+      "UMANS_SEARCH_DISABLE=1 → other tools still registered");
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -5079,7 +5079,7 @@ if (process.platform !== "win32") {
     if (existsSync(lockFile)) { childReady = true; break; }
     await new Promise((r) => setTimeout(r, 5));
   }
-  assert(childReady, "COV10-3: child holder created the lockfile");
+  assert(childReady, "child holder created the lockfile");
   try {
     const q = createConcurrencyQueue({ stateFile, lockTimeoutMs: 50, lockRetryMs: 5 });
     let threw = false;
@@ -5092,7 +5092,7 @@ if (process.platform !== "win32") {
       errMsg = e instanceof Error ? e.message : String(e);
     }
     const elapsed = Date.now() - t0;
-    assert(threw, "COV10-3: acquireLock threw on timeout (lock held by child with fresh mtime)");
+    assert(threw, "acquireLock threw on timeout (lock held by child with fresh mtime)");
     assert(errMsg.includes("timed out acquiring lock"),
       `COV10-3: throw message mentions timeout (got: ${errMsg})`);
     // The throw fired within ~500ms (the 50ms deadline + retry slack), proving
@@ -5112,7 +5112,7 @@ if (process.platform !== "win32") {
   // the source so the path is at least pinned structurally.
   const src = readFileSync("concurrency-queue.ts", "utf8");
   assert(src.includes("timed out acquiring lock"),
-    "COV10-3: acquireLock timeout message present in source (Windows skip)");
+    "acquireLock timeout message present in source (Windows skip)");
 }
 
 // --- acquireLock opens a zero-byte O_EXCL sentinel (no writeFileSync) ---
@@ -5126,19 +5126,19 @@ if (process.platform !== "win32") {
 {
   const src = readFileSync("concurrency-queue.ts", "utf8");
   const acquireIdx = src.indexOf("function acquireLock(");
-  assert(acquireIdx >= 0, "CORR11-1: acquireLock defined in concurrency-queue.ts");
+  assert(acquireIdx >= 0, "acquireLock defined in concurrency-queue.ts");
   const acquireEnd = src.indexOf("\n}\n", acquireIdx);
   const body = src.slice(acquireIdx, acquireEnd);
   // the lockfile is a zero-byte O_EXCL sentinel — no writeFileSync
   // of a PID object after openSync.
   assert(!body.includes("writeFileSync(fd, JSON.stringify"),
-    "SEC13-2: acquireLock does NOT write the holder PID (dead code dropped)");
+    "acquireLock does NOT write the holder PID (dead code dropped)");
   // The openSync("wx") call must still be present (O_EXCL sentinel).
   assert(body.includes('openSync(lockFile, "wx", 0o600)'),
-    "CORR11-1: acquireLock opens lockfile with O_EXCL (wx) + 0o600 mode");
+    "acquireLock opens lockfile with O_EXCL (wx) + 0o600 mode");
   // The release fn must close fd + unlink the lockfile.
   assert(body.includes("closeSync(fd)") && body.includes("unlinkSync(lockFile)"),
-    "CORR11-1: release fn closes fd + unlinks lockfile");
+    "release fn closes fd + unlinks lockfile");
 }
 
 // --- side-call tool execute early-return paths driven through real wiring ---
@@ -5233,8 +5233,8 @@ if (process.platform !== "win32") {
     }
     await umansFactory(pi as any);
 
-    assert(tools.has("umans_web_search"), "COV10-5: umans_web_search tool registered through wiring");
-    assert(tools.has("umans_vision"), "COV10-5: umans_vision tool registered through wiring");
+    assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
+    assert(tools.has("umans_vision"), "umans_vision tool registered through wiring");
     const searchTool = tools.get("umans_web_search")!;
     const visionTool = tools.get("umans_vision")!;
 
@@ -5251,8 +5251,8 @@ if (process.platform !== "win32") {
     assert(typeof searchNoKey?.content?.[0]?.text === "string" &&
       searchNoKey.content[0].text.includes("API key unavailable"),
       `COV10-5: web_search no-apiKey early-return text (got: ${searchNoKey?.content?.[0]?.text})`);
-    assert(usageCalls === 0, "COV10-5: web_search no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
-    assert(messagesCalls === 0, "COV10-5: web_search no-apiKey did not fetch /v1/messages (early-return before searchWeb)");
+    assert(usageCalls === 0, "web_search no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "web_search no-apiKey did not fetch /v1/messages (early-return before searchWeb)");
 
     // (b) umans_vision.execute with an unknown image_id (not in imageStore):
     // the !image early-return fires BEFORE apiKey resolution + acquireSlot.
@@ -5267,8 +5267,8 @@ if (process.platform !== "win32") {
     assert(typeof visionUnknown?.content?.[0]?.text === "string" &&
       visionUnknown.content[0].text.includes("not available in this session"),
       `COV10-5: vision unknown-image_id early-return text (got: ${visionUnknown?.content?.[0]?.text})`);
-    assert(usageCalls === 0, "COV10-5: vision unknown-image_id did not poll /v1/usage (early-return before acquireSlot)");
-    assert(messagesCalls === 0, "COV10-5: vision unknown-image_id did not fetch /v1/messages (early-return before analyzeImage)");
+    assert(usageCalls === 0, "vision unknown-image_id did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "vision unknown-image_id did not fetch /v1/messages (early-return before analyzeImage)");
 
     // Populate imageStore via the via-handoff message_end handler with one
     // image so the subsequent (c)/(d) sub-tests can use its id.
@@ -5305,8 +5305,8 @@ if (process.platform !== "win32") {
     assert(typeof visionNoKey?.content?.[0]?.text === "string" &&
       visionNoKey.content[0].text.includes("API key unavailable"),
       `COV10-5: vision no-apiKey early-return text (got: ${visionNoKey?.content?.[0]?.text})`);
-    assert(usageCalls === 0, "COV10-5: vision no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
-    assert(messagesCalls === 0, "COV10-5: vision no-apiKey did not fetch /v1/messages (early-return before analyzeImage)");
+    assert(usageCalls === 0, "vision no-apiKey did not poll /v1/usage (early-return before acquireSlot)");
+    assert(messagesCalls === 0, "vision no-apiKey did not fetch /v1/messages (early-return before analyzeImage)");
 
     // (d) umans_vision.execute with a known image_id + valid apiKey but no
     // vision model configured: the !visionModelId early-return fires AFTER
@@ -5319,12 +5319,12 @@ if (process.platform !== "win32") {
     apiKeyResolver = async () => "uk-test-key";
     const srcIdx = readFileSync("index.ts", "utf8");
     assert(srcIdx.includes('"No vision model configured. Set one with /umans-vision model <id>."'),
-      "COV10-5: vision no-model early-return guard present in source (index.ts)");
+      "vision no-model early-return guard present in source (index.ts)");
     // Confirm the guard sits between the apiKey check and acquireSlot in the
     // umans_vision execute body (so it fires before any side-call).
     const guardIdx = srcIdx.indexOf('"No vision model configured');
     const acquireIdx = srcIdx.indexOf("acquireSlot(apiKey, signal);", guardIdx);
-    assert(acquireIdx > guardIdx, "COV10-5: vision no-model guard precedes acquireSlot (early-return before side-call)");
+    assert(acquireIdx > guardIdx, "vision no-model guard precedes acquireSlot (early-return before side-call)");
 
     await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
@@ -5346,27 +5346,27 @@ if (process.platform !== "win32") {
 {
   const src = readFileSync("index.ts", "utf8");
   assert(src.includes("async function raiseForUmansStatus("),
-    "CLN10-4: raiseForUmansStatus helper defined in index.ts");
+    "raiseForUmansStatus helper defined in index.ts");
   // Both side-call sites call the helper in their !res.ok branch.
   const analyzeIdx = src.indexOf("async function analyzeImage(");
   const searchIdx = src.indexOf("async function searchWeb(");
   assert(analyzeIdx >= 0 && searchIdx > analyzeIdx,
-    "CLN10-4: analyzeImage + searchWeb defined in index.ts");
+    "analyzeImage + searchWeb defined in index.ts");
   const analyzeCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
   const searchCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
   assert(analyzeCallIdx > analyzeIdx && analyzeCallIdx < searchIdx,
-    "CLN10-4: analyzeImage !res.ok branch calls raiseForUmansStatus");
+    "analyzeImage !res.ok branch calls raiseForUmansStatus");
   assert(searchCallIdx > searchIdx,
-    "CLN10-4: searchWeb !res.ok branch calls raiseForUmansStatus");
+    "searchWeb !res.ok branch calls raiseForUmansStatus");
   // The helper runs the 429 push (handle429) + the body sanitize
   // (sanitizeErrorBody) — pin both are referenced inside it.
   const helperStart = src.indexOf("async function raiseForUmansStatus(");
   const helperEnd = src.indexOf("\n}\n", helperStart);
   const helperBody = src.slice(helperStart, helperEnd);
   assert(helperBody.includes("handle429(res, concurrencyQueue)"),
-    "CLN10-4: raiseForUmansStatus runs the 429 push (handle429)");
+    "raiseForUmansStatus runs the 429 push (handle429)");
   assert(helperBody.includes("sanitizeErrorBody(txt)"),
-    "CLN10-4: raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
+    "raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
 }
 
 // --- concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
@@ -5387,11 +5387,11 @@ if (process.platform !== "win32") {
       Array.from({ length: 5 }, () => Promise.resolve(q.join())),
     );
     // All join()s must return a non-null id (queue not disabled).
-    assert(ids.every((id) => id !== null), "COV9-8: all 5 concurrent join()s returned a non-null id");
+    assert(ids.every((id) => id !== null), "all 5 concurrent join()s returned a non-null id");
     // Read the state file + assert all 5 waiters landed.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
-    assert(Array.isArray(parsed.waiters), "COV9-8: state file has a waiters array");
+    assert(Array.isArray(parsed.waiters), "state file has a waiters array");
     assert(parsed.waiters.length === 5, `COV9-8: all 5 waiters landed (got ${parsed.waiters.length})`);
     // Each id from join() must be present in the file.
     const fileIds = new Set(parsed.waiters.map((w: any) => w.id));
@@ -5416,20 +5416,20 @@ if (process.platform !== "win32") {
   // USER_AGENT must be a template literal interpolating pkg.version, not a
   // hardcoded version string.
   assert(src.includes('const USER_AGENT = `pi-umans-provider/${pkg.version}`;'),
-    "CLN11-1: USER_AGENT is derived from pkg.version (template literal), not hardcoded");
+    "USER_AGENT is derived from pkg.version (template literal), not hardcoded");
   // The pkg import (ESM JSON import attribute) must be present.
   assert(src.includes('import pkg from "./package.json" with { type: "json" }'),
-    "CLN11-1: package.json imported as pkg (ESM JSON import attribute)");
+    "package.json imported as pkg (ESM JSON import attribute)");
   // USER_AGENT string must include the current package.json version — the
   // exact drift assertion. (We can't read USER_AGENT directly since it isn't
   // exported, but the template-literal check above + this version match
   // structurally guarantee it.)
   assert(typeof pkg.version === "string" && pkg.version.length > 0,
-    "CLN11-1: package.json has a version field");
+    "package.json has a version field");
   // The template literal builds the string `pi-umans-provider/<version>`.
   const expected = `pi-umans-provider/${pkg.version}`;
   assert(`pi-umans-provider/${pkg.version}` === expected,
-    "CLN11-1: USER_AGENT template literal includes pkg.version (no drift)");
+    "USER_AGENT template literal includes pkg.version (no drift)");
 }
 
 // --- future-dated lockfile mtime is reclaimed (clock skew / touch -t attack) ---
@@ -5463,9 +5463,9 @@ if (process.platform !== "win32") {
     const q = createConcurrencyQueue(cfg);
     const id = q.join();
     assert(typeof id === "string" && id.length > 0,
-      "ADV12-1: far-future (1h) lockfile mtime is reclaimed (join succeeds, not wedged)");
+      "far-future (1h) lockfile mtime is reclaimed (join succeeds, not wedged)");
     assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
-      "ADV12-1: far-future lockfile is either gone (released) or freshly created (~now)");
+      "far-future lockfile is either gone (released) or freshly created (~now)");
     q.cancel(id!);
   } finally {
     try { rmSync(tmp1, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5494,9 +5494,9 @@ if (process.platform !== "win32") {
     // mtime is reclaimed.
     const id = q.join();
     assert(typeof id === "string" && id.length > 0,
-      "SEC13-1: near-future (30s) lockfile mtime is reclaimed (join succeeds, not wedged)");
+      "near-future (30s) lockfile mtime is reclaimed (join succeeds, not wedged)");
     assert(!existsSync(lockFile) || statSync(lockFile).mtimeMs - Date.now() < 5_000,
-      "SEC13-1: near-future lockfile is either gone (released) or freshly created (~now)");
+      "near-future lockfile is either gone (released) or freshly created (~now)");
     q.cancel(id!);
   } finally {
     try { rmSync(tmp2, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5511,11 +5511,11 @@ if (process.platform !== "win32") {
   // The import line must NOT include readFileSync.
   const importLine = src.match(/import\{[^}]*\}from"node:fs"/)?.[0] ?? src.split("\n").find((l) => l.includes('from "node:fs"')) ?? "";
   assert(!importLine.includes("readFileSync"),
-    "ADV12-3: readFileSync removed from concurrency-queue.ts import (dead after SEC9-3)");
+    "readFileSync removed from concurrency-queue.ts import (dead after SEC9-3)");
   // Sanity: readFileSync should not appear as a call (only in comments is OK).
   const calls = src.replace(/\/\/.*$/gm, "").match(/readFileSync\(/g);
   assert(calls === null,
-    "ADV12-3: no readFileSync call sites in concurrency-queue.ts (comments excluded)");
+    "no readFileSync call sites in concurrency-queue.ts (comments excluded)");
 }
 
 // --- cancel(ourId) in acquireSlot abort path is wrapped in try/catch ---
@@ -5528,10 +5528,10 @@ if (process.platform !== "win32") {
   // Find the abort path block.
   const abortBlock = src.match(/if \(decision === "abort"\) \{[\s\S]*?return undefined;\n\s*\}/)?.[0] ?? "";
   assert(abortBlock.length > 0,
-    "COV12-1: abort path block found in index.ts");
+    "abort path block found in index.ts");
   // The cancel(ourId) call in the abort path must be wrapped in try/catch.
   assert(abortBlock.includes('try { concurrencyQueue.cancel(ourId); } catch'),
-    "COV12-1: cancel(ourId) in abort path wrapped in try/catch (best-effort)");
+    "cancel(ourId) in abort path wrapped in try/catch (best-effort)");
   // The sibling cancel calls must also be wrapped (regression guard).
   const touchReapBlock = src.match(/touchToken.*?reaped[\s\S]*?\n\s*\}/)?.[0] ?? "";
 }
@@ -5547,14 +5547,14 @@ if (process.platform !== "win32") {
   // Find the before_provider_request handler's acquireSlot call.
   const handlerBlock = src.match(/pi\.on\("before_provider_request"[\s\S]*?\n  \}\);/)?.[0] ?? "";
   assert(handlerBlock.length > 0,
-    "ADV12-2: before_provider_request handler block found");
+    "before_provider_request handler block found");
   // The acquireSlot call must be inside a try/catch.
   assert(handlerBlock.includes('try {') && handlerBlock.includes('release = await acquireSlot'),
-    "ADV12-2: acquireSlot call wrapped in try block");
+    "acquireSlot call wrapped in try block");
   assert(handlerBlock.includes('catch (err)') && handlerBlock.includes('fail-open ungated'),
-    "ADV12-2: catch block fails open ungated (proceeds without release fn)");
+    "catch block fails open ungated (proceeds without release fn)");
   assert(handlerBlock.includes('proceeding ungated'),
-    "ADV12-2: user notified via ctx.ui.notify on fail-open");
+    "user notified via ctx.ui.notify on fail-open");
 }
 
 // --- 403 account_suspended / cap_abuse: extractBoxedUntil tolerant extraction ---
@@ -5569,26 +5569,26 @@ if (process.platform !== "win32") {
   const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
   let ms = extractBoxedUntil(JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future }));
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: structured JSON boxed_until (ISO string) extracted");
+    "structured JSON boxed_until (ISO string) extracted");
   // (a') nested under error.boxed_until.
   ms = extractBoxedUntil(JSON.stringify({ error: { type: "account_suspended", boxed_until: future } }));
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: nested error.boxed_until extracted");
+    "nested error.boxed_until extracted");
   // (a'') epoch-seconds numeric boxed_until.
   const futureSec = Math.floor((Date.now() + 3 * 60 * 60 * 1000) / 1000);
   ms = extractBoxedUntil(JSON.stringify({ boxed_until: futureSec }));
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: epoch-seconds numeric boxed_until extracted + converted to ms");
+    "epoch-seconds numeric boxed_until extracted + converted to ms");
   // (a''') epoch-MILLISECONDS numeric boxed_until (b > 1e12, returned as-is).
   const futureMs = Date.now() + 3 * 60 * 60 * 1000;
   ms = extractBoxedUntil(JSON.stringify({ boxed_until: futureMs }));
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: epoch-milliseconds numeric boxed_until extracted as-is (b > 1e12)");
+    "epoch-milliseconds numeric boxed_until extracted as-is (b > 1e12)");
   // (b) ISO timestamp embedded in an error message string.
   const msgBody = `{"error":"account_suspended until ${future}; contact support"}`;
   ms = extractBoxedUntil(msgBody);
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: ISO timestamp embedded in error message string extracted via regex");
+    "ISO timestamp embedded in error message string extracted via regex");
   // (b') message string with a PAST reference BEFORE the future deadline
   // (e.g. `account_suspended from <past> until <future>`). The regex must
   // iterate ALL timestamps + skip the past one (t <= now) + return the future
@@ -5598,7 +5598,7 @@ if (process.platform !== "win32") {
   const futureDeadline = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
   ms = extractBoxedUntil(`account_suspended from ${pastRef} until ${futureDeadline}; contact support`);
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: past reference before future deadline — regex iterates + returns the future timestamp");
+    "past reference before future deadline — regex iterates + returns the future timestamp");
   // (b'') message string with TWO future timestamps where the NON-deadline
   // future appears BEFORE the real deadline. The regex must return the LATEST
   // future timestamp (the maximum), not the first — a shorter pause would
@@ -5609,7 +5609,7 @@ if (process.platform !== "win32") {
   const laterFuture = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString(); // +5h
   ms = extractBoxedUntil(`policy_review ${earlyFuture}; suspended until ${laterFuture}`);
   assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
-    "C2: two future timestamps — regex returns the LATEST (the maximum), not the first");
+    "two future timestamps — regex returns the LATEST (the maximum), not the first");
   // (b''') structured-JSON path with TWO future boxed_until fields: a
   // top-level boxed_until (an earlier future, e.g. a non-deadline future
   // timestamp) + error.boxed_until (the real, later deadline). Symmetric with
@@ -5622,7 +5622,7 @@ if (process.platform !== "win32") {
     error: { type: "account_suspended", boxed_until: laterFuture },
   }));
   assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
-    "C2: structured-JSON two future boxed_until fields — returns the LATEST (error.boxed_until), not the first (top-level)");
+    "structured-JSON two future boxed_until fields — returns the LATEST (error.boxed_until), not the first (top-level)");
   // (b'''') symmetric case: candidates reversed in source order
   // (error.boxed_until earlier, top-level later) — still the maximum.
   ms = extractBoxedUntil(JSON.stringify({
@@ -5630,23 +5630,23 @@ if (process.platform !== "win32") {
     error: { type: "account_suspended", boxed_until: earlyFuture },
   }));
   assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
-    "C2: structured-JSON two future boxed_until fields (reversed order) — returns the LATEST regardless of candidate order");
+    "structured-JSON two future boxed_until fields (reversed order) — returns the LATEST regardless of candidate order");
   // (c) absent (HTML gateway page) → undefined.
   ms = extractBoxedUntil("<html><body>403 Forbidden</body></html>");
   assert(ms === undefined,
-    "C3: HTML body with no timestamp → undefined (caller applies 30s floor)");
+    "HTML body with no timestamp → undefined (caller applies 30s floor)");
   // (c') empty body → undefined.
   ms = extractBoxedUntil("");
-  assert(ms === undefined, "C3: empty body → undefined");
+  assert(ms === undefined, "empty body → undefined");
   // PAST boxed_until (ISO string) → undefined (treated as absent).
   const past = new Date(Date.now() - 60 * 1000).toISOString();
   ms = extractBoxedUntil(JSON.stringify({ boxed_until: past }));
   assert(ms === undefined,
-    "Adv4: past boxed_until treated as absent (does not silently disable the pause)");
+    "past boxed_until treated as absent (does not silently disable the pause)");
   // Adv4': PAST boxed_until embedded in message string → undefined.
   ms = extractBoxedUntil(`account_suspended until ${past}`);
   assert(ms === undefined,
-    "Adv4: past boxed_until in message string treated as absent");
+    "past boxed_until in message string treated as absent");
 }
 
 // --- isSuspendBody detects the suspend family ---
@@ -5655,32 +5655,32 @@ if (process.platform !== "win32") {
 // for siblings.
 {
   assert(isSuspendBody(JSON.stringify({ error: { type: "account_suspended" } })),
-    "C7: account_suspended body detected");
+    "account_suspended body detected");
   assert(isSuspendBody(JSON.stringify({ type: "billing_error" })),
-    "C7: billing_error body detected");
+    "billing_error body detected");
   assert(isSuspendBody("cap_abuse until tomorrow"),
-    "C7: cap_abuse in plain string detected");
+    "cap_abuse in plain string detected");
   assert(isSuspendBody("CAP_SUSPENDED"),
-    "C7: cap_suspended detected case-insensitively");
+    "cap_suspended detected case-insensitively");
   assert(!isSuspendBody(JSON.stringify({ error: "forbidden" })),
-    "C7: unrelated 403 body (auth error) NOT detected");
+    "unrelated 403 body (auth error) NOT detected");
   assert(!isSuspendBody("<html><body>403 Forbidden</body></html>"),
-    "C7: HTML gateway page NOT detected");
+    "HTML gateway page NOT detected");
   assert(!isSuspendBody(""),
-    "C7: empty body NOT detected");
+    "empty body NOT detected");
 }
 
 // --- isSuspendReason detects the suspend family for /v1/usage priority.reason ---
 {
-  assert(isSuspendReason("cap_abuse"), "C5: cap_abuse is a suspend reason");
-  assert(isSuspendReason("cap_suspended"), "C5: cap_suspended is a suspend reason");
-  assert(isSuspendReason("account_suspended"), "C5: account_suspended is a suspend reason");
-  assert(isSuspendReason("billing_error"), "C5: billing_error is a suspend reason");
-  assert(isSuspendReason("CAP_ABUSE"), "C5: suspend reason match is case-insensitive");
-  assert(!isSuspendReason("rate_limited"), "C5: rate_limited is NOT a suspend reason (lower-cap-by-1 path)");
-  assert(!isSuspendReason(undefined), "C5: undefined reason is NOT a suspend reason");
-  assert(!isSuspendReason(null), "C5: null reason is NOT a suspend reason");
-  assert(!isSuspendReason(""), "C5: empty string is NOT a suspend reason");
+  assert(isSuspendReason("cap_abuse"), "cap_abuse is a suspend reason");
+  assert(isSuspendReason("cap_suspended"), "cap_suspended is a suspend reason");
+  assert(isSuspendReason("account_suspended"), "account_suspended is a suspend reason");
+  assert(isSuspendReason("billing_error"), "billing_error is a suspend reason");
+  assert(isSuspendReason("CAP_ABUSE"), "suspend reason match is case-insensitive");
+  assert(!isSuspendReason("rate_limited"), "rate_limited is NOT a suspend reason (lower-cap-by-1 path)");
+  assert(!isSuspendReason(undefined), "undefined reason is NOT a suspend reason");
+  assert(!isSuspendReason(null), "null reason is NOT a suspend reason");
+  assert(!isSuspendReason(""), "empty string is NOT a suspend reason");
 }
 
 // --- raiseForUmansStatus 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE ---
@@ -5707,7 +5707,7 @@ if (process.platform !== "win32") {
   assert(stA.pausedReason === PAUSE_REASON_CAP_ABUSE,
     "D10: 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE (single tag, C9)");
   assert(stA.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: 403 boxed_until parsed (5h-ish pause, not 30s floor)");
+    "403 boxed_until parsed (5h-ish pause, not 30s floor)");
   q.clearPause({ force: true });
 
   // (b) 403 with boxed_until embedded in error message string → regex extraction works.
@@ -5716,9 +5716,9 @@ if (process.platform !== "win32") {
   try { await raiseForUmansStatus(resB, q); } catch { /* expected */ }
   const stB = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stB.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "C3: 403 message-string boxed_until → PAUSE_REASON_CAP_ABUSE");
+    "403 message-string boxed_until → PAUSE_REASON_CAP_ABUSE");
   assert(stB.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
-    "C3: 403 message-string boxed_until extracted via regex");
+    "403 message-string boxed_until extracted via regex");
   q.clearPause({ force: true });
 
   // (c) 403 with PAST boxed_until → 30s floor (Adv4).
@@ -5728,9 +5728,9 @@ if (process.platform !== "win32") {
   try { await raiseForUmansStatus(resC, q); } catch { /* expected */ }
   const stC = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stC.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "Adv4: 403 with past boxed_until still pushes PAUSE_REASON_CAP_ABUSE");
+    "403 with past boxed_until still pushes PAUSE_REASON_CAP_ABUSE");
   assert(stC.pausedUntil <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
-    "Adv4: past boxed_until → 30s floor (not silently disabled)");
+    "past boxed_until → 30s floor (not silently disabled)");
   q.clearPause({ force: true });
 
   // (d) 403 with HTML suspend body (no timestamp) → 30s floor (C3 fallback).
@@ -5740,9 +5740,9 @@ if (process.platform !== "win32") {
   try { await raiseForUmansStatus(resD2, q); } catch { /* expected */ }
   const stD = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stD.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "C3: 403 HTML suspend body → PAUSE_REASON_CAP_ABUSE");
+    "403 HTML suspend body → PAUSE_REASON_CAP_ABUSE");
   assert(stD.pausedUntil <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
-    "C3: 403 HTML body no timestamp → 30s floor");
+    "403 HTML body no timestamp → 30s floor");
   q.clearPause({ force: true });
 
   // (e) 403 with unrelated body {"error":"forbidden"} → pauseUntil NOT called (C7).
@@ -5750,9 +5750,9 @@ if (process.platform !== "win32") {
   try { await raiseForUmansStatus(resE, q); } catch { /* expected */ }
   const stE = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stE.pausedUntil === 0,
-    "C7: 403 with unrelated body does NOT push a pause (gate not poisoned for siblings)");
+    "403 with unrelated body does NOT push a pause (gate not poisoned for siblings)");
   assert(stE.pausedReason === null,
-    "C7: 403 with unrelated body leaves pausedReason null");
+    "403 with unrelated body leaves pausedReason null");
 
   // (f) 403 pause extends (not shortens) an existing 429 pause.
   // Set a 429 pause at ~60s out, then push a cap_abuse pause at ~3h out.
@@ -5774,11 +5774,11 @@ if (process.platform !== "win32") {
   const resG = new Response(JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future }), { status: 403 });
   let threwG = false;
   try { await raiseForUmansStatus(resG); } catch { threwG = true; }
-  assert(threwG, "COV-F4: no-queue 403 with suspend body still throws (HTTP 403: ...)");
+  assert(threwG, "no-queue 403 with suspend body still throws (HTTP 403: ...)");
   // The state file must have no pause pushed (no queue to push through).
   const stG = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(stG.pausedUntil === 0 && stG.pausedReason === null,
-    "COV-F4: no-queue 403 pushes no pause (guard short-circuits when queue is absent)");
+    "no-queue 403 pushes no pause (guard short-circuits when queue is absent)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -5807,15 +5807,15 @@ if (process.platform !== "win32") {
   q.clearPause(); // (no force)
   const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st2.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "C1: cap_abuse pause survives a stale clearPause (sticky guard)");
+    "cap_abuse pause survives a stale clearPause (sticky guard)");
   assert(st2.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
-    "C1: cap_abuse pausedUntil survives a stale clearPause");
+    "cap_abuse pausedUntil survives a stale clearPause");
 
   // force:true clears it (operator /umans-concurrency reset).
   q.clearPause({ force: true });
   const st3 = JSON.parse(readFileSync(stateFile, "utf8"));
-  assert(st3.pausedReason === null, "C1: clearPause({force}) clears the sticky pause");
-  assert(st3.pausedUntil === 0, "C1: clearPause({force}) zeroes pausedUntil");
+  assert(st3.pausedReason === null, "clearPause({force}) clears the sticky pause");
+  assert(st3.pausedUntil === 0, "clearPause({force}) zeroes pausedUntil");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -5831,7 +5831,7 @@ if (process.platform !== "win32") {
   q.clearPause(); // stale low===false tick
   let st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedReason === PAUSE_REASON_429 && st.pausedUntil > Date.now() + 50_000,
-    "C1: 429 pause survives a stale clearPause (sticky set symmetry)");
+    "429 pause survives a stale clearPause (sticky set symmetry)");
   q.clearPause({ force: true });
 
   // Strike pause.
@@ -5839,7 +5839,7 @@ if (process.platform !== "win32") {
   q.clearPause(); // stale low===false tick
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedReason === PAUSE_REASON_STRIKES && st.pausedUntil > Date.now() + 29 * 60 * 1000,
-    "C1: strike pause survives a stale clearPause (sticky set symmetry)");
+    "strike pause survives a stale clearPause (sticky set symmetry)");
   q.clearPause({ force: true });
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5861,9 +5861,9 @@ if (process.platform !== "win32") {
   q.pauseUntil(Date.now() + 2 * 60 * 60 * 1000, "Account deprioritized");
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "C9: cap_abuse tag preserved when extended by a non-sticky reason (no flip)");
+    "cap_abuse tag preserved when extended by a non-sticky reason (no flip)");
   assert(st.pausedUntil > Date.now() + 1.5 * 60 * 60 * 1000,
-    "C9: pausedUntil extended to the longer deadline");
+    "pausedUntil extended to the longer deadline");
   q.clearPause({ force: true });
 
   // Same for a 429 pause.
@@ -5871,7 +5871,7 @@ if (process.platform !== "win32") {
   q.pauseUntil(Date.now() + 2 * 60 * 1000, "Account deprioritized");
   const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st2.pausedReason === PAUSE_REASON_429,
-    "C9: 429 tag preserved when extended by a non-sticky reason");
+    "429 tag preserved when extended by a non-sticky reason");
   q.clearPause({ force: true });
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -5946,7 +5946,7 @@ if (process.platform !== "win32") {
     // status bar shows the deprio. The real test: fetchUsage did NOT return null,
     // so refreshUsage parsed priority.low=true + did NOT clearPause (sticky guard).
     // Verify the usage fetch was called (not skipped) + did not crash.
-    assert(usageCalls > 0, "Adv1: /v1/usage 403 with suspend body fetched (not skipped)");
+    assert(usageCalls > 0, "/v1/usage 403 with suspend body fetched (not skipped)");
     await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
@@ -5983,11 +5983,11 @@ if (process.platform !== "win32") {
   // fires regardless. localInFlight 0 (no local launches).
   const decision = isCapacityFree(snap, { limit: undefined, queuePaused: false, localInFlight: 0 });
   assert(decision.free === false,
-    "COV-F3: /usage-403 synthetic snapshot → isCapacityFree returns free:false (cap_abuse branch fires)");
+    "/usage-403 synthetic snapshot → isCapacityFree returns free:false (cap_abuse branch fires)");
   assert(decision.repause !== undefined && decision.repause!.reason === PAUSE_REASON_CAP_ABUSE,
-    "COV-F3: synthetic snapshot → repause with PAUSE_REASON_CAP_ABUSE");
+    "synthetic snapshot → repause with PAUSE_REASON_CAP_ABUSE");
   assert(decision.repause !== undefined && decision.repause!.until > Date.now() + 2 * 60 * 60 * 1000,
-    "COV-F3: synthetic snapshot repause carries the extracted boxed_until (~3h)");
+    "synthetic snapshot repause carries the extracted boxed_until (~3h)");
 }
 
 // --- after_provider_response 403 bridge pause (non-sticky bridge) ---
@@ -6060,24 +6060,24 @@ if (process.platform !== "win32") {
     // The 5s non-sticky bridge pause must have landed in the state file.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
-    assert(parsed.pausedUntil > before, "C1: after_provider_response 403 set a bridge pausedUntil > now");
+    assert(parsed.pausedUntil > before, "after_provider_response 403 set a bridge pausedUntil > now");
     assert(parsed.pausedReason === PAUSE_REASON_403_BRIDGE,
-      "C1: 403 bridge pause tagged PAUSE_REASON_403_BRIDGE (non-sticky, not cap_abuse)");
+      "403 bridge pause tagged PAUSE_REASON_403_BRIDGE (non-sticky, not cap_abuse)");
     assert(!STICKY_PAUSE_REASONS.has(PAUSE_REASON_403_BRIDGE),
-      "C1: PAUSE_REASON_403_BRIDGE is NOT in STICKY_PAUSE_REASONS (clearable by stale /usage tick)");
+      "PAUSE_REASON_403_BRIDGE is NOT in STICKY_PAUSE_REASONS (clearable by stale /usage tick)");
     const pauseSec = Math.round((parsed.pausedUntil - Date.now()) / 1000);
     assert(pauseSec >= 1 && pauseSec <= 5,
       `C1: 403 bridge pause is ~5s (PAUSE_403_BRIDGE_MS), pause ~${pauseSec}s`);
     // The notify message must be accurate (possible suspension, not asserted).
     assert(notifications.some((n) => n.msg.includes("403") && n.msg.includes("possible suspension")),
-      "C1: 403 bridge pause notifies with accurate 'possible suspension' message");
+      "403 bridge pause notifies with accurate 'possible suspension' message");
     // The bridge is non-sticky: clearPause (without force) must clear it.
     // This is what a stale /v1/usage tick reporting priority.low===false does.
     const q = createConcurrencyQueue({ stateFile });
     q.clearPause();
     const cleared = JSON.parse(readFileSync(stateFile, "utf8"));
     assert(cleared.pausedUntil === 0 && cleared.pausedReason === null,
-      "C1: non-sticky bridge is clearable by a plain clearPause (no force needed)");
+      "non-sticky bridge is clearable by a plain clearPause (no force needed)");
     await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
@@ -6175,7 +6175,7 @@ if (process.platform !== "win32") {
       });
       st = JSON.parse(readFileSync(stateFile, "utf8"));
       assert(st.pausedUntil === 0 && st.pausedReason === null,
-        "C1: message_end clears the non-sticky bridge (no force, no body-check)");
+        "message_end clears the non-sticky bridge (no force, no body-check)");
     }
     await dispatch("session_shutdown", { type: "session_shutdown" });
 
@@ -6314,7 +6314,7 @@ if (process.platform !== "win32") {
     const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
     const parsed = JSON.parse(raw);
     assert(parsed.pausedReason !== PAUSE_REASON_STRIKES,
-      "Adv6: refreshStrikes does not push PAUSE_REASON_STRIKES on a null count (403 on /history)");
+      "refreshStrikes does not push PAUSE_REASON_STRIKES on a null count (403 on /history)");
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -6578,11 +6578,11 @@ if (process.platform !== "win32") {
 
   // cancel(ourId) splices the in-flight entry (C6) in addition to the waiter.
   q.cancel("our-id");
-  assert(q.snapshot().inflightCount === 1, "C6: cancel splices the matching in-flight entry");
+  assert(q.snapshot().inflightCount === 1, "cancel splices the matching in-flight entry");
   // Sibling's entry is untouched.
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.inflight.length === 1 && st.inflight[0].id === "sibling-id",
-    "C6: cancel leaves sibling's in-flight entry intact");
+    "cancel leaves sibling's in-flight entry intact");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6623,7 +6623,7 @@ if (process.platform !== "win32") {
   }));
   const st = readState(stateFile);
   assert(st.inflight.length === 1 && st.inflight[0].id === "ok",
-    "Adv2: malformed inflight entries dropped by isInFlightEntry (well-formed kept)");
+    "malformed inflight entries dropped by isInFlightEntry (well-formed kept)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6652,7 +6652,7 @@ if (process.platform !== "win32") {
   // The 100 live-PID entries are NOT reaped (isPidDead(1) is false) + within
   // the 120s bound → inflightCount is 100 → the gate blocks (max(100, ...) >= cap).
   assert(q.snapshot().inflightCount === 100,
-    "Adv2: 100 live-PID inflight entries block the gate (documented DoS surface)");
+    "100 live-PID inflight entries block the gate (documented DoS surface)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6713,10 +6713,10 @@ if (process.platform !== "win32") {
   q.reset();
   const snap = q.snapshot();
   assert(snap.inflightCount === 1,
-    "C11: reset() splices only our own in-flight entries (sibling's intact)");
+    "reset() splices only our own in-flight entries (sibling's intact)");
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.inflight.length === 1 && st.inflight[0].id === "sibling",
-    "C11: sibling's in-flight entry survives our reset()");
+    "sibling's in-flight entry survives our reset()");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6735,7 +6735,7 @@ if (process.platform !== "win32") {
     { limit: 4, queuePaused: false, localInFlight: 2 },
   );
   assert(decision.free === false,
-    "C12: max(2,4)=4 >= cap 4 → not free (fresh /usage, local in-flight counted via max not sum)");
+    "max(2,4)=4 >= cap 4 → not free (fresh /usage, local in-flight counted via max not sum)");
 
   // (b) localInFlight=2, concurrent_sessions=2 (stale-low), limit=4 → max(2,2)=2 < 4 → free.
   decision = isCapacityFree(
@@ -6743,7 +6743,7 @@ if (process.platform !== "win32") {
     { limit: 4, queuePaused: false, localInFlight: 2 },
   );
   assert(decision.free === true,
-    "C12: max(2,2)=2 < cap 4 → free (stale /usage, local in-flight catches the burst)");
+    "max(2,2)=2 < cap 4 → free (stale /usage, local in-flight catches the burst)");
 
   // (c) localInFlight=4, concurrent_sessions=0, limit=4 → max(4,0)=4 >= 4 → not free.
   // This is the within-machine burst case: /usage hasn't caught up (reports 0),
@@ -6753,7 +6753,7 @@ if (process.platform !== "win32") {
     { limit: 4, queuePaused: false, localInFlight: 4 },
   );
   assert(decision.free === false,
-    "C12: max(4,0)=4 >= cap 4 → not free (local in-flight blocks a 5th local launch even when /usage reports 0)");
+    "max(4,0)=4 >= cap 4 → not free (local in-flight blocks a 5th local launch even when /usage reports 0)");
 
   // (d) sum would have over-serialized case (b): sum(2,2)=4 >= 4 → not free.
   // Verify max is used by asserting (b) is free (sum would have blocked it).
@@ -6778,7 +6778,7 @@ if (process.platform !== "win32") {
     threw = true;
   }
   assert(threw,
-    "Adv5: addInFlight propagates a throw (fail-closed — turn aborts, does not proceed without the entry)");
+    "addInFlight propagates a throw (fail-closed — turn aborts, does not proceed without the entry)");
 }
 
 // --- reason-aware pause: cap_abuse suspends fully (priority.low + suspend reason) ---
@@ -6808,22 +6808,22 @@ if (process.platform !== "win32") {
   // cap_suspended → same (C5 suspend-family enumeration).
   d = isCapacityFree(baseSnap("cap_suspended"), baseInputs);
   assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
-    "C5: cap_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
+    "cap_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
 
   // account_suspended → same (C5).
   d = isCapacityFree(baseSnap("account_suspended"), baseInputs);
   assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
-    "C5: account_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
+    "account_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
 
   // billing_error → same (C5).
   d = isCapacityFree(baseSnap("billing_error"), baseInputs);
   assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
-    "C5: billing_error → full pause with PAUSE_REASON_CAP_ABUSE");
+    "billing_error → full pause with PAUSE_REASON_CAP_ABUSE");
 
   // Case-insensitive match.
   d = isCapacityFree(baseSnap("CAP_ABUSE"), baseInputs);
   assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
-    "C5: suspend reason match is case-insensitive");
+    "suspend reason match is case-insensitive");
 }
 
 // --- rate_limited + absent/unknown reason keep the lower-cap-by-1 path ---
@@ -6939,13 +6939,13 @@ if (process.platform !== "win32") {
     qSnap.pausedUntil >= repause!.until &&
     qSnap.pausedReason === repause!.reason;
   assert(alreadyCovered,
-    "C10: active cap_abuse pause already covers the repause (guard would skip the re-push)");
+    "active cap_abuse pause already covers the repause (guard would skip the re-push)");
   // Do NOT call pauseUntil (the guard skipped it). The state file's mtime
   // should not change (no write). Wait a moment to ensure mtime resolution.
   await new Promise((r) => setTimeout(r, 20));
   const mtime2 = statSync(stateFile).mtimeMs;
   assert(mtime2 === mtime1,
-    "C10: write-amplification guard skips the pauseUntil call (no state-file write)");
+    "write-amplification guard skips the pauseUntil call (no state-file write)");
 
   // A repause with a LONGER deadline → guard does NOT skip (extend).
   const longerUntil = Date.now() + 4 * 60 * 60 * 1000;
@@ -6957,7 +6957,7 @@ if (process.platform !== "win32") {
     qSnap.pausedUntil >= repause2!.until &&
     qSnap.pausedReason === repause2!.reason;
   assert(!alreadyCovered2,
-    "C10: longer deadline repause → guard does NOT skip (extend)");
+    "longer deadline repause → guard does NOT skip (extend)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -6983,11 +6983,11 @@ if (process.platform !== "win32") {
   const snap = q.snapshot(); // snapshot calls reapStale
   // The dead-PID in-flight entry is reaped (inflightCount 0).
   assert(snap.inflightCount === 0,
-    "Adv11: dead-PID in-flight entry reaped by reapStale (120s bound)");
+    "dead-PID in-flight entry reaped by reapStale (120s bound)");
   // The 5h cap_abuse pause survives (not reaped — within the MAX_PAUSE_MS ceiling).
-  assert(snap.paused === true, "Adv11: 5h cap_abuse pause survives the 120s in-flight reap cycle");
+  assert(snap.paused === true, "5h cap_abuse pause survives the 120s in-flight reap cycle");
   assert(snap.pausedReason === PAUSE_REASON_CAP_ABUSE,
-    "Adv11: cap_abuse pause reason preserved after in-flight reap");
+    "cap_abuse pause reason preserved after in-flight reap");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
