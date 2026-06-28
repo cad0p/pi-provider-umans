@@ -2990,7 +2990,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(composed2.aborted === true, "CMP8-2: composed signal aborts when a source aborts");
 }
 
-// --- acquireSlot C1 re-join + MAX_TOKEN_REJOINS fail-open ---
+// --- acquireSlot re-join + MAX_TOKEN_REJOINS fail-open ---
 // The C1 HIGH fix (re-stamp token, re-join on reap) was tested only at the pure
 // touchToken seam. The integrated acquireSlot loop (token reaped mid-poll ->
 // cancel -> re-join -> re-wait -> resume) is never driven by a test. Through the
@@ -3283,7 +3283,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     q.cancel("ignored");
     q.pauseUntil(Date.now() + 10_000, "ignored");
     q.reset();
-    // the D11 in-flight stubs must also be no-ops in disabled mode.
+    // the in-flight stubs must also be no-ops in disabled mode.
     q.addInFlight("ignored");
     q.removeInFlight("ignored");
   } catch { threw = true; }
@@ -5557,7 +5557,7 @@ if (process.platform !== "win32") {
     "ADV12-2: user notified via ctx.ui.notify on fail-open");
 }
 
-// --- 403 account_suspended / cap_abuse: extractBoxedUntil tolerant extraction (C3, Adv4) ---
+// --- 403 account_suspended / cap_abuse: extractBoxedUntil tolerant extraction ---
 // The Umans server emits boxed_until in three shapes: (a) a structured JSON
 // field (top-level or nested under error), (b) an ISO-8601 timestamp embedded
 // in an error MESSAGE STRING (the incident-2026-06-27 shape), (c) absent (HTML
@@ -5649,7 +5649,7 @@ if (process.platform !== "win32") {
     "Adv4: past boxed_until in message string treated as absent");
 }
 
-// --- isSuspendBody detects the suspend family (C7) ---
+// --- isSuspendBody detects the suspend family ---
 // A 403 WITHOUT a suspend-family body (an auth error, a proxy HTML page) does
 // NOT push a pause — the turn still throws, but the shared gate is not poisoned
 // for siblings.
@@ -5670,7 +5670,7 @@ if (process.platform !== "win32") {
     "C7: empty body NOT detected");
 }
 
-// --- isSuspendReason detects the suspend family for /v1/usage priority.reason (C5) ---
+// --- isSuspendReason detects the suspend family for /v1/usage priority.reason ---
 {
   assert(isSuspendReason("cap_abuse"), "C5: cap_abuse is a suspend reason");
   assert(isSuspendReason("cap_suspended"), "C5: cap_suspended is a suspend reason");
@@ -5683,7 +5683,7 @@ if (process.platform !== "win32") {
   assert(!isSuspendReason(""), "C5: empty string is NOT a suspend reason");
 }
 
-// --- raiseForUmansStatus 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE (D10, C3, C7, C9) ---
+// --- raiseForUmansStatus 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE ---
 // A 403 with a suspend-family body is the HTTP symptom of the same cap_abuse
 // suspension the /v1/usage priority.reason=cap_abuse branch detects. Both push
 // the SAME PAUSE_REASON_CAP_ABUSE tag (single tag eliminates reason-flip
@@ -5783,7 +5783,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- STICKY_PAUSE_REASONS: cap_abuse pause survives a stale refreshUsage low===false tick (C1) ---
+// --- STICKY_PAUSE_REASONS: cap_abuse pause survives a stale refreshUsage low===false tick ---
 // /v1/usage LAGS a real suspension by 1-5s. A stale refreshUsage tick reporting
 // priority.low===false arriving right after a 403/cap_abuse pause was written
 // must NOT wipe it — the next waiter would launch into a still-suspended account
@@ -5820,7 +5820,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- STICKY_PAUSE_REASONS: 429 + strike pauses also survive a stale clearPause (C1 symmetry) ---
+// --- STICKY_PAUSE_REASONS: 429 + strike pauses also survive a stale clearPause ---
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-sticky-sym-"));
   const stateFile = join(dir, "state.json");
@@ -5845,7 +5845,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- pauseUntil preserves ANY sticky reason tag when extending (C9) ---
+// --- pauseUntil preserves ANY sticky reason tag when extending ---
 // A cap_abuse pause extended by a /usage priority.low tick with a longer
 // deadline + a non-null reason must keep PAUSE_REASON_CAP_ABUSE (not flip to
 // the /usage reason), so the sticky guard holds.
@@ -5877,7 +5877,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- /v1/usage 403 with suspend body returns a synthetic cap_abuse snapshot (Adv1) ---
+// --- /v1/usage 403 with suspend body returns a synthetic cap_abuse snapshot ---
 // When /v1/usage itself returns 403 during a suspension (the server returns
 // 403 for everything once suspended), the prior fail-open (return null →
 // isCapacityFree(null) → {free:true}) would launch every queued waiter into
@@ -5957,7 +5957,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- /v1/usage 403-suspend synthetic snapshot flows through isCapacityFree → cap_abuse repause (COV-F3) ---
+// --- /v1/usage 403-suspend synthetic snapshot flows through isCapacityFree → cap_abuse repause ---
 // fetchUsage returns a synthetic { usage: { concurrent_sessions: 0, priority: { low: true, boxed_until, reason: cap_abuse } } }
 // (no limits field) on a /usage 403-suspend. fetchUsageSnapshot maps this to a
 // CapacitySnapshot, + isCapacityFree's cap_abuse branch must fire BEFORE the
@@ -6237,7 +6237,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- refreshStrikes clears strikes24h when fetch429Strikes returns null (Adv6) ---
+// --- refreshStrikes clears strikes24h when fetch429Strikes returns null ---
 // /v1/usage/history may also return 403 during a suspension. The prior code
 // left the last cached strikes value, so the status bar showed a stale
 // "Strikes 19/20" for the full 5h. refreshStrikes now clears strikes24h so the
@@ -6324,7 +6324,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- refreshUsage preserves guaranteedConcurrency when /v1/usage returns 403-suspend (C3) ---
+// --- refreshUsage preserves guaranteedConcurrency when /v1/usage returns 403-suspend ---
 // The synthetic cap_abuse object (fetchUsage on a /v1/usage 403 with a suspend
 // body) carries no `limits` field. The prior code unconditionally assigned
 // guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined, wiping
@@ -6420,7 +6420,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- refreshStrikes preserves strikes24h on a transient /history failure (C4) ---
+// --- refreshStrikes preserves strikes24h on a transient /history failure ---
 // The prior code wiped strikes24h to undefined on ANY fetch429Strikes null —
 // including a transient 5xx / network timeout. Now fetch429Strikes returns a
 // typed result: a 403-suspend clears the cache (suspended: true), but a
@@ -6528,7 +6528,7 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- D11 local in-flight: addInFlight/removeInFlight + snapshot().inflightCount ---
+// --- local in-flight: addInFlight/removeInFlight + snapshot().inflightCount ---
 // acquireSlot increments local in-flight BEFORE releasing the token (the
 // order is load-bearing — the next head's readState must see our entry before
 // it can claim the token). snapshot().inflightCount is the post-reap count.
@@ -6657,7 +6657,7 @@ if (process.platform !== "win32") {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// --- D11 + reapStale: dead-PID + >120s in-flight entries are reaped ---
+// --- + reapStale: dead-PID + >120s in-flight entries are reaped ---
 // The same watchdog pattern that reaps stale waiters/tokens also reaps a
 // crashed/aborted in-flight entry (same 120s bound). A SIGKILL between
 // addInFlight + the HTTP send leaves a phantom entry that blocks one slot
@@ -6781,7 +6781,7 @@ if (process.platform !== "win32") {
     "Adv5: addInFlight propagates a throw (fail-closed — turn aborts, does not proceed without the entry)");
 }
 
-// --- D12 reason-aware pause: cap_abuse suspends fully (priority.low + suspend reason) ---
+// --- reason-aware pause: cap_abuse suspends fully (priority.low + suspend reason) ---
 // When priority.low AND the reason indicates a suspend-family account state
 // (cap_abuse / cap_suspended / account_suspended / billing_error), the account
 // is SUSPENDED (the server returns 403), not just slow. Lowering the cap by 1
@@ -6826,7 +6826,7 @@ if (process.platform !== "win32") {
     "C5: suspend reason match is case-insensitive");
 }
 
-// --- D12: rate_limited + absent/unknown reason keep the lower-cap-by-1 path ---
+// --- rate_limited + absent/unknown reason keep the lower-cap-by-1 path ---
 // rate_limited is a transient deprioritization (the server is slow, not
 // suspended). Lowering the cap by 1 + keeping work going is the right behavior
 // (D3). No repause is returned (priority.low is a status signal, not a stop).
@@ -6863,7 +6863,7 @@ if (process.platform !== "win32") {
   assert(d.repause === undefined, "D12: rate_limited at cap → no repause (just block, not pause)");
 }
 
-// --- D12: cap_abuse repause extends (not shortens) an existing 429 pause ---
+// --- cap_abuse repause extends (not shortens) an existing 429 pause ---
 // The repause is returned with PAUSE_REASON_CAP_ABUSE; the caller pushes it via
 // pauseUntil, which uses extend-never-shorten (the longer deadline wins) +
 // preserves the sticky tag (C9). A 429 pause at 60s out + a cap_abuse repause
