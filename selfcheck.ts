@@ -3283,12 +3283,17 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     q.cancel("ignored");
     q.pauseUntil(Date.now() + 10_000, "ignored");
     q.reset();
+    // COV-F2: the D11 in-flight stubs must also be no-ops in disabled mode.
+    q.addInFlight("ignored");
+    q.removeInFlight("ignored");
   } catch { threw = true; }
   assert(!threw, "COV7-4: disabled stub methods do not throw");
   const snap = q.snapshot();
   assert(snap.queued === 0 && snap.tokenHeld === false && snap.paused === false &&
     snap.pausedUntil === 0 && snap.pausedReason === null,
     "COV7-4: disabled snapshot stays empty after every stub method");
+  assert(snap.inflightCount === 0,
+    "COV-F2: disabled addInFlight/removeInFlight are no-ops (inflightCount stays 0)");
 }
 
 // --- COV7-5: queuePaused takes precedence over priority.low ---
@@ -5731,6 +5736,19 @@ if (process.platform !== "win32") {
     "D10: 403 cap_abuse pause extends (not shortens) the existing 429 pause");
   q.clearPause({ force: true });
 
+  // (g) 403 with suspend body but NO queue arg → still throws + pushes no pause.
+  // The guard short-circuits when concurrencyQueue is undefined (the signature
+  // permits it: concurrencyQueue?). The production call sites always pass the
+  // queue, but a future caller without a queue must not crash + must not push.
+  const resG = new Response(JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future }), { status: 403 });
+  let threwG = false;
+  try { await raiseForUmansStatus(resG); } catch { threwG = true; }
+  assert(threwG, "COV-F4: no-queue 403 with suspend body still throws (HTTP 403: ...)");
+  // The state file must have no pause pushed (no queue to push through).
+  const stG = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stG.pausedUntil === 0 && stG.pausedReason === null,
+    "COV-F4: no-queue 403 pushes no pause (guard short-circuits when queue is absent)");
+
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
@@ -5912,6 +5930,39 @@ if (process.platform !== "win32") {
   // body returns false, so fetchUsage returns null (existing fail-open).
   assert(!isSuspendBody(JSON.stringify({ error: "forbidden" })),
     "Adv1: /v1/usage 403 with unrelated body → isSuspendBody false (fail-open, returns null)");
+}
+
+// --- /v1/usage 403-suspend synthetic snapshot flows through isCapacityFree → cap_abuse repause (COV-F3) ---
+// fetchUsage returns a synthetic { usage: { concurrent_sessions: 0, priority: { low: true, boxed_until, reason: cap_abuse } } }
+// (no limits field) on a /usage 403-suspend. fetchUsageSnapshot maps this to a
+// CapacitySnapshot, + isCapacityFree's cap_abuse branch must fire BEFORE the
+// cap check (baseCap is undefined because limits is absent) + return
+// { free: false, repause: { until, reason: PAUSE_REASON_CAP_ABUSE } }. This
+// asserts the synthetic-snapshot → cap_abuse repause handoff end-to-end through
+// the pure decision (a regression where the synthetic shape drifted — e.g.
+// priority.low not set, or reason not cap_abuse — would not hit the branch).
+{
+  const boxedUntil = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  // Mirror the synthetic object fetchUsage returns on a /usage 403-suspend.
+  const syntheticUsage = { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil, reason: "cap_abuse" } };
+  // Mirror fetchUsageSnapshot's mapping (parsePriority is exported).
+  const priority = parsePriority(syntheticUsage.priority);
+  const snap = {
+    concurrentSessions: syntheticUsage.concurrent_sessions,
+    limit: undefined, // data.limits absent in the synthetic object
+    hardCap: undefined,
+    priority,
+  };
+  // limit is undefined (no env override, no cached guaranteedConcurrency) — the
+  // unlimited-plan short-circuit is AFTER the cap_abuse branch, so the repause
+  // fires regardless. localInFlight 0 (no local launches).
+  const decision = isCapacityFree(snap, { limit: undefined, queuePaused: false, localInFlight: 0 });
+  assert(decision.free === false,
+    "COV-F3: /usage-403 synthetic snapshot → isCapacityFree returns free:false (cap_abuse branch fires)");
+  assert(decision.repause !== undefined && decision.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "COV-F3: synthetic snapshot → repause with PAUSE_REASON_CAP_ABUSE");
+  assert(decision.repause !== undefined && decision.repause!.until > Date.now() + 2 * 60 * 60 * 1000,
+    "COV-F3: synthetic snapshot repause carries the extracted boxed_until (~3h)");
 }
 
 // --- after_provider_response 403 bridge pause (C1/ADV-2/SB-1: non-sticky bridge) ---
@@ -6562,20 +6613,24 @@ if (process.platform !== "win32") {
   const stateFile = join(dir, "state.json");
   const now = Date.now();
   // A state file with: (a) a dead-PID in-flight entry, (b) a >120s-stale
-  // in-flight entry (live PID but old ts), (c) a fresh in-flight entry.
+  // in-flight entry (live PID but old ts), (c) a fresh in-flight entry,
+  // (d) an entry at EXACTLY 120s (the <= boundary — must be KEPT, not reaped).
   writeFileSync(stateFile, JSON.stringify({
     waiters: [], token: null,
     inflight: [
       { id: "dead-pid", pid: 9_999_999, ts: now }, // dead pid -> reap
       { id: "stale-ts", pid: process.pid, ts: now - 121_000 }, // >120s -> reap
+      { id: "boundary", pid: process.pid, ts: now - 120_000 }, // exactly 120s -> KEEP (<=)
       { id: "fresh", pid: process.pid, ts: now }, // fresh -> keep
     ],
     pausedUntil: 0, pausedReason: null, pausedTs: 0,
   }));
   const q = createConcurrencyQueue({ stateFile, now: () => now });
   const snap = q.snapshot(); // snapshot calls reapStale
-  assert(snap.inflightCount === 1,
-    "D11: dead-PID + >120s in-flight entries reaped; fresh entry kept");
+  assert(snap.inflightCount === 2,
+    "D11: dead-PID + >120s in-flight entries reaped; fresh + exact-120s-boundary entries kept");
+  assert(snap.inflightCount === 2,
+    "COV-F6: in-flight entry at exactly staleTokenMs (120s) is KEPT (<= boundary, not reaped)");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
