@@ -131,7 +131,7 @@ export interface QueueConfig {
 }
 
 const DEFAULT_STATE_FILE = `${homedir()}/.pi/agent/umans-concurrency.json`;
-// CORR2-3 / CMP-MED-4: 120s comfortably exceeds long streaming turns (xhigh/max
+// 120s comfortably exceeds long streaming turns (xhigh/max
 // thinking, long outputs, slow TTFT). The watchdog is a LAST RESORT (dead PID
 // or truly hung process), not a tight bound on legitimate turns — the burst
 // headroom (hard_cap - limit) absorbs any transient over-limit from a reaped
@@ -143,14 +143,14 @@ const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_LOCK_TIMEOUT_MS = 2_000;
 
 /**
- * ADV12-1/SEC13-1: a lockfile whose mtime is in the future is treated as
+ * a lockfile whose mtime is in the future is treated as
  * stale + reclaimed. A future-dated mtime arises from a backwards clock jump
  * (NTP correction, resume from suspend, manual `date` change) or a
  * hand-edited/planted lockfile. Without this bound, `cfg.now() - st.mtimeMs`
  * is negative, the stale-lockfile condition is false, and the lock is never
  * reclaimed — wedging every `mutate` until the wall clock catches up.
  *
- * SEC13-1: the prior 60s ceiling left a 1-60s gap where a near-future-dated
+ * the prior 60s ceiling left a 1-60s gap where a near-future-dated
  * lockfile (small NTP skew) was NOT reclaimed, wedging the queue for up to 60s.
  * Lowered to 1s — catches any human-planted `touch -t` (always > 1s) and any
  * meaningful NTP skew (> 1s), while tolerating sub-ms floating-point jitter
@@ -178,7 +178,7 @@ export const MAX_PAUSE_MS = 5 * 60 * 60 * 1000; // 18,000,000 ms
 
 /**
  * Tighter ceiling for a 429-sourced pause (5 × PRIORITY_BACKOFF_MS = 2.5 min).
- * ADV4-2: a server returning 429 forever (e.g. a misconfigured UMANS_BASE_URL)
+ * a server returning 429 forever (e.g. a misconfigured UMANS_BASE_URL)
  * writes a fresh pausedUntil on every turn, each extending the shared pause up
  * to the 5h MAX_PAUSE_MS ceiling — wedging all local pi processes for the real
  * Umans account-pause duration even though the 429 source is non-account-wide.
@@ -194,7 +194,7 @@ export const MAX_PAUSE_429_MS = 5 * PRIORITY_BACKOFF_MS; // 150,000 ms (2.5 min)
 
 /**
  * Reason tag written by the 429 handler (index.ts after_provider_response).
- * CORR4-1: /usage LAGS a 429 (the design acknowledges this at the capacityFree
+ * /usage LAGS a 429 (the design acknowledges this at the capacityFree
  * doc-comment), so a stale 5s refreshUsage tick reporting priority.low===false
  * would wipe a sibling's freshly-written 429 pause within 1-5s — letting the
  * next waiter launch into the deprio the gate exists to prevent. clearPause
@@ -396,7 +396,7 @@ export function isSuspendReason(reason: string | null | undefined): boolean {
 }
 
 /**
- * SEC9-2/SEC8-1: upper bound on the state file size we'll read+parse.
+ * upper bound on the state file size we'll read+parse.
  * Legitimate state is <2 KB even with hundreds of waiters; a poisoned or
  * runaway file (e.g. 1 GB) would OOM/stall the pi process. readState stats the
  * file first + bails to the empty-state catch when st.size exceeds this.
@@ -417,7 +417,7 @@ export function clampPauseUntil(until: number, now: number = Date.now(), ceiling
 
 /**
  * Cap + sanitize a pause reason before it is stored or rendered. SEC5-1 /
- * ADV5-5: a compromised or misconfigured gateway can push a crafted
+ * a compromised or misconfigured gateway can push a crafted
  * `priority.reason` that flows unescaped into the status bar (PAUSED <Ns>
  * (<reason>)). Cap to ~64 chars and strip non-printable / control / ANSI-escape
  * characters so a crafted string cannot mangle the bar or inject control
@@ -426,7 +426,7 @@ export function clampPauseUntil(until: number, now: number = Date.now(), ceiling
  * the injection surface without losing signal.
  */
 const PAUSE_REASON_MAX_CHARS = 64;
-// SEC9-1/SEC8-3: strip control chars (incl. DEL), ESC (0x1b, ANSI escape
+// strip control chars (incl. DEL), ESC (0x1b, ANSI escape
 // introducer), + Unicode bidi/RTL override chars (U+202A-E, U+2066-9, U+061C)
 // and zero-width / BOM chars (U+200B-F, U+FEFF) that could spoof the displayed
 // pause reason in the status bar. Keeps printable ASCII + common printable
@@ -455,7 +455,7 @@ export interface PriorityState {
  * may be an ISO string, epoch seconds, or null; when low===true but boxed_until is
  * null/absent, we fall back to now + PRIORITY_BACKOFF_MS so callers always get a
  * concrete deadline to honor.
- * SEC7-2: clamp `until` to now + MAX_PAUSE_MS so the parse boundary matches the
+ * clamp `until` to now + MAX_PAUSE_MS so the parse boundary matches the
  * 429 path's defense-in-depth (a poisoned boxed_until like 2099-12-31 cannot
  * propagate a centuries-long deadline even if a future caller bypasses
  * pauseUntil's own clamp). Low priority — the write boundary already clamps +
@@ -478,7 +478,7 @@ export function parsePriority(raw: unknown): PriorityState {
       if (!Number.isNaN(t)) ms = t;
     }
     until = ms > 0 ? ms : Date.now() + PRIORITY_BACKOFF_MS;
-    // SEC7-2: clamp at the parse boundary too (defense-in-depth).
+    // clamp at the parse boundary too (defense-in-depth).
     until = clampPauseUntil(until, Date.now(), MAX_PAUSE_MS);
   }
   return { low, until, reason: sanitizeReason(p.reason) };
@@ -569,7 +569,7 @@ export function isCapacityFree(
   // 5h MAX_PAUSE_MS ceiling (the non-429 branch of pauseUntil). A >5h real
   // suspension self-heals via overhang re-push (the 5h pause reaps, the next
   // poll re-observes cap_abuse + re-pushes with the remaining boxed_until).
-  // C4: return the repause, do NOT push it here — isCapacityFree is a pure
+  // return the repause, do NOT push it here — isCapacityFree is a pure
   // decision (no I/O); the caller in capacityFree pushes it. This mirrors how
   // a priority.low repause is already returned + pushed.
   if (snap.priority.low && isSuspendReason(snap.priority.reason)) {
@@ -617,13 +617,13 @@ export function isCapacityFree(
  * fallback), "abc" (NaN → fallback), "" (empty → fallback). CLN4-3:
  * tightened from Number.isFinite to Number.isInteger so a fractional typo
  * falls back to the server value (a strict improvement for a slot-count knob).
- * CORR8-3 / ADV8-1: tightened further to a strict /^\d+$/ regex test BEFORE
+ * tightened further to a strict /^\d+$/ regex test BEFORE
  * Number(trimmed) so hex ("0x10" === 16) and scientific notation ("1e3" ===
  * 1000) — which Number() accepts + Number.isInteger() happily passes — are
  * rejected to fallback. A "0x10" typo would silently set the gate to 16,
  * defeating the cap. Mirrors the 429 Retry-After parse (which already used
  * /^\d+$/). The existing `n > 0` check still rejects 0.
- * SEC9-5 / CORR9-1: Number.isInteger returns true for huge integers within
+ * Number.isInteger returns true for huge integers within
  * Number.MAX_VALUE (e.g. "999999999999999999999" → 1e21), silently disabling
  * the cap. Tightened to Number.isSafeInteger (rejects >2^53-1) + a practical
  * ceiling of 1024 so a long-digit typo falls back instead of effectively
@@ -676,7 +676,7 @@ function isInFlightEntry(e: unknown): e is InFlightEntry {
 
 /** Read the queue state, or return a fresh empty state if the file is absent/corrupt. */
 export function readState(path: string): QueueState {
-  // SEC10-1: open the fd FIRST + fstat it + read from the fd, so the
+  // open the fd FIRST + fstat it + read from the fd, so the
   // regular-file + size checks + the read are atomic wrt path swaps. The
   // prior lstatSync(path) + readFileSync(path) pair had a TOCTOU window: an
   // attacker could swap the file (e.g. to a symlink) between the lstat + the
@@ -687,7 +687,7 @@ export function readState(path: string): QueueState {
   // different target. A missing file throws ENOENT from openSync, caught by
   // the outer try → empty state (matching the prior absent-file behavior).
   //
-  // ADV11-1 / SEC11-1 / SEC12-1: the open uses O_NOFOLLOW | O_NONBLOCK.
+  // the open uses O_NOFOLLOW | O_NONBLOCK.
   // O_NOFOLLOW makes the open fail with ELOOP on a symlink (eliminating the
   // symlink-swap vector). O_NONBLOCK prevents a swapped FIFO from blocking
   // the open indefinitely (probe-confirmed: openSync(fifo, O_RDONLY|O_NOFOLLOW)
@@ -710,7 +710,7 @@ export function readState(path: string): QueueState {
       if (!lstat.isFile() || lstat.size > MAX_STATE_BYTES) {
         return { waiters: [], token: null, inflight: [], pausedUntil: 0, pausedReason: null, pausedTs: 0 };
       }
-      // SEC10-1 / ADV11-1 / SEC12-1: open the fd AFTER the lstat guard with
+      // open the fd AFTER the lstat guard with
       // O_NOFOLLOW | O_NONBLOCK so a path swap between the lstat + the open
       // cannot redirect the open into a symlink (ELOOP) or block on a swapped
       // FIFO (O_NONBLOCK makes the open return immediately). fstat operates on
@@ -731,7 +731,7 @@ export function readState(path: string): QueueState {
       const parsed = JSON.parse(raw) as Partial<QueueState>;
       const waiters = Array.isArray(parsed.waiters) ? parsed.waiters.filter(isWaiterEntry) : [];
       const token = isTokenState(parsed.token) ? parsed.token : null;
-      // Adv2: shape-guard inflight (same pattern as waiters). A poisoned
+      // shape-guard inflight (same pattern as waiters). A poisoned
       // non-array inflight (e.g. inflight: "garbage" or inflight: 42) would
       // make state.inflight.length undefined/throw → max(NaN, cap) = NaN →
       // NaN < cap is false → gate blocks forever (silent DoS). A non-array is
@@ -743,7 +743,7 @@ export function readState(path: string): QueueState {
         token,
         inflight,
         pausedUntil: typeof parsed.pausedUntil === "number" ? parsed.pausedUntil : 0,
-        // COV6-1 / SEC6-1: sanitize pausedReason on the READ boundary too. SEC5-1
+        // sanitize pausedReason on the READ boundary too. SEC5-1
         // sanitizes at the write boundary (pauseUntil) + parse path (parsePriority),
         // but readState passed parsed.pausedReason straight through → snapshot() →
         // status bar/notify render raw. A hand-edited file, a compromised sibling
@@ -764,7 +764,7 @@ export function readState(path: string): QueueState {
 /**
  * True if a PID is not currently alive. Never throws.
  *
- * CLN5-3: this is one of the module's pure-helper exports — pure,
+ * this is one of the module's pure-helper exports — pure,
  * side-effect-free functions exposed so external consumers (and selfcheck)
  * can build on the queue's primitives. They are not used by index.ts (the
  * provider goes through the ConcurrencyQueue handle), but are a defensible
@@ -775,7 +775,7 @@ export function readState(path: string): QueueState {
  * SANITIZE_CTRL_RE / MAX_STATE_BYTES).
  */
 export function isPidDead(pid: number): boolean {
-  // SEC7-3: defensive guard for non-numeric / non-finite input. The shape
+  // defensive guard for non-numeric / non-finite input. The shape
   // guards (isWaiterEntry/isTokenState) already drop malformed entries, but a
   // future caller could bypass them; treat non-number / NaN / Infinity as
   // dead so reapStale reclaims rather than passing garbage to process.kill
@@ -806,7 +806,7 @@ export function isPidDead(pid: number): boolean {
  * compromised sibling or a hand-edited file — SEC2-MED-1). Returns the cleaned
  * state; does not write to disk.
  *
- * CMP-MED-3: PID reuse is a known blind spot of the kill(pid, 0) probe — if a
+ * PID reuse is a known blind spot of the kill(pid, 0) probe — if a
  * holding pi process crashes, its PID can be recycled by an unrelated process
  * within the staleTokenMs window, and isPidDead would return false (alive).
  * The TIMESTAMP staleness check (now - token.ts > staleTokenMs) is the real
@@ -865,7 +865,7 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
 }
 
 /**
- * C2/CMP6-1: feature-detect Atomics.wait for a non-CPU-burning sync sleep.
+ * feature-detect Atomics.wait for a non-CPU-burning sync sleep.
  * Exported (alongside decideLaunch / shouldReleaseOnMessageEnd) so the code
  * path is unit-testable. Returns true when Atomics.wait + SharedArrayBuffer are
  * available (the acquireLock spin uses it); false when the runtime lacks them
@@ -878,7 +878,7 @@ function canAtomicsWait(): boolean {
 }
 
 /**
- * C2/CMP6-1: synchronous sleep that does NOT spin the CPU. Under lock
+ * synchronous sleep that does NOT spin the CPU. Under lock
  * contention the old busy-spin (while (cfg.now() < target) {}) burned CPU and
  * starved the lock holder's event loop on a single-core VM, racing the 2s
  * lock timeout. Atomics.wait blocks the calling thread (it yields the core)
@@ -914,7 +914,7 @@ function syncSleep(ms: number, cfg: Required<QueueConfig>): void {
  * a crashed process from permanently wedging the queue. (The critical section
  * is milliseconds, so an old lockfile is definitively stale.)
  *
- * CMP-MED-2: the 2s lockTimeoutMs is a hard CORRECTNESS ceiling on the
+ * the 2s lockTimeoutMs is a hard CORRECTNESS ceiling on the
  * critical section, not just a liveness bound — no slow operation may be added
  * inside `mutate` (readState / reapStale / fn / writeStateAtomic). A
  * legitimately slow writer (disk pressure under a burst of `pi -p` jobs) that
@@ -939,7 +939,7 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       // TOCTOU). The PID write was retained as dead code until SEC13-2 dropped
       // it — a write that is never read back is not a fencing token. The
       // mtime ceiling is the sole authoritative reclaim bound.
-      // CORR11-1/SEC13-2: the only throwing call is openSync itself. If it
+      // the only throwing call is openSync itself. If it
       // throws (EEXIST handled below; ENOSPC/EIO/EROFS re-thrown by the outer
       // catch), fd is still undefined (no leak possible — there is no
       // writeFileSync after openSync that could throw + leave fd open). The
@@ -952,7 +952,7 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
       if (e.code !== "EEXIST") throw e;
       // Lock is held by another process — or stale from a crash. Reclaim if the
       // holder PID is dead OR the lockfile is older than the lock timeout.
-      // SEC7-1: use lstatSync (not statSync) so the mtime check reads the
+      // use lstatSync (not statSync) so the mtime check reads the
       // lockfile entry itself, NOT a symlink target. An attacker who can write
       // to ~/.pi/agent plants a symlink at ${stateFile}.lock -> any old file;
       // statSync follows it, reads the TARGET's old mtime, concludes stale,
@@ -966,12 +966,12 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
           unlinkSync(lockFile);
           continue; // retry the O_EXCL immediately
         }
-        // SEC9-3: the mtime ceiling is the authoritative reclaim bound. The
+        // the mtime ceiling is the authoritative reclaim bound. The
         // PID-based fast-path (CMP7-1) was an optimization that read the
         // lockfile content via readFileSync — dropped to remove the TOCTOU
         // between lstatSync (confirms regular file) + readFileSync (follows
         // symlinks). SEC13-2: the PID write was also dropped (dead code).
-        // ADV12-1/SEC13-1: reclaim if the lockfile is older than lockTimeoutMs
+        // reclaim if the lockfile is older than lockTimeoutMs
         // (the original mtime ceiling) OR if its mtime is in the future beyond
         // MAX_LOCK_FUTURE_MS (1s). A future-dated mtime — from clock skew, NTP
         // correction, resume from suspend, or a `touch -t` attack — is not a
@@ -991,7 +991,7 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
         throw new Error(`concurrency-queue: timed out acquiring lock ${lockFile}`);
       }
       // Spin briefly. Use a synchronous sleep to avoid timers in the hot path.
-      // C2/CMP6-1: prefer Atomics.wait over a CPU-burning busy-spin. Under
+      // prefer Atomics.wait over a CPU-burning busy-spin. Under
       // contention each process busy-spins 5ms per retry, burning CPU AND
       // blocking the event loop of the process that currently holds the lock —
       // the holder cannot make progress on writeStateAtomic/renameSync while a
@@ -1023,14 +1023,14 @@ function withLock<T>(cfg: Required<QueueConfig>, lockFile: string, fn: (now: num
 function writeStateAtomic(path: string, state: QueueState): void {
   const dir = dirname(path);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore EEXIST */ }
-  // C4: stale-.tmp reaping moved out to mutate's withLock block so it uses the
+  // stale-.tmp reaping moved out to mutate's withLock block so it uses the
   // injected cfg.now() (testability — a frozen clock now exercises the reaper).
-  // ADV7-1: include a short random suffix in the temp name so a recycled pid
+  // include a short random suffix in the temp name so a recycled pid
   // never collides with a stale leftover from a prior (crashed) run sharing
   // the same pid. The reaper's prefix match (`${basename(path)}.` + suffix
   // `.tmp`) still matches; the random middle distinguishes concurrent runs.
   const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  // SEC6-2: open with O_EXCL ("wx") + 0o600 so a planted symlink at the per-pid
+  // open with O_EXCL ("wx") + 0o600 so a planted symlink at the per-pid
   // temp name throws EEXIST instead of being followed. writeFileSync(symlink,
   // ...) follows the symlink and writes into its target (probe-confirmed);
   // openSync("wx") creates the file ONLY if it does not already exist (no
@@ -1046,7 +1046,7 @@ function writeStateAtomic(path: string, state: QueueState): void {
   } finally {
     try { closeSync(fd); } catch { /* best-effort */ }
   }
-  // ADV10-2: wrap renameSync in try/catch so a throw (EISDIR, EXDEV) unlinks
+  // wrap renameSync in try/catch so a throw (EISDIR, EXDEV) unlinks
   // the .tmp before re-throwing. Without this the temp file leaks on disk
   // (reaped after 10s by reapStaleTmps, but accumulates under sustained
   // failure — e.g. a planted directory at `path` makes every renameSync throw
@@ -1072,10 +1072,10 @@ function writeStateAtomic(path: string, state: QueueState): void {
 const STALE_TMP_MS = 10_000;
 
 /** Best-effort unlink of stale <path>.*.tmp files older than STALE_TMP_MS. */
-// C4: now is threaded in from mutate's caller (cfg.now()) so a frozen clock
+// now is threaded in from mutate's caller (cfg.now()) so a frozen clock
 // exercises the reaper — a regression inverting the comparison would not be
 // caught otherwise.
-// ADV7-2: cap the number of .tmp files unlinked per mutate (REAP_TMP_MAX) to
+// cap the number of .tmp files unlinked per mutate (REAP_TMP_MAX) to
 // bound the critical section under pathological .tmp accumulation. The reaper
 // runs inside the O_EXCL lock, so unlinking thousands of stale leftovers would
 // extend the critical section past the 2s lockTimeoutMs ceiling (CMP-MED-2),
@@ -1092,13 +1092,13 @@ function reapStaleTmps(path: string, now: number): void {
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const full = `${dir}/${name}`;
     try {
-      // SEC8-2/SEC9-6/ADV-R13-2: use lstatSync (not statSync) so a symlink
+      // use lstatSync (not statSync) so a symlink
       // .tmp → /etc/passwd is detected as non-regular + unlinked directly
       // without following the link (matching the lockfile's SEC7-1 posture).
       // statSync would follow the symlink, read the TARGET's mtime, and
       // unlinkSync (which removes the symlink itself, safe) but the mtime
       // leak is inconsistent with the hardened posture.
-      // ADV-R13-2: a symlink .tmp is NEVER a legitimate temp file (the writer
+      // a symlink .tmp is NEVER a legitimate temp file (the writer
       // uses openSync("wx") which creates regular files only). Unlink
       // unconditionally regardless of mtime — a freshly-planted symlink has
       // lstatSync().mtimeMs ≈ now, so the STALE_TMP_MS check below would skip
@@ -1106,7 +1106,7 @@ function reapStaleTmps(path: string, now: number): void {
       // same temp name (EEXIST). Matches the lockfile's non-regular → unlink
       // posture at acquireLock (SEC7-1).
       const st = lstatSync(full);
-      // CORR7-5: a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
+      // a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
       // (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the
       // real wedge — the per-pid temp name is a directory). rmdir it if empty
       // (best-effort) + skip; a non-empty dir is left for the operator.
@@ -1116,7 +1116,7 @@ function reapStaleTmps(path: string, now: number): void {
         continue;
       }
       if (!st.isFile()) {
-        // ADV-R13-2: a symlink (or other non-regular non-directory) at a .tmp
+        // a symlink (or other non-regular non-directory) at a .tmp
         // name is never legitimate — unlink unconditionally regardless of
         // mtime. The writer uses openSync("wx") which creates regular files
         // only, so a non-regular .tmp was planted (attacker with write access
@@ -1170,7 +1170,7 @@ export interface ConcurrencyQueue {
   pauseUntil(until: number, reason?: string | null): void;
   /**
    * Clear deprioritization early (e.g. when /usage reports priority.low===false).
-   * CORR4-1: by default this REFUSES to clear a 429-origin pause (tagged
+   * by default this REFUSES to clear a 429-origin pause (tagged
    * PAUSE_REASON_429) — /usage lags a 429 by 1-5s, so a stale tick reporting
    * priority.low===false must not wipe a sibling's freshly-written 429 pause.
    * clearPause refuses purely on the PAUSE_REASON_429 + pausedUntil > now
@@ -1250,7 +1250,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   const lockFile = `${cfg.stateFile}.lock`;
   const ourPid = cfg.pid;
 
-  // COV4-1: ensure the state file's parent dir exists before the first mutate.
+  // ensure the state file's parent dir exists before the first mutate.
   // The lockfile lives in the same dir as the state file, so acquireLock's
   // openSync(lockFile, "wx") throws ENOENT when the parent dir is missing —
   // BEFORE writeStateAtomic's own mkdirSync ever runs (it runs inside withLock,
@@ -1265,12 +1265,12 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // our own and so the status bar can show "launching".
   let holdsToken = false;
   let ourTokenId: string | null = null;
-  // COV5-5 / ADV5-4: track our waiter ids (set in join) alongside ourTokenId so
+  // track our waiter ids (set in join) alongside ourTokenId so
   // reset() can splice out a queued-but-not-launched waiter. Without this, a
   // process that join()ed but is still queued (ourTokenId === null) has reset()
   // as a no-op, leaking the waiter for staleWaiterMs (5 min) if the process
   // doesn't exit — blocking siblings behind a dead-PID entry.
-  // COV6-2: a Set (not a single slot) so a second join() on one queue does NOT
+  // a Set (not a single slot) so a second join() on one queue does NOT
   // overwrite the first id. Reachable from transformMessageImages (multi-image
   // handoff runs Promise.all → acquireSlot → join() per image). Probe (5×)
   // confirmed: two join() calls then reset() leaves exactly 1 waiter every
@@ -1278,9 +1278,9 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // safe — token release is closure-captured per waitForLaunch — but a Set is
   // used here because waiters accumulate.
   const ourWaiterIds: Set<string> = new Set();
-  // CLN7-1: ourWaiterIds (Set) is the sole source of truth. Deleted the dead
+  // ourWaiterIds (Set) is the sole source of truth. Deleted the dead
   // let ourWaiterId single-slot.
-  // CORR7-2: a per-instance AbortController that reset() aborts to stop any
+  // a per-instance AbortController that reset() aborts to stop any
   // in-flight waitForLaunch poll loop on the same queue instance. Without it,
   // reset() splices our waiter id from the file, but a concurrent poll loop's
   // mutate sees stillQueued===false and RE-INSERTS the id at the tail (ADV-4's
@@ -1295,7 +1295,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     return withLock(cfg, lockFile, (now) => {
       const state = reapStale(readState(cfg.stateFile), cfg, now);
       const result = fn(now, state);
-      // C4: reap stale .tmp files inside the lock, using the injected cfg.now()
+      // reap stale .tmp files inside the lock, using the injected cfg.now()
       // (was Date.now() inside writeStateAtomic — a frozen clock never
       // exercised the reaper). ADV-1: best-effort cleanup of crashed writers'
       // leftovers; errors swallowed inside reapStaleTmps.
@@ -1317,7 +1317,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void> {
       return new Promise((resolve, reject) => {
-        // CMP8-2: compose the caller's signal + the per-instance resetAbort
+        // compose the caller's signal + the per-instance resetAbort
         // controller via AbortSignal.any (Node 20.3+; declared in package.json
         // engines). Replaces the manual addEventListener + finally
         // removeEventListener bridge (listener-leak footgun + boilerplate).
@@ -1343,7 +1343,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // promise would claim the token when freed and resolve a release fn
           // nobody holds (ADV-2 token leak).
           if (signal?.aborted || resetAbort.signal.aborted) return;
-          // ADV4-1: the FIRST poll() runs synchronously inside the Promise
+          // the FIRST poll() runs synchronously inside the Promise
           // executor, so a throw here rejects the promise and acquireSlot's
           // finally cleans up — safe. But every SUBSEQUENT poll is a
           // setTimeout callback; a throw from mutate() there (acquireLock
@@ -1361,7 +1361,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           let got: boolean;
           try {
             got = mutate((now, state) => {
-              // ADV-4: if our waiter entry was reaped by staleWaiterMs (5 min)
+              // if our waiter entry was reaped by staleWaiterMs (5 min)
               // while we were still queued (e.g. a deep FIFO + slow models, or
               // a perpetually-full /usage per ADV-3), re-insert it at the tail
               // with a fresh timestamp so we don't poll forever with
@@ -1421,7 +1421,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     pauseUntil(until: number, reason?: string | null): void {
       mutate((now, state) => {
-        // ADV4-2: a 429-sourced pause (tagged PAUSE_REASON_429) is clamped to
+        // a 429-sourced pause (tagged PAUSE_REASON_429) is clamped to
         // the tighter MAX_PAUSE_429_MS (2.5 min) ceiling so a misconfigured
         // UMANS_BASE_URL returning 429 forever cannot wedge the account for the
         // full 5h MAX_PAUSE_MS. A server priority.low pause (the other caller)
@@ -1430,7 +1430,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         // Retry-After is honored.
         const ceilingMs = reason === PAUSE_REASON_429 ? MAX_PAUSE_429_MS : MAX_PAUSE_MS;
         const clamped = clampPauseUntil(until, now, ceilingMs);
-        // COV6-3: a past `clamped` is still > 0 when no pause is active, so the
+        // a past `clamped` is still > 0 when no pause is active, so the
         // write below would proceed — display is safe (pausedUntil > now is
         // false), but the on-disk pausedReason lingers as stale data. Early-
         // return when the pause is already elapsed (nothing to write).
@@ -1439,11 +1439,11 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         }
         if (clamped > state.pausedUntil) {
           state.pausedUntil = clamped;
-          // SEC5-1 / ADV5-5: sanitize at the write boundary too (defense-in-
+          // sanitize at the write boundary too (defense-in-
           // depth) so a poisoned reason never reaches the shared file,
           // regardless of caller. parsePriority already sanitizes the
           // server-sourced reason; this catches any future caller.
-          // CORR7-1: do NOT overwrite a sticky reason tag with a different
+          // do NOT overwrite a sticky reason tag with a different
           // reason when extending. clearPause's sticky guard keys on the
           // reason STRING, so a /usage priority.low tick with a longer deadline
           // + a non-null reason (e.g. "Account deprioritized") would wipe a
@@ -1464,7 +1464,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     clearPause(opts?: { force?: boolean }): void {
       mutate((now, state) => {
-        // CORR4-1: /v1/usage LAGS a real suspension by 1-5s. A stale 5s
+        // /v1/usage LAGS a real suspension by 1-5s. A stale 5s
         // refreshUsage tick reporting priority.low===false would wipe a
         // freshly-written sticky pause, letting the next waiter launch into
         // the still-suspended account + re-trip the cascade the pause exists
@@ -1489,7 +1489,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     touchToken(ourId: string): boolean {
-      // C1 (HIGH): the capacity-poll loop in acquireSlot holds the launch token
+      // the capacity-poll loop in acquireSlot holds the launch token
       // across a long /usage poll (a pause-bounded wait can legitimately
       // exceed 120s — see CORR4-3). reapStale reaps any token whose now -
       // token.ts > staleTokenMs, regardless of liveness, so a poller that never
@@ -1540,14 +1540,14 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     snapshot(): { queued: number; tokenHeld: boolean; paused: boolean; pausedUntil: number; pausedReason: string | null; inflightCount: number } {
-      // CMP9-4: snapshot reads without the lock (atomic rename prevents torn
+      // snapshot reads without the lock (atomic rename prevents torn
       // reads; value may be one mutate stale — capacity-poll compensates via
       // /usage priority.low). Correct for the status bar; the brief staleness
       // is acceptable for an operator-facing view.
       // Read without mutating; still reap for an accurate view.
       const now = cfg.now();
       const state = reapStale(readState(cfg.stateFile), cfg, now);
-      // CORR7-3: reconcile holdsToken with the file. reapStale may have reaped
+      // reconcile holdsToken with the file. reapStale may have reaped
       // our token (id mismatch / absent) — e.g. the watchdog reaped it after
       // >120s while this process still believes it holds it. Without this,
       // snapshot().tokenHeld returns the stale local `holdsToken` (true) and the
@@ -1572,7 +1572,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       mutate((_now, state) => {
         const idx = state.waiters.findIndex((w) => w.id === ourId);
         if (idx >= 0) state.waiters.splice(idx, 1);
-        // C6: also splice the matching in-flight entry. An abort-after-launch
+        // also splice the matching in-flight entry. An abort-after-launch
         // path that calls cancel (the token-reaped re-join path, the abort
         // signal, acquireSlot's finally) must not leak the in-flight entry for
         // 120s — localInFlight would be inflated by 1, needlessly blocking one
@@ -1589,7 +1589,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     },
 
     reset(): void {
-      // CORR7-2: abort the per-instance resetAbort controller FIRST so any
+      // abort the per-instance resetAbort controller FIRST so any
       // in-flight waitForLaunch poll loop on this queue instance stops +
       // rejects (acquireSlot catches + returns undefined). Without this, reset()
       // splices our waiter id from the file, but a concurrent poll loop's mutate
@@ -1606,12 +1606,12 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // sibling pi processes' queue state. Leave both files for natural expiry
       // (the watchdog reaps stale token/waiter entries) and stale-lockfile
       // recovery. Matches the scope of `cancel`.
-      // COV5-5 / ADV5-4: also splice out a queued-but-not-launched waiter
+      // also splice out a queued-but-not-launched waiter
       // (ourTokenId === null, ourWaiterIds non-empty). Without this, a process that
       // join()ed but is still queued has reset() as a no-op, leaking the
       // waiter for staleWaiterMs (5 min) if the process doesn't exit —
       // blocking siblings behind a dead-PID entry.
-      // COV6-2: splice EVERY id in ourWaiterIds (a Set, not a single slot) so a
+      // splice EVERY id in ourWaiterIds (a Set, not a single slot) so a
       // second join() on one queue does not leak the first waiter. Reachable
       // from transformMessageImages (Promise.all → acquireSlot → join() per
       // image). The token single-slot (ourTokenId) is safe — token release is
@@ -1627,7 +1627,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           if (tokId && state.token && state.token.id === tokId) {
             state.token = null;
           }
-          // C11: PID-scoped in-flight cleanup. Splice only in-flight entries
+          // PID-scoped in-flight cleanup. Splice only in-flight entries
           // whose pid === ourPid() (or whose id is in ourWaiterIds —
           // addInFlight reuses the waiter id). Do NOT wipe siblings' in-flight
           // entries — a global wipe would re-arm the within-machine burst race
