@@ -44,6 +44,11 @@ import {
   parseConcurrencyLimit,
   PRIORITY_BACKOFF_MS,
   PAUSE_REASON_429,
+  PAUSE_REASON_STRIKES,
+  PAUSE_REASON_CAP_ABUSE,
+  STICKY_PAUSE_REASONS,
+  extractBoxedUntil,
+  isSuspendBody,
   MAX_PAUSE_429_MS,
   SANITIZE_CTRL_RE,
   type ConcurrencyQueue,
@@ -125,7 +130,6 @@ const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
 const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
 const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
-const PAUSE_REASON_STRIKES = "429 strike limit approached";
 
 /**
  * COV5-1: pure decision extracted from acquireSlot's capacity-poll loop so the
@@ -624,14 +628,43 @@ export function handle429(
  * queue — then only the body sanitize + throw run, matching the prior inline
  * behavior).
  */
-async function raiseForUmansStatus(
+export async function raiseForUmansStatus(
   res: { status: number; headers?: Headers | Record<string, string> | undefined | null; text(): Promise<string> },
   concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
 ): Promise<never> {
   if (res.status === 429 && concurrencyQueue) {
     handle429(res, concurrencyQueue);
   }
+  // C13: read text() ONCE into a local. A fetch Response body can only be
+  // consumed once; reading it again returns "". The 403 suspend-body check
+  // + the sanitizeErrorBody call below both operate on this same string.
   const txt = await res.text().catch(() => "");
+  // 403 account_suspended / cap_abuse: the Umans server escalates from
+  // deprioritization (priority.low + 429s) to a full account suspension by
+  // returning HTTP 403 with a body indicating account_suspended / cap_abuse
+  // / cap_suspended / billing_error (the 403 is the HTTP symptom of the same
+  // underlying cap_abuse suspension the /v1/usage priority.reason=cap_abuse
+  // branch detects). Treat it like a 429: extract the boxed_until deadline
+  // from the body + push the shared cap_abuse pause so sibling pi processes
+  // back off instead of launching into the 403 wall + cascading.
+  // C7: a 403 WITHOUT a suspend-family body (an auth error, a proxy HTML
+  // page, an IP-allowlist rejection) does NOT push a pause — the turn still
+  // throws, but the shared gate is not poisoned for siblings.
+  // C3/Adv4: boxed_until is tolerant — a structured JSON field, an ISO
+  // timestamp embedded in the error message string, or absent (→ 30s floor).
+  // A PAST boxed_until is treated as absent so a crafted/stale past value
+  // does not silently disable the pause (pauseUntil early-returns on a past
+  // deadline, re-arming the cascade).
+  if (res.status === 403 && concurrencyQueue && isSuspendBody(txt)) {
+    const now = Date.now();
+    const extracted = extractBoxedUntil(txt);
+    const until = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
+    try {
+      concurrencyQueue.pauseUntil(until, PAUSE_REASON_CAP_ABUSE);
+    } catch (err) {
+      console.warn("umans: pauseUntil threw in 403 handler (continuing):", err instanceof Error ? err.message : err);
+    }
+  }
   // SEC7-4: cap + sanitize the gateway error body before echoing it (cap 80,
   // strip non-printable / ANSI-escape) so a crafted body cannot inject
   // control sequences or mangle the tool result.
@@ -1008,7 +1041,17 @@ export default async function (pi: ExtensionAPI) {
 
   async function refreshStrikes(apiKey: string) {
     const count = await fetch429Strikes(apiKey);
-    if (count === null) return; // leave cached value; status bar shows "?"
+    if (count === null) {
+      // Adv6: /v1/usage/history may also return 403 during a suspension
+      // (the server returns 403 for everything once suspended). The prior
+      // code left the last cached strikes value, so the status bar showed
+      // a stale "Strikes 19/20" for the full 5h suspension. Clear it so the
+      // bar reflects that the count is unknown (the threshold check below
+      // is skipped — extend-never-shorten holds regardless because a cap_abuse
+      // pause is sticky + longer than any strike pause).
+      strikes24h = undefined;
+      return;
+    }
     strikes24h = count;
     // Dynamic threshold: server limit minus the max in-flight requests (the
     // concurrency limit). A burst of in-flight requests can all 429 before our
@@ -1120,7 +1163,34 @@ export default async function (pi: ExtensionAPI) {
           "User-Agent": USER_AGENT,
         },
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // Adv1: a 403 FROM /v1/usage itself is a POSITIVE suspension signal,
+        // not an absence of signal. The Umans server returns 403
+        // account_suspended / cap_abuse for everything once the account is
+        // suspended — including /v1/usage. The prior fail-open (return null
+        // → isCapacityFree(null) → {free:true}) would launch every queued
+        // waiter into the 403 wall, re-arming the cascade D10 exists to
+        // prevent. Detect the suspend family in the body + return a
+        // synthetic usage object with priority.low=true + reason=cap_abuse
+        // so the cap_abuse branch (isCapacityFree) fires + pushes the real
+        // pause. A 403 WITHOUT a suspend body (an auth error on /usage
+        // itself) keeps the fail-open stance (return null).
+        if (res.status === 403) {
+          const txt = await res.text().catch(() => "");
+          if (isSuspendBody(txt)) {
+            const now = Date.now();
+            const extracted = extractBoxedUntil(txt);
+            const boxedUntilMs = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
+            return {
+              usage: {
+                concurrent_sessions: 0,
+                priority: { low: true, boxed_until: new Date(boxedUntilMs).toISOString(), reason: "cap_abuse" },
+              },
+            };
+          }
+        }
+        return null;
+      }
       return await res.json() as {
         limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
         usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
@@ -1206,12 +1276,16 @@ export default async function (pi: ExtensionAPI) {
     deprioritized = priority.low;
     priorityUntil = priority.until;
     // Only clear a pause that was pushed by a PREVIOUS priority.low tick —
-    // don't clear a 429-origin or strike-origin pause (those have their own
-    // deadlines + must not be wiped by a stale /usage tick reporting low===false
-    // before the server catches up). CORR4-1: the 429 tag survives this clear.
+    // don't clear a sticky-origin pause (429 / cap_abuse / strike — those have
+    // their own deadlines + must not be wiped by a stale /usage tick reporting
+    // low===false before the server catches up). CORR4-1: the sticky tag set
+    // survives this clear. The cap_abuse reason is now covered symmetrically
+    // (the prior hardcoded PAUSE_REASON_429 + PAUSE_REASON_STRIKES check left
+    // it uncovered, re-arming the incident cascade when a stale /usage tick
+    // arrived 1-5s after a 403/cap_abuse pause was written).
     if (!priority.low) {
       const snap = concurrencyQueue.snapshot();
-      if (snap.paused && snap.pausedReason !== PAUSE_REASON_429 && snap.pausedReason !== PAUSE_REASON_STRIKES) {
+      if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
         concurrencyQueue.clearPause();
       }
     }
@@ -2019,6 +2093,32 @@ export default async function (pi: ExtensionAPI) {
       const until = handle429(event, concurrencyQueue);
       ctx.ui?.notify?.(
         `Umans 429: pausing new turns ${Math.round((until - Date.now()) / 1000)}s to avoid account deprioritization.`,
+        "warning",
+      );
+    }
+    // 403 account_suspended / cap_abuse bridge pause. The pi
+    // after_provider_response event carries status + headers but NO body
+    // (the body has not streamed yet at headers time), so the boxed_until
+    // deadline carried in the 403 error message body is unreachable here.
+    // Push a 30s bridge pause tagged PAUSE_REASON_CAP_ABUSE so sibling pi
+    // processes back off immediately; the real 5h deadline is pushed by the
+    // /v1/usage cap_abuse branch (isCapacityFree) once /usage catches up
+    // (priority.low===true, reason===cap_abuse, boxed_until). Extend-never-
+    // shorten holds: the cap_abuse repause with the real boxed_until extends
+    // this 30s bridge without shortening it. A 403 WITHOUT a suspend-family
+    // body (an auth error) is not detectable here (no body), so this fires
+    // for every 403 — but the bridge is bounded + the cap_abuse branch is
+    // the authoritative signal. The side-call path (raiseForUmansStatus)
+    // body-checks before pausing; this main-turn path cannot.
+    if (event.status === 403) {
+      const until = Date.now() + PRIORITY_BACKOFF_MS;
+      try {
+        concurrencyQueue.pauseUntil(until, PAUSE_REASON_CAP_ABUSE);
+      } catch (err) {
+        console.warn("umans: pauseUntil threw in 403 main-turn handler (continuing):", err instanceof Error ? err.message : err);
+      }
+      ctx.ui?.notify?.(
+        `Umans 403 (account suspended): pausing new turns ${Math.round((until - Date.now()) / 1000)}s; the /v1/usage cap_abuse signal will extend the pause once the server catches up.`,
         "warning",
       );
     }

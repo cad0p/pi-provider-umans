@@ -180,6 +180,130 @@ export const MAX_PAUSE_429_MS = 5 * PRIORITY_BACKOFF_MS; // 150,000 ms (2.5 min)
 export const PAUSE_REASON_429 = "HTTP 429 from gateway";
 
 /**
+ * Reason tag written when the Umans server escalates from deprioritization
+ * to a full account suspension (it returns HTTP 403 `account_suspended` /
+ * `cap_abuse` / `cap_suspended` / `billing_error` instead of a 429). Both
+ * the 403 response handler (raiseForUmansStatus + after_provider_response)
+ * and the /v1/usage cap_abuse branch (isCapacityFree) push THIS SAME tag:
+ * the 403 is the HTTP symptom of the same underlying cap_abuse suspension,
+ * so a single tag eliminates the reason-flip fragility where a stale
+ * /v1/usage tick could wipe a freshly-written pause whose reason changed
+ * between the two observation channels. The cap_abuse pause uses the 5h
+ * MAX_PAUSE_MS ceiling (the non-429 branch of pauseUntil).
+ */
+export const PAUSE_REASON_CAP_ABUSE = "account cap_abuse suspension";
+
+/**
+ * Reason tag written by the strike counter when the 24h 429 count approaches
+ * the server's 5h-pause threshold (see refreshStrikes in index.ts). Sticky
+ * so a stale /v1/usage tick does not wipe a freshly-written strike pause.
+ */
+export const PAUSE_REASON_STRIKES = "429 strike limit approached";
+
+/**
+ * The set of pause reasons that a stale /v1/usage tick reporting
+ * priority.low===false must NOT clear. /v1/usage LAGS a real suspension by
+ * 1-5s (the same lag CORR4-1 defends for 429s), so a stale-low===false tick
+ * arriving right after a 403/cap_abuse pause was written would wipe it —
+ * letting the next waiter launch into a still-suspended account + re-trip
+ * the cascade the pause exists to prevent. clearPause + the refreshUsage
+ * call-site guard both check this set instead of the prior hardcoded
+ * PAUSE_REASON_429 / PAUSE_REASON_STRIKES checks so the new cap_abuse
+ * reason is covered symmetrically.
+ */
+export const STICKY_PAUSE_REASONS = new Set([PAUSE_REASON_429, PAUSE_REASON_CAP_ABUSE, PAUSE_REASON_STRIKES]);
+
+/**
+ * ISO-8601 timestamp regex used to extract `boxed_until` from a 403 error
+ * body when the deadline is embedded in an error MESSAGE STRING rather than
+ * a structured JSON field (the incident 2026-06-27 showed the server emits
+ * the suspension deadline inside the error message text, not as a
+ * `boxed_until` field). Matches `2026-06-28T03:09:24Z` and the
+ * fractional-seconds variant `2026-06-28T03:09:24.123Z`.
+ */
+const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/;
+
+/**
+ * Tolerantly extract a suspension deadline (epoch-ms) from a 403 response
+ * body. The Umans server emits `boxed_until` in three shapes observed across
+ * the suspend family: (a) a structured JSON field (top-level or nested under
+ * `error`), (b) an ISO-8601 timestamp embedded inside an error MESSAGE
+ * STRING (the incident-2026-06-27 shape), or (c) absent entirely (an HTML
+ * gateway page or an unrelated 403). This helper tries (a) then (b) then
+ * returns `undefined` so the caller can apply a 30s floor fallback.
+ *
+ * A PAST `boxed_until` (the server thinks the suspension elapsed but is
+ * still returning 403 — a stale deprio tick right as the suspension lifts, or
+ * a crafted value) is treated as ABSENT → `undefined`. pauseUntil
+ * early-returns on a past deadline, so without this guard a 403 carrying a
+ * past `boxed_until` would silently disable the pause + re-arm the cascade.
+ */
+export function extractBoxedUntil(body: string): number | undefined {
+  if (!body) return undefined;
+  const now = Date.now();
+  let parsed: unknown = undefined;
+  try { parsed = JSON.parse(body); } catch { /* not JSON — fall through to regex */ }
+  if (parsed && typeof parsed === "object") {
+    const candidates = [
+      (parsed as { boxed_until?: unknown }).boxed_until,
+      (parsed as { error?: { boxed_until?: unknown } }).error?.boxed_until,
+    ];
+    for (const b of candidates) {
+      const ms = toEpochMs(b);
+      // Adv4: a PAST boxed_until is treated as absent (undefined). pauseUntil
+      // early-returns on a past deadline, so without this guard a 403 carrying
+      // a past boxed_until would silently disable the pause + re-arm the
+      // cascade. The caller applies a 30s floor when undefined is returned.
+      if (ms !== undefined && ms > now) return ms;
+    }
+  }
+  const m = body.match(ISO_TIMESTAMP_RE);
+  if (m) {
+    const t = Date.parse(m[0]);
+    if (!Number.isNaN(t) && t > now) return t;
+  }
+  return undefined;
+}
+
+function toEpochMs(b: unknown): number | undefined {
+  if (typeof b === "number" && b > 0) return b > 1e12 ? b : b * 1000;
+  if (typeof b === "string" && b) {
+    const t = Date.parse(b);
+    if (!Number.isNaN(t)) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Detect whether a response body indicates a suspend-family account state
+ * (the Umans server returns HTTP 403 with one of these strings for a full
+ * account suspension, as opposed to a per-request auth error or an HTML
+ * gateway page). Matches `account_suspended`, `cap_abuse`, `cap_suspended`,
+ * `billing_error` case-insensitively, either as a JSON `type`/`error.type`
+ * field or anywhere in the raw body string (covers the error-message-text
+ * shape). A 403 WITHOUT a suspend-family body (an auth error, a proxy HTML
+ * page) does NOT push a pause — the turn still throws, but the shared gate
+ * is not poisoned for siblings.
+ */
+const SUSPEND_REASON_RE = /account_suspended|cap_abuse|cap_suspended|billing_error/i;
+export function isSuspendBody(body: string): boolean {
+  if (!body) return false;
+  return SUSPEND_REASON_RE.test(body);
+}
+
+/**
+ * True when a /v1/usage `priority.reason` string indicates a full account
+ * suspension (the gate must fully pause) vs. a transient deprioritization
+ * (the gate lowers the cap by 1 + keeps working). Matches the same family
+ * as isSuspendBody. `rate_limited` + absent/unknown keep the lower-cap-by-1
+ * path.
+ */
+export function isSuspendReason(reason: string | null | undefined): boolean {
+  if (typeof reason !== "string" || !reason) return false;
+  return SUSPEND_REASON_RE.test(reason);
+}
+
+/**
  * SEC9-2/SEC8-1: upper bound on the state file size we'll read+parse.
  * Legitimate state is <2 KB even with hundreds of waiters; a poisoned or
  * runaway file (e.g. 1 GB) would OOM/stall the pi process. readState stats the
@@ -1146,18 +1270,19 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // depth) so a poisoned reason never reaches the shared file,
           // regardless of caller. parsePriority already sanitizes the
           // server-sourced reason; this catches any future caller.
-          // CORR7-1: do NOT overwrite a PAUSE_REASON_429 tag with a non-429
-          // reason when extending. CORR4-1's clearPause guard keys on the
+          // CORR7-1: do NOT overwrite a sticky reason tag with a different
+          // reason when extending. clearPause's sticky guard keys on the
           // reason STRING, so a /usage priority.low tick with a longer deadline
-          // + a non-null reason (e.g. "Account deprioritized") would wipe the
-          // 429 tag, letting the next stale priority.low===false tick clear the
-          // pause early — exactly the race CORR4-1 exists to prevent. The 429
-          // tag stays authoritative; the longer deadline still extends
-          // pausedUntil. When the 429 pause naturally elapses (pausedUntil <=
-          // now), clearPause clears it normally.
+          // + a non-null reason (e.g. "Account deprioritized") would wipe a
+          // freshly-written sticky tag, letting the next stale
+          // priority.low===false tick clear the pause early — exactly the
+          // race CORR4-1 exists to prevent. The sticky tag stays
+          // authoritative; the longer deadline still extends pausedUntil.
+          // When the sticky pause naturally elapses (pausedUntil <= now),
+          // clearPause clears it normally.
           const newReason = sanitizeReason(reason);
-          state.pausedReason = state.pausedReason === PAUSE_REASON_429
-            ? PAUSE_REASON_429
+          state.pausedReason = state.pausedReason && STICKY_PAUSE_REASONS.has(state.pausedReason)
+            ? state.pausedReason
             : (newReason ?? state.pausedReason ?? null);
           state.pausedTs = now;
         }
@@ -1166,18 +1291,23 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     clearPause(opts?: { force?: boolean }): void {
       mutate((now, state) => {
-        // CORR4-1: /usage LAGS a 429 by 1-5s. A stale 5s refreshUsage tick
-        // reporting priority.low===false would wipe a sibling's freshly-written
-        // 429 pause, letting the next waiter launch into the deprio the gate
-        // exists to prevent. Refuse to clear a 429-origin pause (tagged
-        // PAUSE_REASON_429) unless forced — the 429 pause survives until it
-        // naturally elapses (reapStale/pausedUntil<=now) OR /usage reports
-        // priority.low===true (refreshUsage only calls clearPause on the
-        // low===false branch, so a 429 pause set by a sibling survives the
-        // stale tick; the 429 writer's OWN refreshUsage clears it only after its
-        // own /usage catches up to priority.low===true then back to false).
-        if (!opts?.force && state.pausedReason === PAUSE_REASON_429 && state.pausedUntil > now) {
-          return; // keep the 429-origin pause
+        // CORR4-1: /v1/usage LAGS a real suspension by 1-5s. A stale 5s
+        // refreshUsage tick reporting priority.low===false would wipe a
+        // freshly-written sticky pause, letting the next waiter launch into
+        // the still-suspended account + re-trip the cascade the pause exists
+        // to prevent. Refuse to clear ANY pause tagged with a sticky reason
+        // (PAUSE_REASON_429 / PAUSE_REASON_CAP_ABUSE / PAUSE_REASON_STRIKES)
+        // unless forced — the pause survives until it naturally elapses
+        // (reapStale/pausedUntil<=now) OR /usage reports priority.low===true
+        // (refreshUsage only calls clearPause on the low===false branch, so a
+        // sticky pause set by a sibling survives the stale tick; the writer's
+        // OWN refreshUsage clears it only after its own /usage catches up to
+        // priority.low===true then back to false). The STICKY_PAUSE_REASONS
+        // set makes the guard symmetric across 429 + cap_abuse + strike
+        // reasons (the prior hardcoded PAUSE_REASON_429 check left the new
+        // cap_abuse reason uncovered, re-arming the incident cascade).
+        if (!opts?.force && state.pausedReason && STICKY_PAUSE_REASONS.has(state.pausedReason) && state.pausedUntil > now) {
+          return; // keep the sticky-origin pause
         }
         state.pausedUntil = 0;
         state.pausedReason = null;

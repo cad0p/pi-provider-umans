@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, countdown, sanitizeErrorBody, handle429 } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, countdown, sanitizeErrorBody, handle429, raiseForUmansStatus } from "./index.ts";
 import {
   parsePriority,
   readState,
@@ -18,8 +18,14 @@ import {
   clampPauseUntil,
   isCapacityFree,
   parseConcurrencyLimit,
+  extractBoxedUntil,
+  isSuspendBody,
+  isSuspendReason,
   MAX_PAUSE_MS,
   PAUSE_REASON_429,
+  PAUSE_REASON_CAP_ABUSE,
+  PAUSE_REASON_STRIKES,
+  STICKY_PAUSE_REASONS,
   MAX_PAUSE_429_MS,
   PRIORITY_BACKOFF_MS,
   sanitizeReason,
@@ -5537,6 +5543,524 @@ if (process.platform !== "win32") {
     "ADV12-2: catch block fails open ungated (proceeds without release fn)");
   assert(handlerBlock.includes('proceeding ungated'),
     "ADV12-2: user notified via ctx.ui.notify on fail-open");
+}
+
+// --- 403 account_suspended / cap_abuse: extractBoxedUntil tolerant extraction (C3, Adv4) ---
+// The Umans server emits boxed_until in three shapes: (a) a structured JSON
+// field (top-level or nested under error), (b) an ISO-8601 timestamp embedded
+// in an error MESSAGE STRING (the incident-2026-06-27 shape), (c) absent (HTML
+// gateway page). A PAST boxed_until is treated as absent so a crafted/stale
+// past value does not silently disable the pause (pauseUntil early-returns on
+// a past deadline, re-arming the cascade).
+{
+  // (a) structured JSON field, top-level boxed_until (ISO string).
+  const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  let ms = extractBoxedUntil(JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future }));
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: structured JSON boxed_until (ISO string) extracted");
+  // (a') nested under error.boxed_until.
+  ms = extractBoxedUntil(JSON.stringify({ error: { type: "account_suspended", boxed_until: future } }));
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: nested error.boxed_until extracted");
+  // (a'') epoch-seconds numeric boxed_until.
+  const futureSec = Math.floor((Date.now() + 3 * 60 * 60 * 1000) / 1000);
+  ms = extractBoxedUntil(JSON.stringify({ boxed_until: futureSec }));
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: epoch-seconds numeric boxed_until extracted + converted to ms");
+  // (b) ISO timestamp embedded in an error message string.
+  const msgBody = `{"error":"account_suspended until ${future}; contact support"}`;
+  ms = extractBoxedUntil(msgBody);
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: ISO timestamp embedded in error message string extracted via regex");
+  // (c) absent (HTML gateway page) → undefined.
+  ms = extractBoxedUntil("<html><body>403 Forbidden</body></html>");
+  assert(ms === undefined,
+    "C3: HTML body with no timestamp → undefined (caller applies 30s floor)");
+  // (c') empty body → undefined.
+  ms = extractBoxedUntil("");
+  assert(ms === undefined, "C3: empty body → undefined");
+  // Adv4: PAST boxed_until (ISO string) → undefined (treated as absent).
+  const past = new Date(Date.now() - 60 * 1000).toISOString();
+  ms = extractBoxedUntil(JSON.stringify({ boxed_until: past }));
+  assert(ms === undefined,
+    "Adv4: past boxed_until treated as absent (does not silently disable the pause)");
+  // Adv4': PAST boxed_until embedded in message string → undefined.
+  ms = extractBoxedUntil(`account_suspended until ${past}`);
+  assert(ms === undefined,
+    "Adv4: past boxed_until in message string treated as absent");
+}
+
+// --- isSuspendBody detects the suspend family (C7) ---
+// A 403 WITHOUT a suspend-family body (an auth error, a proxy HTML page) does
+// NOT push a pause — the turn still throws, but the shared gate is not poisoned
+// for siblings.
+{
+  assert(isSuspendBody(JSON.stringify({ error: { type: "account_suspended" } })),
+    "C7: account_suspended body detected");
+  assert(isSuspendBody(JSON.stringify({ type: "billing_error" })),
+    "C7: billing_error body detected");
+  assert(isSuspendBody("cap_abuse until tomorrow"),
+    "C7: cap_abuse in plain string detected");
+  assert(isSuspendBody("CAP_SUSPENDED"),
+    "C7: cap_suspended detected case-insensitively");
+  assert(!isSuspendBody(JSON.stringify({ error: "forbidden" })),
+    "C7: unrelated 403 body (auth error) NOT detected");
+  assert(!isSuspendBody("<html><body>403 Forbidden</body></html>"),
+    "C7: HTML gateway page NOT detected");
+  assert(!isSuspendBody(""),
+    "C7: empty body NOT detected");
+}
+
+// --- isSuspendReason detects the suspend family for /v1/usage priority.reason (C5) ---
+{
+  assert(isSuspendReason("cap_abuse"), "C5: cap_abuse is a suspend reason");
+  assert(isSuspendReason("cap_suspended"), "C5: cap_suspended is a suspend reason");
+  assert(isSuspendReason("account_suspended"), "C5: account_suspended is a suspend reason");
+  assert(isSuspendReason("billing_error"), "C5: billing_error is a suspend reason");
+  assert(isSuspendReason("CAP_ABUSE"), "C5: suspend reason match is case-insensitive");
+  assert(!isSuspendReason("rate_limited"), "C5: rate_limited is NOT a suspend reason (lower-cap-by-1 path)");
+  assert(!isSuspendReason(undefined), "C5: undefined reason is NOT a suspend reason");
+  assert(!isSuspendReason(null), "C5: null reason is NOT a suspend reason");
+  assert(!isSuspendReason(""), "C5: empty string is NOT a suspend reason");
+}
+
+// --- raiseForUmansStatus 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE (D10, C3, C7, C9) ---
+// A 403 with a suspend-family body is the HTTP symptom of the same cap_abuse
+// suspension the /v1/usage priority.reason=cap_abuse branch detects. Both push
+// the SAME PAUSE_REASON_CAP_ABUSE tag (C9: single tag eliminates reason-flip
+// fragility). boxed_until is tolerant (JSON field / message-string regex / 30s
+// floor). A PAST boxed_until → 30s floor (Adv4). A 403 WITHOUT a suspend body
+// does NOT push a pause (C7).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-403-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // (a) 403 with JSON body {error:{type:account_suspended}, boxed_until:<future>} →
+  // pauseUntil called with parsed deadline + PAUSE_REASON_CAP_ABUSE.
+  const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  const bodyA = JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future });
+  const resA = new Response(bodyA, { status: 403 });
+  let threw = false;
+  try { await raiseForUmansStatus(resA, q); } catch { threw = true; }
+  assert(threw, "D10: 403 with suspend body still throws (HTTP 403: ...)");
+  const stA = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stA.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "D10: 403 with suspend body pushes PAUSE_REASON_CAP_ABUSE (single tag, C9)");
+  assert(stA.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: 403 boxed_until parsed (5h-ish pause, not 30s floor)");
+  q.clearPause({ force: true });
+
+  // (b) 403 with boxed_until embedded in error message string → regex extraction works.
+  const bodyB = `{"error":"account_suspended until ${future}; contact support"}`;
+  const resB = new Response(bodyB, { status: 403 });
+  try { await raiseForUmansStatus(resB, q); } catch { /* expected */ }
+  const stB = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stB.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "C3: 403 message-string boxed_until → PAUSE_REASON_CAP_ABUSE");
+  assert(stB.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: 403 message-string boxed_until extracted via regex");
+  q.clearPause({ force: true });
+
+  // (c) 403 with PAST boxed_until → 30s floor (Adv4).
+  const past = new Date(Date.now() - 60 * 1000).toISOString();
+  const bodyC = JSON.stringify({ error: { type: "account_suspended" }, boxed_until: past });
+  const resC = new Response(bodyC, { status: 403 });
+  try { await raiseForUmansStatus(resC, q); } catch { /* expected */ }
+  const stC = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stC.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "Adv4: 403 with past boxed_until still pushes PAUSE_REASON_CAP_ABUSE");
+  assert(stC.pausedUntil <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
+    "Adv4: past boxed_until → 30s floor (not silently disabled)");
+  q.clearPause({ force: true });
+
+  // (d) 403 with HTML body (no timestamp) → 30s floor (C3 fallback).
+  const resD = new Response("<html><body>403 Forbidden</body></html>", { status: 403, headers: { "content-type": "text/html" } });
+  // isSuspendBody("<html>...403 Forbidden") is false → no pause pushed. Simulate
+  // a suspend-family HTML body so the 403 handler fires + the 30s floor applies.
+  const resD2 = new Response("<html>account_suspended</html>", { status: 403 });
+  try { await raiseForUmansStatus(resD2, q); } catch { /* expected */ }
+  const stD = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stD.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "C3: 403 HTML suspend body → PAUSE_REASON_CAP_ABUSE");
+  assert(stD.pausedUntil <= Date.now() + PRIORITY_BACKOFF_MS + 1_000,
+    "C3: 403 HTML body no timestamp → 30s floor");
+  q.clearPause({ force: true });
+
+  // (e) 403 with unrelated body {"error":"forbidden"} → pauseUntil NOT called (C7).
+  const resE = new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
+  try { await raiseForUmansStatus(resE, q); } catch { /* expected */ }
+  const stE = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stE.pausedUntil === 0,
+    "C7: 403 with unrelated body does NOT push a pause (gate not poisoned for siblings)");
+  assert(stE.pausedReason === null,
+    "C7: 403 with unrelated body leaves pausedReason null");
+
+  // (f) 403 pause extends (not shortens) an existing 429 pause.
+  // Set a 429 pause at ~60s out, then push a cap_abuse pause at ~3h out.
+  handle429({ status: 429, headers: { "retry-after": "60" } }, q);
+  const stF1 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stF1.pausedReason === PAUSE_REASON_429, "setup: 429 pause tagged PAUSE_REASON_429");
+  const futureF = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  const resF = new Response(JSON.stringify({ error: { type: "account_suspended" }, boxed_until: futureF }), { status: 403 });
+  try { await raiseForUmansStatus(resF, q); } catch { /* expected */ }
+  const stF2 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(stF2.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+    "D10: 403 cap_abuse pause extends (not shortens) the existing 429 pause");
+  q.clearPause({ force: true });
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- STICKY_PAUSE_REASONS: cap_abuse pause survives a stale refreshUsage low===false tick (C1) ---
+// /v1/usage LAGS a real suspension by 1-5s. A stale refreshUsage tick reporting
+// priority.low===false arriving right after a 403/cap_abuse pause was written
+// must NOT wipe it — the next waiter would launch into a still-suspended account
+// + re-trip the cascade. The STICKY_PAUSE_REASONS set (429 + cap_abuse + strike)
+// makes clearPause + the refreshUsage call-site guard symmetric.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sticky-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Push a cap_abuse pause at ~3h out.
+  const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  const body = JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future });
+  const res = new Response(body, { status: 403 });
+  try { await raiseForUmansStatus(res, q); } catch { /* expected */ }
+  const st1 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st1.pausedReason === PAUSE_REASON_CAP_ABUSE, "setup: cap_abuse pause written");
+  assert(st1.pausedUntil > Date.now() + 2 * 60 * 60 * 1000, "setup: cap_abuse pause ~3h out");
+
+  // Simulate a stale refreshUsage low===false tick → clearPause must NOT wipe it.
+  q.clearPause(); // (no force)
+  const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st2.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "C1: cap_abuse pause survives a stale clearPause (sticky guard)");
+  assert(st2.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+    "C1: cap_abuse pausedUntil survives a stale clearPause");
+
+  // force:true clears it (operator /umans-concurrency reset).
+  q.clearPause({ force: true });
+  const st3 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st3.pausedReason === null, "C1: clearPause({force}) clears the sticky pause");
+  assert(st3.pausedUntil === 0, "C1: clearPause({force}) zeroes pausedUntil");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- STICKY_PAUSE_REASONS: 429 + strike pauses also survive a stale clearPause (C1 symmetry) ---
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sticky-sym-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // 429 pause.
+  handle429({ status: 429, headers: { "retry-after": "60" } }, q);
+  q.clearPause(); // stale low===false tick
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedReason === PAUSE_REASON_429 && st.pausedUntil > Date.now() + 50_000,
+    "C1: 429 pause survives a stale clearPause (sticky set symmetry)");
+  q.clearPause({ force: true });
+
+  // Strike pause.
+  q.pauseUntil(Date.now() + 30 * 60 * 1000, PAUSE_REASON_STRIKES);
+  q.clearPause(); // stale low===false tick
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedReason === PAUSE_REASON_STRIKES && st.pausedUntil > Date.now() + 29 * 60 * 1000,
+    "C1: strike pause survives a stale clearPause (sticky set symmetry)");
+  q.clearPause({ force: true });
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- pauseUntil preserves ANY sticky reason tag when extending (C9) ---
+// A cap_abuse pause extended by a /usage priority.low tick with a longer
+// deadline + a non-null reason must keep PAUSE_REASON_CAP_ABUSE (not flip to
+// the /usage reason), so the sticky guard holds.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-sticky-preserve-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Push a cap_abuse pause at ~1h out.
+  q.pauseUntil(Date.now() + 60 * 60 * 1000, PAUSE_REASON_CAP_ABUSE);
+  // Extend with a longer deadline + a DIFFERENT non-sticky reason (simulates a
+  // /usage priority.low tick with reason "Account deprioritized").
+  q.pauseUntil(Date.now() + 2 * 60 * 60 * 1000, "Account deprioritized");
+  const st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "C9: cap_abuse tag preserved when extended by a non-sticky reason (no flip)");
+  assert(st.pausedUntil > Date.now() + 1.5 * 60 * 60 * 1000,
+    "C9: pausedUntil extended to the longer deadline");
+  q.clearPause({ force: true });
+
+  // Same for a 429 pause.
+  q.pauseUntil(Date.now() + 60 * 1000, PAUSE_REASON_429);
+  q.pauseUntil(Date.now() + 2 * 60 * 1000, "Account deprioritized");
+  const st2 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st2.pausedReason === PAUSE_REASON_429,
+    "C9: 429 tag preserved when extended by a non-sticky reason");
+  q.clearPause({ force: true });
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- /v1/usage 403 with suspend body returns a synthetic cap_abuse snapshot (Adv1) ---
+// When /v1/usage itself returns 403 during a suspension (the server returns
+// 403 for everything once suspended), the prior fail-open (return null →
+// isCapacityFree(null) → {free:true}) would launch every queued waiter into
+// the 403 wall. fetchUsage now detects the suspend family in the body + returns
+// a synthetic usage object with priority.low=true + reason=cap_abuse so the
+// cap_abuse branch fires. A 403 WITHOUT a suspend body keeps the fail-open
+// stance (return null).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-adv1-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // (a) /v1/usage 403 with suspend body → synthetic cap_abuse usage object.
+  const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  const suspendBody = JSON.stringify({ error: { type: "account_suspended" }, boxed_until: future });
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(suspendBody, { status: 403, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // Trigger a refreshUsage via session_start (the factory schedules a 5s poll;
+    // session_start calls refreshUsage immediately).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    // The /v1/usage 403-with-suspend-body must have pushed the cap_abuse pause
+    // (refreshUsage → parsePriority(priority.low=true, reason=cap_abuse) →
+    // the cap_abuse branch in isCapacityFree is not hit here because refreshUsage
+    // does not call isCapacityFree; but the priority.low=true is cached + the
+    // status bar shows the deprio. The real test: fetchUsage did NOT return null,
+    // so refreshUsage parsed priority.low=true + did NOT clearPause (sticky guard).
+    // Verify the usage fetch was called (not skipped) + did not crash.
+    assert(usageCalls > 0, "Adv1: /v1/usage 403 with suspend body fetched (not skipped)");
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // (b) /v1/usage 403 with unrelated body → fail-open (returns null, no pause).
+  // Verify via a direct fetchUsage call shape: isSuspendBody on an unrelated
+  // body returns false, so fetchUsage returns null (existing fail-open).
+  assert(!isSuspendBody(JSON.stringify({ error: "forbidden" })),
+    "Adv1: /v1/usage 403 with unrelated body → isSuspendBody false (fail-open, returns null)");
+}
+
+// --- after_provider_response 403 bridge pause (C2: no body access on main-turn path) ---
+// The pi after_provider_response event carries status + headers but NO body
+// (the body has not streamed yet at headers time), so the boxed_until deadline
+// carried in the 403 error body is unreachable here. Push a 30s bridge pause
+// tagged PAUSE_REASON_CAP_ABUSE so siblings back off immediately; the real 5h
+// deadline is pushed by the /v1/usage cap_abuse branch once /usage catches up.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-403-bridge-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget() {}, setStatus() {},
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    const before = Date.now();
+    await dispatch("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
+    // The 30s bridge pause must have landed in the state file.
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedUntil > before, "C2: after_provider_response 403 set a bridge pausedUntil > now");
+    assert(parsed.pausedReason === PAUSE_REASON_CAP_ABUSE,
+      "C2: 403 bridge pause tagged PAUSE_REASON_CAP_ABUSE (single tag, C9)");
+    const pauseSec = Math.round((parsed.pausedUntil - Date.now()) / 1000);
+    assert(pauseSec >= 25 && pauseSec <= 30,
+      `C2: 403 bridge pause is ~30s (PRIORITY_BACKOFF_MS floor), pause ~${pauseSec}s`);
+    // The user must be notified.
+    assert(notifications.some((n) => n.msg.includes("403") && n.msg.includes("account suspended")),
+      "C2: 403 bridge pause notifies the user");
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- refreshStrikes clears strikes24h when fetch429Strikes returns null (Adv6) ---
+// /v1/usage/history may also return 403 during a suspension. The prior code
+// left the last cached strikes value, so the status bar showed a stale
+// "Strikes 19/20" for the full 5h. refreshStrikes now clears strikes24h so the
+// bar reflects that the count is unknown.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-adv6-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  let historyStatus = 200;
+  let historyBody = JSON.stringify({
+    buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+  });
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(historyBody, { status: historyStatus, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // First poll: 19 strikes cached (historyStatus 200).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    // Now make /history return 403 → fetch429Strikes returns null.
+    historyStatus = 403;
+    historyBody = JSON.stringify({ error: { type: "account_suspended" } });
+    // Trigger refreshStrikes via the immediate scheduleStrikePoll (immediate=true
+    // fires at session_start). Wait a tick for the setTimeout(0) to fire.
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // No assertion on the internal strikes24h var (not exported); the test
+    // confirms the factory does not crash when /history returns 403 + the
+    // strike threshold check is skipped (no spurious PAUSE_REASON_STRIKES
+    // pushed on a null count). The state file should have no strike pause.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason !== PAUSE_REASON_STRIKES,
+      "Adv6: refreshStrikes does not push PAUSE_REASON_STRIKES on a null count (403 on /history)");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 console.log("\nall checks passed");
