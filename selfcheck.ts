@@ -234,8 +234,8 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 }
 
 // --- decideLaunch capacity-poll branch logic (extracted from acquireSlot) ---
-// The 5 fix commits that hardened acquireSlot's branches (ADV-3, CORR4-3,
-// ADV4-2, COV4-2, ADV4-4) shipped without a regression test pinning the actual
+// The 5 fix commits that hardened acquireSlot's branches
+// shipped without a regression test pinning the actual
 // decision. decideLaunch is the pure seam: given a capacity-free result +
 // elapsed time + pause state + signal, decide launch / wait / failOpen / abort.
 {
@@ -248,7 +248,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   // not free, under the cap, not aborted → wait.
   assert(decideLaunch({ isFree: false, elapsedMs: 1_000, queuePaused: false, signalAborted: false }) === "wait",
     "not free under cap → wait");
-  // not free, cap elapsed, no pause → failOpen (ADV-3).
+  // not free, cap elapsed, no pause → failOpen.
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: false, signalAborted: false }) === "failOpen",
     "cap elapsed + no pause → failOpen");
   assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: false, signalAborted: false }) === "failOpen",
@@ -256,9 +256,9 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   // cap elapsed BUT a known pause is active → keep waiting (do not
   // fail open into a still-deprioritized account).
   assert(decideLaunch({ isFree: false, elapsedMs: 60_000, queuePaused: true, signalAborted: false }) === "wait",
-    "cap elapsed but paused → wait (CORR4-3 no fail-open during pause)");
+    "cap elapsed but paused → wait (no fail-open during pause)");
   assert(decideLaunch({ isFree: false, elapsedMs: 120_000, queuePaused: true, signalAborted: false }) === "wait",
-    "well past cap but paused → wait (CORR4-3)");
+    "well past cap but paused → wait");
   // mid-poll abort: signal fired → abort (cancel + reject), even if cap elapsed.
   assert(decideLaunch({ isFree: false, elapsedMs: 0, queuePaused: false, signalAborted: true }) === "abort",
     "signal aborted → abort");
@@ -423,11 +423,11 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 }
 
 // --- readState sanitizes pausedReason on the READ boundary ---
-// SEC5-1 sanitizes at the write boundary (pauseUntil) + parse path, but a
+// Sanitizing runs at the write boundary (pauseUntil) + parse path, but a
 // hand-edited file, a compromised sibling writing JSON directly, or a file
 // poisoned by an earlier unfixed build surfaces the raw string via readState
 // → snapshot() → status bar. readState must run pausedReason through
-// sanitizeReason too (defense-in-depth, the other half of SEC5-1's claim).
+// sanitizeReason too (defense-in-depth, the other half of the claim).
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-cov6-1-"));
   const stateFile = join(dir, "state.json");
@@ -446,19 +446,19 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   // readState must return a capped, control-char-free string.
   const st = readState(stateFile);
   assert(st.pausedReason !== null && st.pausedReason.length <= 64,
-    "COV6-1/SEC6-1: readState caps poisoned pausedReason to <= 64 chars");
+    "readState caps poisoned pausedReason to <= 64 chars");
   assert(!/[\x00-\x1f\x7f]/.test(st.pausedReason ?? ""),
-    "COV6-1/SEC6-1: readState strips control/ANSI-escape chars from poisoned pausedReason");
+    "readState strips control/ANSI-escape chars from poisoned pausedReason");
   assert(!st.pausedReason!.includes("\x1b"),
-    "COV6-1/SEC6-1: readState removes the ESC byte from poisoned pausedReason");
+    "readState removes the ESC byte from poisoned pausedReason");
 
   // snapshot() (the render path) must surface the same clean string.
   const q = createConcurrencyQueue({ stateFile });
   const snap = q.snapshot();
   assert(snap.pausedReason !== null && snap.pausedReason.length <= 64,
-    "COV6-1/SEC6-1: snapshot().pausedReason is capped after read sanitize");
+    "snapshot().pausedReason is capped after read sanitize");
   assert(!/[\x00-\x1f\x7f]/.test(snap.pausedReason ?? ""),
-    "COV6-1/SEC6-1: snapshot().pausedReason has no control/ANSI-escape chars after read sanitize");
+    "snapshot().pausedReason has no control/ANSI-escape chars after read sanitize");
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -467,7 +467,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
 // readState guards waiters (Array.isArray + per-entry shape), pausedUntil/pausedTs
 // (typeof number), token (shape), and falls back to empty on JSON throw.
 // Previously only the absent-file case was tested. Exercise: truncated JSON,
-// garbage waiters, non-object token, string pausedUntil. SEC5-2: malformed
+// garbage waiters, non-object token, string pausedUntil. Malformed
 // waiter/token entries are dropped (not passed through) so isPidDead/reapStale
 // never receive a non-number pid that would throw a synchronous TypeError.
 {
@@ -482,13 +482,13 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
     "readState truncated JSON -> empty state (no throw)");
 
   // Garbage waiters array (entries lack id/pid/ts) → dropped by the shape
-  // guard (SEC5-2); reapStale/isPidDead never see a non-number pid.
+  // guard; reapStale/isPidDead never see a non-number pid.
   writeFileSync(stateFile, JSON.stringify({ waiters: [{ foo: 1 }, { bar: 2 }] }));
   const garbage = readState(stateFile);
   assert(garbage.waiters.length === 0,
     "readState garbage waiters entries dropped (shape-validated)");
 
-  // Non-object token (a string) → null (shape guard rejects it, SEC5-2).
+  // Non-object token (a string) → null (shape guard rejects it).
   writeFileSync(stateFile, JSON.stringify({ token: "not-an-object" }));
   const badTok = readState(stateFile);
   assert(badTok.token === null,
@@ -554,7 +554,7 @@ assert(/^img_[0-9a-f]{8}$/.test(a), "hash format is img_<8 hex>");
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- SEC9-2/SEC8-1 + SEC9-4: readFileSync size bound + non-regular-file guard on state file ---
+// --- readFileSync size bound + non-regular-file guard on state file ---
 // A poisoned/runaway state file (e.g. 1 GB) would OOM/stall the pi process
 // before JSON.parse. A FIFO/pipe or character device would block readFileSync
 // indefinitely (wedging mutate + the O_EXCL lock). readState lstats first + bails
@@ -764,7 +764,7 @@ if (process.platform !== "win32") {
 
     try {
       // join() → mutate → reapStaleTmps unlinks the planted symlink .tmp
-      // (ADV-R13-2: non-regular .tmp unlinked unconditionally regardless of
+      // (non-regular .tmp unlinked unconditionally regardless of
       // mtime) → writeStateAtomic creates a fresh regular temp + renames →
       // join succeeds (no EEXIST throw). The canary is untouched.
       const q = createConcurrencyQueue({ stateFile });
@@ -879,7 +879,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "live-PID token with fresh ts is kept");
 }
 
-// --- S2: clampPauseUntil caps an over-large pause to now + MAX_PAUSE_MS ---
+// --- clampPauseUntil caps an over-large pause to now + MAX_PAUSE_MS ---
 {
   const now = 1_700_000_000_000;
   const huge = now + 1e13; // ~317,000 years (the Number("1e10") wedge)
@@ -891,7 +891,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "clampPauseUntil: sub-ceiling pause unchanged");
 }
 
-// --- S4: strict Retry-After parse rejects hex/sci-notation; valid ints clamp (S4) ---
+// --- strict Retry-After parse rejects hex/sci-notation; valid ints clamp ---
 // Mirrors the inline parse in index.ts after_provider_response 429 branch:
 // /^\d+$/.test(trim) then parseInt + clampPauseUntil. Number() accepted
 // "0x10"=16 and "1e10"=1e10; the strict regex rejects both.
@@ -989,7 +989,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- S2: reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---
+// --- reapStale clears a pause whose pausedTs is older than MAX_PAUSE_MS ---
 {
   const now = 1_700_000_000_000;
   const cfg = {
@@ -1043,7 +1043,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   };
   const reaped = reapStale(state, cfg as any, now);
   assert(reaped.pausedUntil === 0 && reaped.pausedReason === null && reaped.pausedTs === 0,
-    "SEC2-MED-1: forward-dated pausedTs + oversized pausedUntil is reaped (duration check)");
+    "forward-dated pausedTs + oversized pausedUntil is reaped (duration check)");
 
   // A legitimately short pause with a forward-dated pausedTs (edge case) is
   // left intact — duration is within ceiling, and the age check is negative
@@ -1051,7 +1051,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const shortState = { ...state, pausedUntil: now + 30_000, pausedTs: now + 1000 };
   const shortReaped = reapStale(shortState, cfg as any, now);
   assert(shortReaped.pausedUntil === now + 30_000,
-    "SEC2-MED-1: short pause with forward-dated pausedTs is not reaped (duration within ceiling)");
+    "short pause with forward-dated pausedTs is not reaped (duration within ceiling)");
 }
 
 // --- pause whose OWN claimed duration exceeds MAX_PAUSE_MS is reaped ---
@@ -1336,7 +1336,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     // The queue's pauseUntil surfaces the throw (the caller must swallow).
     let caught: unknown = undefined;
     try {
-      q.pauseUntil(Date.now() + 30_000, "COV4-2 probe");
+      q.pauseUntil(Date.now() + 30_000, "probe");
     } catch (err) {
       caught = err;
     }
@@ -1348,7 +1348,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     let guarded = true;
     try {
       try {
-        q.pauseUntil(Date.now() + 30_000, "COV4-2 probe");
+        q.pauseUntil(Date.now() + 30_000, "probe");
       } catch (err) {
         console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
       }
@@ -1394,36 +1394,36 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // Number.isInteger() passes, so a "0x10" typo would silently set the gate to
   // 16, defeating the cap. Mirrors the 429 Retry-After parse.
   assert(parseConcurrencyLimit("0x10", fallback) === fallback,
-    "CORR8-3/ADV8-1: '0x10' (hex) → fallback (strict regex rejects, not 16)");
+    "'0x10' (hex) → fallback (strict regex rejects, not 16)");
   assert(parseConcurrencyLimit("1e3", fallback) === fallback,
-    "CORR8-3/ADV8-1: '1e3' (sci-notation) → fallback (strict regex rejects, not 1000)");
+    "'1e3' (sci-notation) → fallback (strict regex rejects, not 1000)");
   assert(parseConcurrencyLimit("2.0", fallback) === fallback,
-    "CORR8-3/ADV8-1: '2.0' (fractional) → fallback (strict regex rejects)");
+    "'2.0' (fractional) → fallback (strict regex rejects)");
   assert(parseConcurrencyLimit("0X10", fallback) === fallback,
-    "CORR8-3/ADV8-1: '0X10' (hex upper) → fallback");
+    "'0X10' (hex upper) → fallback");
   assert(parseConcurrencyLimit("1E3", fallback) === fallback,
-    "CORR8-3/ADV8-1: '1E3' (sci-notation upper) → fallback");
+    "'1E3' (sci-notation upper) → fallback");
   assert(parseConcurrencyLimit("+3", fallback) === fallback,
-    "CORR8-3/ADV8-1: '+3' → fallback (strict regex rejects the sign)");
+    "'+3' → fallback (strict regex rejects the sign)");
   // Valid positive decimal integers still pass.
   assert(parseConcurrencyLimit("8", fallback) === 8,
-    "CORR8-3/ADV8-1: '8' → 8 (valid positive decimal)");
+    "'8' → 8 (valid positive decimal)");
   assert(parseConcurrencyLimit(" 12 ", fallback) === 12,
-    "CORR8-3/ADV8-1: ' 12 ' → 12 (whitespace trimmed, valid)");
+    "' 12 ' → 12 (whitespace trimmed, valid)");
   // huge integer strings pass /^\d+$/ + Number.isInteger but
   // exceed Number.MAX_SAFE_INTEGER, silently disabling the cap. isSafeInteger +
   // a 1024 ceiling reject them to fallback.
   assert(parseConcurrencyLimit("999999999999999999999", fallback) === fallback,
-    "SEC9-5/CORR9-1: '999999999999999999999' → fallback (unsafe integer)");
+    "'999999999999999999999' → fallback (unsafe integer)");
   assert(parseConcurrencyLimit("1025", fallback) === fallback,
-    "SEC9-5/CORR9-1: '1025' → fallback (exceeds 1024 cap)");
+    "'1025' → fallback (exceeds 1024 cap)");
   assert(parseConcurrencyLimit("64", fallback) === 64,
-    "SEC9-5/CORR9-1: '64' → 64 (valid, under cap)");
+    "'64' → 64 (valid, under cap)");
   assert(parseConcurrencyLimit("1024", fallback) === 1024,
-    "SEC9-5/CORR9-1: '1024' → 1024 (cap boundary, inclusive)");
+    "'1024' → 1024 (cap boundary, inclusive)");
 }
 
-// --- S3: state file + lockfile created with mode 0600 (no PID leakage) ---
+// --- state file + lockfile created with mode 0600 (no PID leakage) ---
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-"));
   const stateFile = join(dir, "state.json");
@@ -1442,7 +1442,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // The lockfile is transient (released after the critical section), so trigger
   // another mutate to recreate it and snapshot mid-flight. Easiest: pause, which
   // takes the lock and writes the state file. We poll for the lockfile briefly.
-  q.pauseUntil(Date.now() + 1000, "S3 probe");
+  q.pauseUntil(Date.now() + 1000, "mode probe");
   // The lockfile is normally gone by now; create a fresh one by joining a second
   // queue instance and snapshotting while it holds the lock. Simpler: directly
   // exercise acquireLock via a second join+waitForLaunch on a sibling queue and
@@ -1513,8 +1513,8 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(snapB.paused === true, "sibling sees shared paused before /usage catches up");
   assert(snapB.pausedUntil === until, "sibling sees the exact shared deadline");
 
-  // A clears it (force: a 429-origin pause survives a plain clearPause per
-  // CORR4-1; the C2 test asserts the shared-file visibility, so force-clear).
+  // A clears it (force: a 429-origin pause survives a plain clearPause;
+  // the test asserts the shared-file visibility, so force-clear).
   qA.clearPause({ force: true });
   assert(qB.snapshot().paused === false, "sibling sees pause lift when cleared");
 
@@ -1618,7 +1618,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 }
 
 // --- head-waiter-reaped re-insert path (head reaped → re-inserted at tail → next waiter claims first) ---
-// The ADV-4 test covers a TAIL waiter aged past staleWaiterMs (re-inserted,
+// The test covers a TAIL waiter aged past staleWaiterMs (re-inserted,
 // survives). The re-insert path also runs when the HEAD waiter itself is
 // reaped — a deep FIFO where the head waiter's PID is alive but its ts aged
 // past staleWaiterMs because the token holder ran a very long turn. In that
@@ -1702,7 +1702,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // Trigger a writeStateAtomic via a mutate (pause).
   const q = createConcurrencyQueue({ stateFile });
-  q.pauseUntil(Date.now() + 1000, "ADV-1 probe");
+  q.pauseUntil(Date.now() + 1000, "reap probe");
 
   // The stale .tmp must be reaped; the fresh one must survive.
   let staleGone = false;
@@ -1766,7 +1766,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(q.snapshot().queued === 0 && q.snapshot().tokenHeld === false, "disabled: snapshot empty");
 }
 
-// --- reset() does not wipe a sibling's queue state (S1) ---
+// --- reset() does not wipe a sibling's queue state ---
 // reset() must only clear THIS process's own entries; it must not unlink the
 // shared state file (which would drop a sibling pi process's waiters/token).
 {
@@ -2009,7 +2009,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
 // --- reset() while a waiter is mid-waitForLaunch ---
 // reset() clears ourTokenId's entry. A concurrent waitForLaunch poller on the
-// same queue instance re-inserts its waiter (ADV-4) before claiming. Verify
+// same queue instance re-inserts its waiter before claiming. Verify
 // reset() mid-wait doesn't corrupt the state file or strand the poller: the
 // poller either re-inserts + eventually claims, or aborts cleanly.
 {
@@ -2058,7 +2058,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // the throw by removing the state file's parent directory after the first poll,
 // so the next setTimeout(poll) re-entry's mutate -> acquireLock -> openSync throws
 // ENOENT immediately (no busy-spin, no event-loop blocking) — the same throw
-// surface as the ADV4-1 reproduction (acquireLock failure) without the timing
+// surface as the reproduction (acquireLock failure) without the timing
 // fragility of a fresh-mtime toucher (the acquireLock busy-spin blocks the
 // toucher's setInterval, so a toucher-based probe can't keep the mtime fresh).
 {
@@ -2076,7 +2076,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // the Promise executor: it sees the token held by 1, returns false, and arms
   // setTimeout(poll, 50). That first poll does NOT throw (the dir exists), so
   // the rejection we assert below can ONLY come from a setTimeout re-entry —
-  // which is exactly the uncaught-throw path ADV4-1 fixes.
+  // which is exactly the uncaught-throw path being fixed.
   const id2 = q.join()!;
   let rejected = false;
   let errMsg = "";
@@ -2099,13 +2099,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   await p2;
   assert(rejected, "setTimeout(poll) throw rejects the promise (does not crash the process)");
   assert(errMsg.startsWith("concurrency-queue: poll failed:"),
-    `ADV4-1: rejection carries the poll-failed message (got "${errMsg}")`);
+    `rejection carries the poll-failed message (got "${errMsg}")`);
 
   // The cancel in the catch is best-effort: with the parent dir removed, the
   // cancel's own mutate also throws ENOENT and is swallowed, so the waiter entry
   // remains in the (renamed) file. That is acceptable — the entry is inert (the
   // process exited the wait) and the watchdog reaps it via staleWaiterMs. The
-  // cancel-actually-removes-the-entry property is covered by the C4/ADV-5 abort
+  // cancel-actually-removes-the-entry property is covered by the abort
   // tests where the dir is intact; this test proves the crash-prevention core.
 
   rmSync(gone, { recursive: true, force: true });
@@ -2117,14 +2117,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // completes; the mainTurnRelease clear + updateStatus live in a finally so
 // the slot is cleared even on throw (prevents a stuck slot). releaseSlot is
 // a closure in index.ts (not exported) operating on a SINGLE mainTurnRelease
-// slot (CORR5-3 dropped the dead Set+FIFO-by-insertion design). This probe
+// slot (dropped the dead Set+FIFO-by-insertion design). This probe
 // mirrors the actual single-slot shape: assert releaseSlot(release) swallows
 // a throw from release(), clears mainTurnRelease when it matches, and still
 // calls updateStatus in finally. Drops the Set/releaseOldest/"drain terminates"
 // assertions that pinned a contract the production code no longer satisfies.
 {
   type Release = () => void;
-  // Mirror the single-slot shape from index.ts (CORR5-3 + ADV3-1).
+  // Mirror the single-slot shape from index.ts.
   let mainTurnRelease: Release | undefined;
   let updateCount = 0;
   function updateStatus() { updateCount++; }
@@ -2158,7 +2158,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // (2) releaseSlot on a release that does NOT match mainTurnRelease leaves
   // mainTurnRelease intact (a side-call release must not clear the main-turn
-  // slot — CORR5-3 invariant). updateStatus still runs in finally.
+  // slot — invariant). updateStatus still runs in finally.
   const main: Release = () => {};
   const sideCall: Release = () => {};
   mainTurnRelease = main;
@@ -2177,12 +2177,12 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 }
 
 // --- preserve 429-origin tag when priority.low extends pause ---
-// CORR4-1's clearPause guard keys on the reason string (PAUSE_REASON_429).
+// The clearPause guard keys on the reason string (PAUSE_REASON_429).
 // pauseUntil overwrites pausedReason whenever it extends pausedUntil, so a
 // /usage priority.low tick with a longer deadline + a non-null reason (e.g.
 // "Account deprioritized") would wipe the 429 tag — then the next stale
 // priority.low===false tick's clearPause() would clear the pause early,
-// exactly the race CORR4-1 exists to prevent. The 429 tag must stay
+// exactly the race this guard exists to prevent. The 429 tag must stay
 // authoritative; only the deadline extends.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-corr7-1-"));
@@ -2209,7 +2209,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     "429 tag preserved when priority.low extends (not overwritten to Account deprioritized)");
 
   // clearPause() (no force) must NOT clear the pause — the 429 tag is still
-  // authoritative (CORR4-1 protection holds even after the extend).
+  // authoritative (protection holds even after the extend).
   qB.clearPause();
   st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.pausedUntil === untilLow, "429 pause survives a stale clearPause after extend");
@@ -2233,7 +2233,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // --- pi-harness mock for handler-wiring integration ---
 // None of the 11 pi.on(...) handlers was exercised by selfcheck — only the 6
 // pure/extracted seams were. A regression swapping mainTurnRelease for a Set,
-// dropping the ADV2-F2 try/finally, or wiring session_shutdown to NOT call
+// dropping the try/finally, or wiring session_shutdown to NOT call
 // reset() would not be caught. This harness mock constructs a minimal
 // ExtensionAPI stub (on/registerTool/registerCommand/registerProvider) + a
 // stub ctx (model.provider="umans", signal, ui.setWidget/notify, modelRegistry),
@@ -2484,7 +2484,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     const parsed = JSON.parse(raw);
     const ourEntries = (parsed.waiters ?? []).filter((w: any) => w.pid === process.pid).length;
     assert(ourEntries === 0,
-      `CORR8-3: message_end removed our waiter entry (our entries=${ourEntries}, expected 0)`);
+      `message_end removed our waiter entry (our entries=${ourEntries}, expected 0)`);
     probeMid.reset();
     // Dispatch session_shutdown to stop the factory's refresh loop + reset its queue.
     await dispatch("session_shutdown");
@@ -2498,7 +2498,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 }
 
 // --- after_provider_response 429 wiring drives the shared pause through the real factory ---
-// handle429 is unit-tested directly (CORR8-2), but the wiring that calls it
+// handle429 is unit-tested directly, but the wiring that calls it
 // from after_provider_response was never driven through the real factory. Drive
 // a 429 + retry-after: 60 header through the real handler + assert the shared
 // pause lands in the state file (pausedUntil > now, pausedReason === 429 tag).
@@ -2726,7 +2726,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // --- reset() aborts an in-flight waitForLaunch poll loop ---
 // reset() clears ourWaiterIds/ourTokenId + splices entries from the file, but a
 // concurrently-running waitForLaunch poll loop on the same queue instance
-// re-inserts the waiter id at the tail every 50ms (ADV-4's re-insert path)
+// re-inserts the waiter id at the tail every 50ms
 // until the turn's AbortSignal aborts — leaking a dead-PID waiter for
 // staleWaiterMs (5 min) if the process exits first. reset() now aborts a
 // per-instance AbortController composed into waitForLaunch, so the poll stops
@@ -2839,9 +2839,9 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 }
 
 // --- lockfile reclaim relies on the mtime ceiling (PID fast-path dropped) ---
-// Recovery was mtime-only — yanked when now - mtimeMs > lockTimeoutMs. CMP7-1
-// added a PID-based fast-path that read the lockfile content; SEC9-3 dropped
-// that read (TOCTOU between lstatSync + readFileSync). The mtime ceiling is
+// Recovery was mtime-only — yanked when now - mtimeMs > lockTimeoutMs. A
+// PID-based fast-path was added that read the lockfile content; that read was
+// dropped (TOCTOU between lstatSync + readFileSync). The mtime ceiling is
 // now the sole reclaim bound: a stale lockfile is reclaimed regardless of
 // holder PID; a fresh lockfile spins until the ceiling. A malformed/oversized/
 // symlink lockfile is unlinked without being followed.
@@ -2863,7 +2863,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const id = q.join()!;
   const elapsed = Date.now() - t0;
   assert(id !== null, "join reclaims a stale lockfile (mtime ceiling)");
-  assert(elapsed < 1_000, `CMP7-1: stale lockfile reclaim is immediate (no 2s wait) (took ${elapsed}ms)`);
+  assert(elapsed < 1_000, `stale lockfile reclaim is immediate (no 2s wait) (took ${elapsed}ms)`);
   const st = JSON.parse(readFileSync(stateFile, "utf8"));
   assert(st.waiters.length === 1 && st.waiters[0].id === id,
     "stale lockfile reclaimed + mutate wrote through");
@@ -2883,10 +2883,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const id2 = q2.join()!; // spins until the mtime ceiling, then reclaims
   const elapsed2 = Date.now() - t1;
   assert(id2 !== null, "fresh lockfile eventually reclaimed via mtime ceiling");
-  assert(elapsed2 >= 150, `CMP7-1: fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
+  assert(elapsed2 >= 150, `fresh lockfile spun ${elapsed2}ms until mtime ceiling (not immediate)`);
   q2.reset();
 
-  // Malformed lockfile content (not JSON) is not read at all post-SEC9-3; the
+  // Malformed lockfile content (not JSON) is not read at all; the
   // mtime ceiling is the sole bound. A stale mtime + malformed content -> reclaimed.
   writeFileSync(lockFile, "not-json", { mode: 0o600 });
   const staleTime = (Date.now() / 1000) - 10; // 10s ago — past 2s ceiling
@@ -3531,7 +3531,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile });
   let threw = false;
   try {
-    q.pauseUntil(Date.now() + 1_000, "CORR7-5 probe");
+    q.pauseUntil(Date.now() + 1_000, "tmp-dir probe");
   } catch { threw = true; }
   assert(!threw, "mutate does not wedge on a planted .tmp directory");
 
@@ -3572,7 +3572,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // entries before calling process.kill. A future caller bypassing them would
 // pass garbage to process.kill (synchronous TypeError not filtered by catch).
 // Add a defensive typeof/Number.isFinite guard returning true (dead). Also
-// pin the EPERM path (PID 1 on macOS -> alive) to lock CORR2-4.
+// pin the EPERM path (PID 1 on macOS -> alive) to lock the fail-safe.
 {
   assert(isPidDead(NaN) === true, "isPidDead(NaN) -> true (non-finite guarded)");
   assert(isPidDead(Infinity) === true, "isPidDead(Infinity) -> true (non-finite guarded)");
@@ -3581,10 +3581,10 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   assert(isPidDead(0) === true, "isPidDead(0) -> true (falsy)");
   assert(isPidDead(-1) === true, "isPidDead(-1) -> true (non-positive)");
   // EPERM path: PID 1 (init/launchd) exists but we lack permission to signal
-  // it -> treat as alive (CORR2-4 fail-safe). On macOS/Linux PID 1 is always
+  // it -> treat as alive (fail-safe). On macOS/Linux PID 1 is always
   // present; on Windows this is a no-op best-effort.
   if (process.platform !== "win32") {
-    assert(isPidDead(1) === false, "isPidDead(1) -> false (EPERM -> alive, CORR2-4 fail-safe)");
+    assert(isPidDead(1) === false, "isPidDead(1) -> false (EPERM -> alive, fail-safe)");
   }
 }
 
@@ -3759,7 +3759,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const release = await q.waitForLaunch(id);
   release();
   const stateMode = statSync(stateFile).mode & 0o777;
-  assert(stateMode === 0o600, `SEC7-5: state file mode is 0600 (got 0o${stateMode.toString(8)})`);
+  assert(stateMode === 0o600, `state file mode is 0600 (got 0o${stateMode.toString(8)})`);
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -3782,7 +3782,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // writeStateAtomic must succeed — it uses a DIFFERENT name (with random suffix).
   const q = createConcurrencyQueue({ stateFile });
   let threw = false;
-  try { q.pauseUntil(Date.now() + 1_000, "ADV7-1 probe"); } catch { threw = true; }
+  try { q.pauseUntil(Date.now() + 1_000, "rename probe"); } catch { threw = true; }
   assert(!threw, "writeStateAtomic succeeds despite a leftover at the old per-pid name (random suffix)");
 
   // The leftover at the old name must be untouched (writeStateAtomic used a
@@ -3819,18 +3819,18 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 
   // Trigger one mutate (pause) — reapStaleTmps must unlink at most 100.
   const q = createConcurrencyQueue({ stateFile });
-  q.pauseUntil(Date.now() + 1_000, "ADV7-2 probe");
+  q.pauseUntil(Date.now() + 1_000, "reap-batch probe");
 
   // Count remaining .tmp files.
   const remaining = readdirSync(dir).filter((n: string) => n.startsWith(`${"state.json"}.`) && n.endsWith(".tmp"));
   assert(remaining.length === 100,
-    `ADV7-2: reapStaleTmps unlinked exactly 100 of 200 stale .tmp files (left ${remaining.length}, expected 100)`);
+    `reapStaleTmps unlinked exactly 100 of 200 stale .tmp files (left ${remaining.length}, expected 100)`);
 
   // A second mutate unlinks the rest.
-  q.pauseUntil(Date.now() + 2_000, "ADV7-2 probe 2");
+  q.pauseUntil(Date.now() + 2_000, "reap-batch probe 2");
   const remaining2 = readdirSync(dir).filter((n: string) => n.startsWith(`${"state.json"}.`) && n.endsWith(".tmp"));
   assert(remaining2.length === 0,
-    `ADV7-2: second mutate unlinks the remaining 100 stale .tmp files (left ${remaining2.length})`);
+    `second mutate unlinks the remaining 100 stale .tmp files (left ${remaining2.length})`);
 
   q.reset();
   rmSync(dir, { recursive: true, force: true });
@@ -3853,7 +3853,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const q = createConcurrencyQueue({ stateFile });
   let threw = false;
   try {
-    q.pauseUntil(Date.now() + 1_000, "ADV10-2 probe");
+    q.pauseUntil(Date.now() + 1_000, "rename-fail probe");
   } catch {
     threw = true;
   }
@@ -3861,14 +3861,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   // No .tmp file may be left on disk (the catch unlinked it before re-throwing).
   const leftover = readdirSync(dir).filter((n: string) => n.endsWith(".tmp"));
   assert(leftover.length === 0,
-    `ADV10-2: no .tmp leaked on renameSync failure (left ${leftover.length} .tmp file(s))`);
+    `no .tmp leaked on renameSync failure (left ${leftover.length} .tmp file(s))`);
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
 
 // --- reapStaleTmps uses lstatSync (symlink .tmp unlinked, not followed) ---
 // A symlink .tmp → /etc/passwd must be unlinked directly without following the
-// link (matching the lockfile's SEC7-1 posture). lstatSync detects non-regular
+// link (matching the lockfile's posture). lstatSync detects non-regular
 // files; unlinkSync removes the symlink itself, leaving the target untouched.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-sec8-2-"));
@@ -3884,13 +3884,13 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const stale = (Date.now() / 1000) - 10_000;
   lutimesSync(tmpPath, stale, stale);
   const q = createConcurrencyQueue({ stateFile });
-  q.pauseUntil(Date.now() + 1_000, "SEC8-2 probe");
+  q.pauseUntil(Date.now() + 1_000, "symlink-tmp probe");
   // The symlink .tmp must be gone (unlinked, not followed).
   let symlinkGone = false;
   try { lstatSync(tmpPath); } catch { symlinkGone = true; }
-  assert(symlinkGone, "SEC8-2/SEC9-6: symlink .tmp unlinked (not followed)");
+  assert(symlinkGone, "symlink .tmp unlinked (not followed)");
   // The target must be untouched.
-  assert(readFileSync(target, "utf8") === "secret", "SEC8-2/SEC9-6: symlink target untouched");
+  assert(readFileSync(target, "utf8") === "secret", "symlink target untouched");
   q.reset();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -3978,7 +3978,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
     assert(emptyNote!.msg.includes("paused"), "no-args status notify mentions paused");
 
     // (c) reset: clearPause({force:true}) + reset() — must clear the 429 pause
-    // (the force branch is the only caller that overrides CORR4-1's 429 guard)
+    // (the force branch is the only caller that overrides the 429 guard)
     // + drop this process's own waiter/token entry.
     notifications.length = 0;
     await cmd.handler("reset", makeCtx());
@@ -4159,7 +4159,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // (umans_web_search, umans_vision) were never driven through the real factory —
 // the harness mocked registerTool as a no-op. A regression dropping acquireSlot
 // from searchWeb/analyzeImage, or assigning side-call's release to
-// mainTurnRelease (ADV4-3/CORR5-3 invariant) would not be caught. CORR8-2
+// mainTurnRelease (invariant) would not be caught. Side-call-429
 // side-call-429 wiring tested at helper level but call sites not driven.
 // Fix: capture tool defs in registerTool, dispatch umans_web_search's execute
 // with stubbed fetch 200 (assert acquire+release — token not held after) and
@@ -5117,9 +5117,9 @@ if (process.platform !== "win32") {
 
 // --- acquireLock opens a zero-byte O_EXCL sentinel (no writeFileSync) ---
 // acquireLock previously did openSync(lockFile, "wx") then writeFileSync(fd,
-// {pid}). CORR11-1 wrapped the writeFileSync in try/catch to close fd + unlink
-// the lockfile on throw. SEC13-2 dropped the PID write entirely (dead code —
-// the read-back was dropped in SEC9-3, so the PID was never read back). The
+// {pid}). The writeFileSync was wrapped in try/catch to close fd + unlink
+// the lockfile on throw. The PID write was dropped entirely (dead code —
+// the read-back was dropped, so the PID was never read back). The
 // lockfile is now a zero-byte O_EXCL sentinel; no writeFileSync follows the
 // openSync, so there is no throw to catch + no fd to leak. The mtime ceiling
 // is the sole authoritative reclaim bound. Pin the new structure.
@@ -5442,7 +5442,7 @@ if (process.platform !== "win32") {
 // near-future-dated lockfile (small NTP skew) was NOT reclaimed. The fix
 // reclaims ANY future-dated mtime (st.mtimeMs > cfg.now()).
 {
-  // Test 1: far-future (1h) — the original ADV12-1 case.
+  // Test 1: far-future (1h) — the original case.
   const tmp1 = `/tmp/adv12-1-far-${process.pid}-${Date.now()}`;
   try {
     const stateFile = `${tmp1}/state.json`;
@@ -5470,7 +5470,7 @@ if (process.platform !== "win32") {
   } finally {
     try { rmSync(tmp1, { recursive: true, force: true }); } catch { /* ignore */ }
   }
-  // Test 2: near-future (30s) — the SEC13-1 gap case.
+  // Test 2: near-future (30s) — the gap case.
   const tmp2 = `/tmp/sec13-1-near-${process.pid}-${Date.now()}`;
   try {
     const stateFile = `${tmp2}/state.json`;
@@ -5489,8 +5489,8 @@ if (process.platform !== "win32") {
       pid: () => process.pid,
     };
     const q = createConcurrencyQueue(cfg);
-    // Before SEC13-1, this threw "timed out acquiring lock" because 30s is
-    // in the old 1-60s gap (not >60s, not <now). After SEC13-1, any future
+    // Before the fix, this threw "timed out acquiring lock" because 30s is
+    // in the old 1-60s gap (not >60s, not <now). After the fix, any future
     // mtime is reclaimed.
     const id = q.join();
     assert(typeof id === "string" && id.length > 0,
@@ -5504,14 +5504,14 @@ if (process.platform !== "win32") {
 }
 
 // --- readFileSync import removed from concurrency-queue.ts (dead) ---
-// SEC9-3 dropped the PID-based fast-path (the only readFileSync call site).
+// The PID-based fast-path was dropped (the only readFileSync call site).
 // The dead import is misleading + trips stricter configs/linters.
 {
   const src = readFileSync("concurrency-queue.ts", "utf8");
   // The import line must NOT include readFileSync.
   const importLine = src.match(/import\{[^}]*\}from"node:fs"/)?.[0] ?? src.split("\n").find((l) => l.includes('from "node:fs"')) ?? "";
   assert(!importLine.includes("readFileSync"),
-    "readFileSync removed from concurrency-queue.ts import (dead after SEC9-3)");
+    "readFileSync removed from concurrency-queue.ts import (dead)");
   // Sanity: readFileSync should not appear as a call (only in comments is OK).
   const calls = src.replace(/\/\/.*$/gm, "").match(/readFileSync\(/g);
   assert(calls === null,
@@ -5538,10 +5538,10 @@ if (process.platform !== "win32") {
 
 // --- before_provider_request wraps acquireSlot in try/catch (fail-open on lock/disk error) ---
 // acquireSlot calls join() → mutate → acquireLock, which can throw on lock
-// timeout (ADV12-1 future-dated mtime), EACCES/ENOSPC/EROFS/ENOENT. Without a
+// timeout (future-dated mtime), EACCES/ENOSPC/EROFS/ENOENT. Without a
 // catch, the throw propagates out of before_provider_request as an unhandled
 // extension error, breaking every Umans turn. Fail-open ungated (proceed without
-// a release fn), matching the /usage-unreachable stance + ADV-3 poll-timeout.
+// a release fn), matching the /usage-unreachable stance + poll-timeout.
 {
   const src = readFileSync("index.ts", "utf8");
   // Find the before_provider_request handler's acquireSlot call.
