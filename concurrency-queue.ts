@@ -244,12 +244,8 @@ export const PAUSE_REASON_STRIKES = "429 strike limit approached";
 export const PAUSE_REASON_403_BRIDGE = "HTTP 403 bridge (awaiting body)";
 
 /**
- * Duration of the main-turn 403 bridge pause (5s). The bridge backs siblings
- * off only until the request body streams + the message_end handler
- * reconciles the pause against the real body. A stale /v1/usage tick can
- * also clear it (non-sticky). 5s comfortably exceeds the body-stream lag for a
- * 403 error response (the server returns the error body promptly) without
- * serializing siblings behind a 30s sticky pause on an unrelated auth 403.
+ * Duration of the main-turn 403 bridge pause (5s). See PAUSE_REASON_403_BRIDGE
+ * for the bound rationale (body-stream lag for a 403 error response).
  */
 export const PAUSE_403_BRIDGE_MS = 5_000;
 
@@ -318,14 +314,8 @@ export function extractBoxedUntil(body: string): number | undefined {
       (parsed as { boxed_until?: unknown }).boxed_until,
       (parsed as { error?: { boxed_until?: unknown } }).error?.boxed_until,
     ];
-    // Collect ALL future candidates + return the MAXIMUM (symmetric with the
-    // regex-fallback path below). A past boxed_until is treated as absent:
-    // pauseUntil early-returns on a past deadline, so without the `ms > now`
-    // guard a past value would silently disable the pause + re-arm the
-    // cascade. A max-reduction (rather than first-future) is fail-safe: a
-    // body with a top-level boxed_until (earlier future) + an error.boxed_until
-    // (the real later deadline) returns the later deadline, so siblings do
-    // not launch into the still-suspended account after the shorter pause.
+    // candidates = [top-level boxed_until, error.boxed_until]; see the JSDoc
+    // for the max-future + past-as-absent rationale.
     let latest: number | undefined;
     for (const b of candidates) {
       const ms = toEpochMs(b);
@@ -335,18 +325,9 @@ export function extractBoxedUntil(body: string): number | undefined {
     }
     if (latest !== undefined) return latest;
   }
-  // Iterate EVERY ISO timestamp in the body, returning the LATEST FUTURE one
-  // (the maximum). A past reference before the future deadline (e.g.
-  // `account_suspended from <past> until <future>`) must not mask the real
-  // deadline: the past match fails the `t > now` guard + is skipped. Using
-  // matchAll (requires the `g` flag on the regex) instead of match (which
-  // returns only the FIRST match). Returning the MAXIMUM future timestamp
-  // (rather than the first) is fail-safe: a longer pause over-pauses on
-  // bodies carrying multiple future timestamps (siblings wait longer, no
-  // cascade), while a shorter pause is fail-dangerous (siblings launch into
-  // a still-suspended account after the shorter pause elapses). The
-  // structured-JSON path above is authoritative when present; this regex is
-  // a fallback for prose-only bodies without a JSON boxed_until field.
+  // Regex fallback for prose-only bodies. matchAll (not match) iterates every
+  // ISO timestamp — requires the `g` flag on ISO_TIMESTAMP_RE. See the JSDoc
+  // for the max-future + past-as-absent rationale.
   let latest: number | undefined;
   for (const m of body.matchAll(ISO_TIMESTAMP_RE)) {
     const t = Date.parse(m[0]);
@@ -509,16 +490,14 @@ interface CapacitySnapshot {
  * Inputs to the capacity decision: the effective concurrency cap (env override
  * or the live /usage value), whether the shared pausedUntil is active, + the
  * local in-flight count (requests launched-but-not-completed on THIS machine).
- * localInFlight is passed IN by the caller (capacityFree reads it via
- * snapshot().inflightCount) so isCapacityFree stays a pure decision with no I/O
- * — the existing selfcheck suite constructs a CapacitySnapshot inline + asserts
- * the decision without a state file, + a readState inside the 300ms poll loop
- * would be a slow operation in a hot path.
+ * localInFlight is passed IN (read via snapshot().inflightCount) so
+ * isCapacityFree stays a pure decision with no I/O — selfcheck constructs a
+ * CapacitySnapshot inline + asserts the decision without a state file.
  */
 interface CapacityInputs {
   limit: number | undefined;
   queuePaused: boolean;
-  /** Local in-flight count (passed IN, not read inside). See CapacityInputs doc. */
+  /** Local in-flight count (passed IN, not read inside). */
   localInFlight?: number;
 }
 
@@ -1464,21 +1443,11 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
 
     clearPause(opts?: { force?: boolean }): void {
       mutate((now, state) => {
-        // /v1/usage LAGS a real suspension by 1-5s. A stale 5s
-        // refreshUsage tick reporting priority.low===false would wipe a
-        // freshly-written sticky pause, letting the next waiter launch into
-        // the still-suspended account + re-trip the cascade the pause exists
-        // to prevent. Refuse to clear ANY pause tagged with a sticky reason
-        // (PAUSE_REASON_429 / PAUSE_REASON_CAP_ABUSE / PAUSE_REASON_STRIKES)
-        // unless forced — the pause survives until it naturally elapses
-        // (reapStale/pausedUntil<=now) OR /usage reports priority.low===true
-        // (refreshUsage only calls clearPause on the low===false branch, so a
-        // sticky pause set by a sibling survives the stale tick; the writer's
-        // OWN refreshUsage clears it only after its own /usage catches up to
-        // priority.low===true then back to false). The STICKY_PAUSE_REASONS
-        // set makes the guard symmetric across 429 + cap_abuse + strike
-        // reasons (the prior hardcoded PAUSE_REASON_429 check left the new
-        // cap_abuse reason uncovered, re-arming the incident cascade).
+        // Refuse to clear a sticky-origin pause (see STICKY_PAUSE_REASONS)
+        // unless forced. /v1/usage lags a real suspension by 1-5s, so a stale
+        // low===false tick would wipe a freshly-written sticky pause. The
+        // writer's OWN refreshUsage clears it only after its own /usage catches
+        // up to priority.low===true then back to false.
         if (!opts?.force && state.pausedReason && STICKY_PAUSE_REASONS.has(state.pausedReason) && state.pausedUntil > now) {
           return; // keep the sticky-origin pause
         }

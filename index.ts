@@ -641,22 +641,12 @@ export async function raiseForUmansStatus(
   // consumed once; reading it again returns "". The 403 suspend-body check
   // + the sanitizeErrorBody call below both operate on this same string.
   const txt = await res.text().catch(() => "");
-  // 403 account_suspended / cap_abuse: the Umans server escalates from
-  // deprioritization (priority.low + 429s) to a full account suspension by
-  // returning HTTP 403 with a body indicating account_suspended / cap_abuse
-  // / cap_suspended / billing_error (the 403 is the HTTP symptom of the same
-  // underlying cap_abuse suspension the /v1/usage priority.reason=cap_abuse
-  // branch detects). Treat it like a 429: extract the boxed_until deadline
-  // from the body + push the shared cap_abuse pause so sibling pi processes
-  // back off instead of launching into the 403 wall + cascading.
-  // a 403 WITHOUT a suspend-family body (an auth error, a proxy HTML
-  // page, an IP-allowlist rejection) does NOT push a pause — the turn still
-  // throws, but the shared gate is not poisoned for siblings.
-  // boxed_until is tolerant — a structured JSON field, an ISO
-  // timestamp embedded in the error message string, or absent (→ 30s floor).
-  // A PAST boxed_until is treated as absent so a crafted/stale past value
-  // does not silently disable the pause (pauseUntil early-returns on a past
-  // deadline, re-arming the cascade).
+  // 403 suspend-family body (account_suspended / cap_abuse / cap_suspended /
+  // billing_error) → treat like a 429: extractBoxedUntil + push
+  // PAUSE_REASON_CAP_ABUSE so siblings back off. isSuspendBody gates; a
+  // non-suspend 403 (auth error, proxy HTML) does NOT pause — the turn still
+  // throws, but the gate is not poisoned for siblings. See extractBoxedUntil
+  // for the tolerant-extraction + past-as-absent rationale.
   if (res.status === 403 && concurrencyQueue && isSuspendBody(txt)) {
     const now = Date.now();
     const extracted = extractBoxedUntil(txt);
@@ -1173,17 +1163,11 @@ export default async function (pi: ExtensionAPI) {
         },
       });
       if (!res.ok) {
-        // a 403 FROM /v1/usage itself is a POSITIVE suspension signal,
-        // not an absence of signal. The Umans server returns 403
-        // account_suspended / cap_abuse for everything once the account is
-        // suspended — including /v1/usage. The prior fail-open (return null
-        // → isCapacityFree(null) → {free:true}) would launch every queued
-        // waiter into the 403 wall, re-arming the cascade D10 exists to
-        // prevent. Detect the suspend family in the body + return a
-        // synthetic usage object with priority.low=true + reason=cap_abuse
-        // so the cap_abuse branch (isCapacityFree) fires + pushes the real
-        // pause. A 403 WITHOUT a suspend body (an auth error on /usage
-        // itself) keeps the fail-open stance (return null).
+        // a 403 FROM /v1/usage is a POSITIVE suspension signal, not absence —
+        // the server returns 403 for everything once the account is suspended.
+        // Return a synthetic priority.low + reason=cap_abuse snapshot so the
+        // cap_abuse branch in isCapacityFree fires + pushes the real pause.
+        // A non-suspend 403 (auth error on /usage) keeps fail-open (return null).
         if (res.status === 403) {
           const txt = await res.text().catch(() => "");
           if (isSuspendBody(txt)) {
@@ -1220,15 +1204,10 @@ export default async function (pi: ExtensionAPI) {
   // strikes from before the most recent cap_suspended bucket — matching the
   // dashboard's behavior so our count stays accurate after a reactivation.
   //
-  // Returns a typed result so the caller can distinguish a SUSPEND-403 (the
-  // server returns 403 for /history too once the account is suspended — clear
-  // the cached count, the status bar should not show a stale "Strikes 19/20"
-  // for the full 5h) from a TRANSIENT failure (network timeout, 5xx, JSON
-  // parse error — preserve the cached count so a single blip does not lose the
-  // strike count + skip the defensive self-pause for the 5min poll interval).
-  // The prior code returned null on ANY failure + the caller wiped the cache,
-  // so a 2s DNS hiccup during an approach-to-threshold would lose the count +
-  // skip the self-pause right when it mattered most.
+  // Returns a typed result: suspend-403 (server returns 403 for /history too
+  // once suspended — clear the cached count so the bar shows no stale
+  // "Strikes 19/20" for 5h) vs transient failure (preserve the cached count so
+  // a blip does not skip the self-pause).
   async function fetch429Strikes(apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
     const now = Date.now();
     const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
@@ -1293,15 +1272,9 @@ export default async function (pi: ExtensionAPI) {
     const data = await fetchUsage(apiKey, 5000);
     if (!data) return; // leave cached values; status bar will show "?"
     // The synthetic cap_abuse return (fetchUsage on a /v1/usage 403 with a
-    // suspend body) carries no `limits` field — only usage + priority. Skip
-    // the limits-derived assignments so the cached guaranteedConcurrency /
-    // requestLimit are preserved for the full suspension window. Without this
-    // guard, the synthetic object would wipe guaranteedConcurrency to
-    // undefined (data.limits?.concurrency?.limit ?? undefined evaluates to
-    // undefined when data.limits is absent), hiding the concurrency limit
-    // display during a suspension + deflating isCapacityFree's baseCap to
-    // undefined (gating still holds because the cap_abuse branch fires before
-    // the cap check, but a future reason=rate_limited synthetic would not).
+    // suspend body) carries no `limits` field. Skip the limits assignments so
+    // the cached guaranteedConcurrency / requestLimit are preserved for the
+    // suspension window (otherwise they wipe to undefined).
     if (data.limits) {
       // null ?? undefined normalizes unlimited (null) limits so the display
       // guards below hide them instead of rendering "x/null".
@@ -1322,14 +1295,10 @@ export default async function (pi: ExtensionAPI) {
     const priority = parsePriority(data.usage?.priority);
     deprioritized = priority.low;
     priorityUntil = priority.until;
-    // Only clear a pause that was pushed by a PREVIOUS priority.low tick —
-    // don't clear a sticky-origin pause (429 / cap_abuse / strike — those have
-    // their own deadlines + must not be wiped by a stale /usage tick reporting
-    // low===false before the server catches up). CORR4-1: the sticky tag set
-    // survives this clear. The cap_abuse reason is now covered symmetrically
-    // (the prior hardcoded PAUSE_REASON_429 + PAUSE_REASON_STRIKES check left
-    // it uncovered, re-arming the incident cascade when a stale /usage tick
-    // arrived 1-5s after a 403/cap_abuse pause was written).
+    // Only clear a pause pushed by a PREVIOUS priority.low tick — don't
+    // clear a sticky-origin pause (see STICKY_PAUSE_REASONS); a stale /usage
+    // tick reporting low===false before the server catches up must not wipe
+    // a freshly-written 429 / cap_abuse / strike pause.
     if (!priority.low) {
       const snap = concurrencyQueue.snapshot();
       if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
@@ -1455,11 +1424,8 @@ export default async function (pi: ExtensionAPI) {
         // blip not yet reflected in /usage). Without this, process B would see
         // priority.low === false and launch right into the 429 that A just hit.
         const snap = await fetchUsageSnapshot(apiKey, signal);
-        // pass localInFlight IN via CapacityInputs (not read inside
-        // isCapacityFree) so the pure decision stays pure + the selfcheck
-        // suite constructs a CapacitySnapshot inline without a state file.
-        // snapshot() calls reapStale, so inflightCount is the post-reap count
-        // (dead-PID + >120s entries removed).
+        // pass localInFlight IN (see CapacityInputs) so isCapacityFree stays
+        // pure. snapshot() calls reapStale, so inflightCount is the post-reap count.
         const qSnap = concurrencyQueue.snapshot();
         const decision = isCapacityFree(snap, {
           limit,
@@ -2179,23 +2145,10 @@ export default async function (pi: ExtensionAPI) {
         "warning",
       );
     }
-    // 403 bridge pause. The pi after_provider_response event carries status
-    // + headers but NO body (the body has not streamed yet at headers time),
-    // so isSuspendBody cannot gate here + the boxed_until deadline carried in
-    // a 403 suspend-family body is unreachable. Push a SHORT non-sticky bridge
-    // tagged PAUSE_REASON_403_BRIDGE (NOT in STICKY_PAUSE_REASONS) so siblings
-    // back off immediately without poisoning the gate for an unrelated 403
-    // (an auth error, a proxy HTML page). The bridge is cleared two ways: (a) a
-    // stale /v1/usage tick reporting priority.low===false clears it (non-sticky
-    // means clearPause does not refuse); (b) the message_end handler
-    // reconciles it against the real body once the stream completes — pushing
-    // the sticky PAUSE_REASON_CAP_ABUSE pause if the body is a suspend family,
-    // or clearing the bridge if it is not. The /v1/usage cap_abuse branch
-    // (isCapacityFree) remains the authoritative signal + extends the pause
-    // to the real boxed_until once /usage catches up. The side-call path
-    // (raiseForUmansStatus) body-checks before pausing; this main-turn path
-    // cannot, so the bridge + message_end reconciliation narrow the
-    // false-positive blast radius.
+    // 403 bridge: the body is unavailable at headers time, so push the
+    // non-sticky PAUSE_REASON_403_BRIDGE (see the const) + reconcile at
+    // message_end. The side-call path body-checks before pausing; this main-turn
+    // path cannot, so the bridge narrows the false-positive blast radius.
     if (event.status === 403) {
       const until = Date.now() + PAUSE_403_BRIDGE_MS;
       try {
@@ -2280,28 +2233,14 @@ export default async function (pi: ExtensionAPI) {
     // so the "release only on an Umans assistant message" invariant is unit-
     // testable. User messages, tool results, and non-Umans providers are no-ops.
     if (!shouldReleaseOnMessageEnd(msg, msg?.provider ?? ctx.model?.provider)) return;
-    // 403 bridge reconciliation. The after_provider_response 403 handler pushed
-    // a SHORT non-sticky PAUSE_REASON_403_BRIDGE because the body had not
-    // streamed yet at headers time. Now the body has streamed, so the robust
-    // paths that read the FULL body have already had a chance to fire + push
-    // the real sticky PAUSE_REASON_CAP_ABUSE pause with the extracted
-    // boxed_until: (a) the side-call raiseForUmansStatus path (reads the raw
-    // body via await res.text() before sanitization), + (b) the /v1/usage
-    // cap_abuse branch (reads the full body). This reconciliation's sole job
-    // is to clear the non-sticky bridge so it does not linger for the full 5s
-    // after a non-suspend 403 (an auth error, a proxy HTML page). It does NOT
-    // re-derive the suspension state from the assistant message's
-    // errorMessage — that prose is the Anthropic-SDK-parsed `error.message`
-    // with sibling fields (e.g. boxed_until) dropped, so it is an unreliable
-    // signal for suspension classification. A plain clearPause (no force)
-    // clears the non-sticky bridge but refuses to clear a sticky pause
-    // (PAUSE_REASON_CAP_ABUSE / 429 / STRIKES) that a sibling's /usage
-    // cap_abuse branch may have pushed in the window between the snapshot
-    // read and the clear — the sticky guard runs inside the mutate lock, so
-    // the race is safe. The snapshot pre-check (pausedReason ===
-    // PAUSE_REASON_403_BRIDGE) is a cheap avoid-the-write optimization; if a
-    // sibling already flipped the pause to a sticky cap_abuse pause, the
-    // snapshot shows that reason and the clear is skipped entirely.
+    // 403 bridge reconciliation: clear the lingering non-sticky bridge now
+    // that the body has streamed. The sticky guard inside clearPause's mutate
+    // lock prevents wiping a sibling's PAUSE_REASON_CAP_ABUSE pause that may
+    // have landed in the window. The snapshot pre-check (reason ===
+    // PAUSE_REASON_403_BRIDGE) is a cheap avoid-the-write skip. This handler
+    // does NOT re-derive suspension from the assistant message's errorMessage
+    // — that prose is the SDK-parsed `error.message` with sibling fields (e.g.
+    // boxed_until) dropped, so it is an unreliable signal for suspension.
     if (!concurrencyDisabled && msg?.stopReason === "error" && typeof msg?.errorMessage === "string") {
       const snap = concurrencyQueue.snapshot();
       if (snap.paused && snap.pausedReason === PAUSE_REASON_403_BRIDGE) {
