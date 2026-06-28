@@ -226,6 +226,34 @@ export const PAUSE_REASON_CAP_ABUSE = "account cap_abuse suspension";
 export const PAUSE_REASON_STRIKES = "429 strike limit approached";
 
 /**
+ * Reason tag written by the main-turn after_provider_response 403 handler as
+ * a SHORT non-sticky bridge. The pi after_provider_response event carries
+ * status + headers but NO body (the body has not streamed yet at headers
+ * time), so the boxed_until deadline carried in a 403 suspend-family body is
+ * unreachable here. A non-sticky bridge backs siblings off immediately
+ * without poisoning the gate for an unrelated 403 (an auth error, a proxy HTML
+ * page): it is NOT in STICKY_PAUSE_REASONS, so a stale /v1/usage tick
+ * reporting priority.low===false clears it, and the message_end handler
+ * reconciles it against the real body once the stream completes — pushing
+ * the sticky PAUSE_REASON_CAP_ABUSE pause if the body is a suspend family,
+ * or clearing the bridge if it is not. The bridge is bounded by
+ * PAUSE_403_BRIDGE_MS (5s): long enough for the body to stream + the
+ * message_end reconciliation to run, short enough that an unrelated 403
+ * does not serialize siblings beyond a brief blip.
+ */
+export const PAUSE_REASON_403_BRIDGE = "HTTP 403 bridge (awaiting body)";
+
+/**
+ * Duration of the main-turn 403 bridge pause (5s). The bridge backs siblings
+ * off only until the request body streams + the message_end handler
+ * reconciles the pause against the real body. A stale /v1/usage tick can
+ * also clear it (non-sticky). 5s comfortably exceeds the body-stream lag for a
+ * 403 error response (the server returns the error body promptly) without
+ * serializing siblings behind a 30s sticky pause on an unrelated auth 403.
+ */
+export const PAUSE_403_BRIDGE_MS = 5_000;
+
+/**
  * The set of pause reasons that a stale /v1/usage tick reporting
  * priority.low===false must NOT clear. /v1/usage LAGS a real suspension by
  * 1-5s (the same lag CORR4-1 defends for 429s), so a stale-low===false tick

@@ -25,6 +25,8 @@ import {
   PAUSE_REASON_429,
   PAUSE_REASON_CAP_ABUSE,
   PAUSE_REASON_STRIKES,
+  PAUSE_REASON_403_BRIDGE,
+  PAUSE_403_BRIDGE_MS,
   STICKY_PAUSE_REASONS,
   MAX_PAUSE_429_MS,
   PRIORITY_BACKOFF_MS,
@@ -5912,12 +5914,17 @@ if (process.platform !== "win32") {
     "Adv1: /v1/usage 403 with unrelated body → isSuspendBody false (fail-open, returns null)");
 }
 
-// --- after_provider_response 403 bridge pause (C2: no body access on main-turn path) ---
+// --- after_provider_response 403 bridge pause (C1/ADV-2/SB-1: non-sticky bridge) ---
 // The pi after_provider_response event carries status + headers but NO body
-// (the body has not streamed yet at headers time), so the boxed_until deadline
-// carried in the 403 error body is unreachable here. Push a 30s bridge pause
-// tagged PAUSE_REASON_CAP_ABUSE so siblings back off immediately; the real 5h
-// deadline is pushed by the /v1/usage cap_abuse branch once /usage catches up.
+// (the body has not streamed yet at headers time), so isSuspendBody cannot
+// gate here + the boxed_until deadline is unreachable. Push a SHORT non-sticky
+// PAUSE_REASON_403_BRIDGE (NOT in STICKY_PAUSE_REASONS) so an unrelated 403
+// (auth error, proxy page) does not poison the gate: a stale /v1/usage tick
+// reporting priority.low===false clears it, + the message_end handler
+// reconciles it against the real body once the stream completes. The bridge
+// is bounded by PAUSE_403_BRIDGE_MS (5s) — long enough for the body to stream
+// + the reconciliation to run, short enough that an unrelated 403 does not
+// serialize siblings beyond a brief blip.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-403-bridge-"));
   const stateFile = join(dir, "state.json");
@@ -5974,19 +5981,141 @@ if (process.platform !== "win32") {
     await umansFactory(pi as any);
     const before = Date.now();
     await dispatch("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
-    // The 30s bridge pause must have landed in the state file.
+    // The 5s non-sticky bridge pause must have landed in the state file.
     const raw = readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw);
-    assert(parsed.pausedUntil > before, "C2: after_provider_response 403 set a bridge pausedUntil > now");
-    assert(parsed.pausedReason === PAUSE_REASON_CAP_ABUSE,
-      "C2: 403 bridge pause tagged PAUSE_REASON_CAP_ABUSE (single tag, C9)");
+    assert(parsed.pausedUntil > before, "C1: after_provider_response 403 set a bridge pausedUntil > now");
+    assert(parsed.pausedReason === PAUSE_REASON_403_BRIDGE,
+      "C1: 403 bridge pause tagged PAUSE_REASON_403_BRIDGE (non-sticky, not cap_abuse)");
+    assert(!STICKY_PAUSE_REASONS.has(PAUSE_REASON_403_BRIDGE),
+      "C1: PAUSE_REASON_403_BRIDGE is NOT in STICKY_PAUSE_REASONS (clearable by stale /usage tick)");
     const pauseSec = Math.round((parsed.pausedUntil - Date.now()) / 1000);
-    assert(pauseSec >= 25 && pauseSec <= 30,
-      `C2: 403 bridge pause is ~30s (PRIORITY_BACKOFF_MS floor), pause ~${pauseSec}s`);
-    // The user must be notified.
-    assert(notifications.some((n) => n.msg.includes("403") && n.msg.includes("account suspended")),
-      "C2: 403 bridge pause notifies the user");
+    assert(pauseSec >= 1 && pauseSec <= 5,
+      `C1: 403 bridge pause is ~5s (PAUSE_403_BRIDGE_MS), pause ~${pauseSec}s`);
+    // The notify message must be accurate (possible suspension, not asserted).
+    assert(notifications.some((n) => n.msg.includes("403") && n.msg.includes("possible suspension")),
+      "C1: 403 bridge pause notifies with accurate 'possible suspension' message");
+    // The bridge is non-sticky: clearPause (without force) must clear it.
+    // This is what a stale /v1/usage tick reporting priority.low===false does.
+    const q = createConcurrencyQueue({ stateFile });
+    q.clearPause();
+    const cleared = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(cleared.pausedUntil === 0 && cleared.pausedReason === null,
+      "C1: non-sticky bridge is clearable by a plain clearPause (no force needed)");
     await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- message_end 403 reconciliation: suspend body → sticky cap_abuse pause (C1/ADV-2/SB-1/COV-F7) ---
+// after_provider_response pushed a 5s non-sticky bridge. message_end fires
+// once the body streams; the assistant message's errorMessage carries the
+// sanitized body text. If the body is a suspend family, push the real sticky
+// PAUSE_REASON_CAP_ABUSE pause with the extracted boxed_until (extend-never-
+// shorten holds vs the 5s bridge). If the body is NOT a suspend family (an
+// auth error), clear the bridge so an unrelated 403 does not serialize siblings.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-403-reconcile-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    // (a) Suspend body: message_end must push the sticky cap_abuse pause.
+    await umansFactory(pi as any);
+    const futureDeadline = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    const suspendBody = `HTTP 403: {"error":{"type":"account_suspended","boxed_until":"${futureDeadline}"}}`;
+    await dispatch("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
+    let st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
+      "C1-reconcile setup: after_provider_response pushed the non-sticky bridge");
+    await dispatch("message_end", {
+      type: "message_end",
+      message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: suspendBody, content: [] },
+    });
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE,
+      "C1: message_end with suspend body pushes the sticky PAUSE_REASON_CAP_ABUSE pause");
+    assert(st.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+      "C1: message_end cap_abuse pause uses the extracted boxed_until (~3h, not the 5s bridge)");
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+
+    // (b) Non-suspend (auth) body: message_end must clear the bridge.
+    rmSync(stateFile, { force: true });
+    const handlers2 = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi2: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers2.has(event)) handlers2.set(event, []);
+        handlers2.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    async function dispatch2(event: string, payload: any): Promise<void> {
+      const hs = handlers2.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi2 as any);
+    const authBody = `HTTP 403: {"error":"forbidden","type":"authentication_error"}`;
+    await dispatch2("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
+      "C1-reconcile setup (auth): after_provider_response pushed the non-sticky bridge");
+    await dispatch2("message_end", {
+      type: "message_end",
+      message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: authBody, content: [] },
+    });
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedUntil === 0 && st.pausedReason === null,
+      "C1: message_end with non-suspend body clears the bridge (no sticky cap_abuse pause)");
+    await dispatch2("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
