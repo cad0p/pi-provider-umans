@@ -5609,7 +5609,28 @@ if (process.platform !== "win32") {
   const laterFuture = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString(); // +5h
   ms = extractBoxedUntil(`policy_review ${earlyFuture}; suspended until ${laterFuture}`);
   assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
-    "C2: two future timestamps — returns the LATEST (the maximum), not the first");
+    "C2: two future timestamps — regex returns the LATEST (the maximum), not the first");
+  // (b''') structured-JSON path with TWO future boxed_until fields: a
+  // top-level boxed_until (an earlier future, e.g. a non-deadline future
+  // timestamp) + error.boxed_until (the real, later deadline). Symmetric with
+  // the regex-path two-future test above: the structured path must return the
+  // MAXIMUM future timestamp, not the first future candidate it sees. A
+  // first-future return would yield the +2h deadline, under-pausing + letting
+  // siblings launch into the still-suspended account after the shorter pause.
+  ms = extractBoxedUntil(JSON.stringify({
+    boxed_until: earlyFuture,
+    error: { type: "account_suspended", boxed_until: laterFuture },
+  }));
+  assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
+    "C2: structured-JSON two future boxed_until fields — returns the LATEST (error.boxed_until), not the first (top-level)");
+  // (b'''') symmetric case: candidates reversed in source order
+  // (error.boxed_until earlier, top-level later) — still the maximum.
+  ms = extractBoxedUntil(JSON.stringify({
+    boxed_until: laterFuture,
+    error: { type: "account_suspended", boxed_until: earlyFuture },
+  }));
+  assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
+    "C2: structured-JSON two future boxed_until fields (reversed order) — returns the LATEST regardless of candidate order");
   // (c) absent (HTML gateway page) → undefined.
   ms = extractBoxedUntil("<html><body>403 Forbidden</body></html>");
   assert(ms === undefined,

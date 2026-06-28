@@ -297,15 +297,16 @@ const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
  * early-returns on a past deadline, so without this guard a 403 carrying a
  * past `boxed_until` would silently disable the pause + re-arm the cascade.
  *
- * For the regex-fallback path (prose-only bodies without a JSON boxed_until
- * field), the LATEST future timestamp is returned (the maximum), not the
- * first. A body can carry multiple future timestamps where a NON-deadline
- * future timestamp appears BEFORE the real deadline; returning the first
- * would yield a too-short pause (siblings launch into the still-suspended
- * account after the shorter pause elapses). The maximum is fail-safe: it
- * over-pauses on bodies with multiple future timestamps (siblings wait
- * longer, no cascade), but cannot under-pause. The structured-JSON path is
- * authoritative when present; the regex is a tolerant secondary.
+ * The LATEST future timestamp is returned (the maximum), not the first —
+ * for BOTH paths (structured-JSON + regex fallback). A body can carry
+ * multiple future timestamps where a NON-deadline future timestamp appears
+ * BEFORE the real deadline; returning the first would yield a too-short
+ * pause (siblings launch into the still-suspended account after the shorter
+ * pause elapses). The maximum is fail-safe: it over-pauses on bodies with
+ * multiple future timestamps (siblings wait longer, no cascade), but cannot
+ * under-pause. The structured-JSON path is authoritative when present; the
+ * regex is a tolerant secondary, and both share the fail-safe max-future
+ * reduction.
  */
 export function extractBoxedUntil(body: string): number | undefined {
   if (!body) return undefined;
@@ -317,14 +318,22 @@ export function extractBoxedUntil(body: string): number | undefined {
       (parsed as { boxed_until?: unknown }).boxed_until,
       (parsed as { error?: { boxed_until?: unknown } }).error?.boxed_until,
     ];
+    // Collect ALL future candidates + return the MAXIMUM (symmetric with the
+    // regex-fallback path below). A past boxed_until is treated as absent:
+    // pauseUntil early-returns on a past deadline, so without the `ms > now`
+    // guard a past value would silently disable the pause + re-arm the
+    // cascade. A max-reduction (rather than first-future) is fail-safe: a
+    // body with a top-level boxed_until (earlier future) + an error.boxed_until
+    // (the real later deadline) returns the later deadline, so siblings do
+    // not launch into the still-suspended account after the shorter pause.
+    let latest: number | undefined;
     for (const b of candidates) {
       const ms = toEpochMs(b);
-      // Adv4: a PAST boxed_until is treated as absent (undefined). pauseUntil
-      // early-returns on a past deadline, so without this guard a 403 carrying
-      // a past boxed_until would silently disable the pause + re-arm the
-      // cascade. The caller applies a 30s floor when undefined is returned.
-      if (ms !== undefined && ms > now) return ms;
+      if (ms !== undefined && ms > now && (latest === undefined || ms > latest)) {
+        latest = ms;
+      }
     }
+    if (latest !== undefined) return latest;
   }
   // Iterate EVERY ISO timestamp in the body, returning the LATEST FUTURE one
   // (the maximum). A past reference before the future deadline (e.g.
