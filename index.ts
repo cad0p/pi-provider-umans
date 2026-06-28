@@ -2282,43 +2282,33 @@ export default async function (pi: ExtensionAPI) {
     if (!shouldReleaseOnMessageEnd(msg, msg?.provider ?? ctx.model?.provider)) return;
     // 403 bridge reconciliation. The after_provider_response 403 handler pushed
     // a SHORT non-sticky PAUSE_REASON_403_BRIDGE because the body had not
-    // streamed yet at headers time. Now the body IS available (encoded in the
-    // assistant message's errorMessage by the provider stream layer — a 403
-    // produces stopReason "error" + errorMessage carrying the sanitized body
-    // text). Reconcile: if the body is a suspend family, push the real sticky
-    // PAUSE_REASON_CAP_ABUSE pause with the extracted boxed_until (extend-never-
-    // shorten holds vs the 5s bridge); if the body is NOT a suspend family (an
-    // auth error, a proxy HTML page), clear the bridge so an unrelated 403 does
-    // not serialize siblings for the full 5s. force:true clears even if a
-    // sibling already flipped the bridge to a sticky cap_abuse pause (the
-    // sticky guard refuses only sticky reasons; the bridge is non-sticky so a
-    // plain clearPause would also suffice, but force is explicit about the
-    // reconciliation intent + handles the race where a sibling's /usage
-    // cap_abuse branch already extended the bridge into a real pause — in that
-    // case the body check confirms the suspension + the cap_abuse branch's
-    // pause is left intact by NOT clearing when isSuspendBody holds).
+    // streamed yet at headers time. Now the body has streamed, so the robust
+    // paths that read the FULL body have already had a chance to fire + push
+    // the real sticky PAUSE_REASON_CAP_ABUSE pause with the extracted
+    // boxed_until: (a) the side-call raiseForUmansStatus path (reads the raw
+    // body via await res.text() before sanitization), + (b) the /v1/usage
+    // cap_abuse branch (reads the full body). This reconciliation's sole job
+    // is to clear the non-sticky bridge so it does not linger for the full 5s
+    // after a non-suspend 403 (an auth error, a proxy HTML page). It does NOT
+    // re-derive the suspension state from the assistant message's
+    // errorMessage — that prose is the Anthropic-SDK-parsed `error.message`
+    // with sibling fields (e.g. boxed_until) dropped, so it is an unreliable
+    // signal for suspension classification. A plain clearPause (no force)
+    // clears the non-sticky bridge but refuses to clear a sticky pause
+    // (PAUSE_REASON_CAP_ABUSE / 429 / STRIKES) that a sibling's /usage
+    // cap_abuse branch may have pushed in the window between the snapshot
+    // read and the clear — the sticky guard runs inside the mutate lock, so
+    // the race is safe. The snapshot pre-check (pausedReason ===
+    // PAUSE_REASON_403_BRIDGE) is a cheap avoid-the-write optimization; if a
+    // sibling already flipped the pause to a sticky cap_abuse pause, the
+    // snapshot shows that reason and the clear is skipped entirely.
     if (!concurrencyDisabled && msg?.stopReason === "error" && typeof msg?.errorMessage === "string") {
-      if (isSuspendBody(msg.errorMessage)) {
-        const now = Date.now();
-        const extracted = extractBoxedUntil(msg.errorMessage);
-        const until = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
+      const snap = concurrencyQueue.snapshot();
+      if (snap.paused && snap.pausedReason === PAUSE_REASON_403_BRIDGE) {
         try {
-          concurrencyQueue.pauseUntil(until, PAUSE_REASON_CAP_ABUSE);
+          concurrencyQueue.clearPause();
         } catch (err) {
-          console.warn("umans: pauseUntil threw in message_end 403 reconciliation (continuing):", err instanceof Error ? err.message : err);
-        }
-      } else {
-        // Non-suspend 403 (auth error, proxy page): clear the bridge so an
-        // unrelated 403 does not serialize siblings. Only clear a bridge-tagged
-        // pause — leave a sticky cap_abuse/429/strike pause intact (a sibling's
-        // /usage cap_abuse branch may have already pushed the real pause).
-        const snap = concurrencyQueue.snapshot();
-        if (snap.paused && snap.pausedReason === PAUSE_REASON_403_BRIDGE) {
-          try {
-            concurrencyQueue.clearPause({ force: true });
-          } catch (err) {
-            console.warn("umans: clearPause threw in message_end 403 reconciliation (continuing):", err instanceof Error ? err.message : err);
-          }
+          console.warn("umans: clearPause threw in message_end 403 reconciliation (continuing):", err instanceof Error ? err.message : err);
         }
       }
     }

@@ -6063,13 +6063,20 @@ if (process.platform !== "win32") {
   }
 }
 
-// --- message_end 403 reconciliation: suspend body → sticky cap_abuse pause (C1/ADV-2/SB-1/COV-F7) ---
-// after_provider_response pushed a 5s non-sticky bridge. message_end fires
-// once the body streams; the assistant message's errorMessage carries the
-// sanitized body text. If the body is a suspend family, push the real sticky
-// PAUSE_REASON_CAP_ABUSE pause with the extracted boxed_until (extend-never-
-// shorten holds vs the 5s bridge). If the body is NOT a suspend family (an
-// auth error), clear the bridge so an unrelated 403 does not serialize siblings.
+// --- message_end 403 reconciliation: clear the non-sticky bridge (no force, no body-check) ---
+// after_provider_response pushed a 5s non-sticky PAUSE_REASON_403_BRIDGE
+// because the body had not streamed yet at headers time. The real sticky
+// PAUSE_REASON_CAP_ABUSE pause with the extracted boxed_until is pushed by
+// the robust paths that read the FULL body: (a) the side-call
+// raiseForUmansStatus path (reads the raw body via await res.text() before
+// sanitization), + (b) the /v1/usage cap_abuse branch (reads the full body).
+// This reconciliation's sole job is to clear the non-sticky bridge so it does
+// not linger for the full 5s after a non-suspend 403 (an auth error, a proxy
+// HTML page). A plain clearPause (no force) clears the non-sticky bridge but
+// refuses to clear a sticky pause (PAUSE_REASON_CAP_ABUSE / 429 / STRIKES)
+// that a sibling's /usage cap_abuse branch may have pushed in the window
+// between the snapshot read and the clear — the sticky guard runs inside the
+// mutate lock, so the race is safe.
 {
   const dir = mkdtempSync(join(tmpdir(), "umans-q-403-reconcile-"));
   const stateFile = join(dir, "state.json");
@@ -6118,7 +6125,13 @@ if (process.platform !== "win32") {
       if (!hs) return;
       for (const h of hs) await h(payload, makeCtx());
     }
-    // (a) Suspend body: message_end must push the sticky cap_abuse pause.
+    // (a) Suspend body: message_end clears the non-sticky bridge (no force).
+    // The real sticky PAUSE_REASON_CAP_ABUSE pause is NOT pushed by
+    // message_end — it is pushed by the robust /usage cap_abuse branch + the
+    // side-call raiseForUmansStatus path (both read the full body). The
+    // errorMessage here carries the SDK-parsed prose (error.message with
+    // sibling boxed_until dropped), so message_end does NOT consult it for
+    // suspension classification. The bridge is cleared (non-sticky).
     await umansFactory(pi as any);
     const futureDeadline = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
     const suspendBody = `HTTP 403: {"error":{"type":"account_suspended","boxed_until":"${futureDeadline}"}}`;
@@ -6131,13 +6144,11 @@ if (process.platform !== "win32") {
       message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: suspendBody, content: [] },
     });
     st = JSON.parse(readFileSync(stateFile, "utf8"));
-    assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE,
-      "C1: message_end with suspend body pushes the sticky PAUSE_REASON_CAP_ABUSE pause");
-    assert(st.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
-      "C1: message_end cap_abuse pause uses the extracted boxed_until (~3h, not the 5s bridge)");
+    assert(st.pausedUntil === 0 && st.pausedReason === null,
+      "C1: message_end with suspend body clears the non-sticky bridge (real cap_abuse pause is pushed by /usage + side-call, not message_end)");
     await dispatch("session_shutdown", { type: "session_shutdown" });
 
-    // (b) Non-suspend (auth) body: message_end must clear the bridge.
+    // (b) Non-suspend (auth) body: message_end clears the bridge (no force).
     rmSync(stateFile, { force: true });
     const handlers2 = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
     const pi2: any = {
@@ -6165,8 +6176,58 @@ if (process.platform !== "win32") {
     });
     st = JSON.parse(readFileSync(stateFile, "utf8"));
     assert(st.pausedUntil === 0 && st.pausedReason === null,
-      "C1: message_end with non-suspend body clears the bridge (no sticky cap_abuse pause)");
+      "C1: message_end with non-suspend body clears the bridge (no force needed)");
     await dispatch2("session_shutdown", { type: "session_shutdown" });
+
+    // (c) TOCTOU: a sibling pushes a sticky PAUSE_REASON_CAP_ABUSE pause
+    // between the snapshot() read and the clearPause() call. The no-force
+    // clearPause must refuse to clear the sticky pause (the sticky guard runs
+    // inside the mutate lock). A prior force:true implementation would wipe
+    // the sibling's sticky pause + re-arm the cascade; the no-force
+    // implementation preserves it.
+    rmSync(stateFile, { force: true });
+    const handlers3 = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi3: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers3.has(event)) handlers3.set(event, []);
+        handlers3.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    async function dispatch3(event: string, payload: any): Promise<void> {
+      const hs = handlers3.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi3 as any);
+    await dispatch3("after_provider_response", { type: "after_provider_response", status: 403, headers: {} });
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_403_BRIDGE,
+      "C1-reconcile setup (toctou): after_provider_response pushed the non-sticky bridge");
+    // Simulate a sibling's /usage cap_abuse branch racing between the
+    // snapshot read and the clearPause call: push a real sticky cap_abuse
+    // pause directly via the queue before message_end fires.
+    const siblingQueue = createConcurrencyQueue({ stateFile });
+    const siblingDeadline = Date.now() + 3 * 60 * 60 * 1000;
+    siblingQueue.pauseUntil(siblingDeadline, PAUSE_REASON_CAP_ABUSE);
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE && st.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+      "C1-toctou setup: sibling pushed a sticky PAUSE_REASON_CAP_ABUSE pause (~3h)");
+    // message_end's snapshot will now see PAUSE_REASON_CAP_ABUSE (not the
+    // bridge), so the reconciliation skips the clear entirely. Even if the
+    // snapshot had seen the bridge, the no-force clearPause would refuse to
+    // clear the sticky pause. Either way, the sibling's sticky pause survives.
+    await dispatch3("message_end", {
+      type: "message_end",
+      message: { role: "assistant", provider: "umans", stopReason: "error", errorMessage: authBody, content: [] },
+    });
+    st = JSON.parse(readFileSync(stateFile, "utf8"));
+    assert(st.pausedReason === PAUSE_REASON_CAP_ABUSE,
+      "C1-toctou: sibling's sticky cap_abuse pause survives message_end reconciliation (no force, no wipe)");
+    assert(st.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+      "C1-toctou: sibling's cap_abuse deadline (~3h) is preserved");
+    await dispatch3("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
