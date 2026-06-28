@@ -5599,6 +5599,17 @@ if (process.platform !== "win32") {
   ms = extractBoxedUntil(`account_suspended from ${pastRef} until ${futureDeadline}; contact support`);
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
     "C3: past reference before future deadline — regex iterates + returns the future timestamp");
+  // (b'') message string with TWO future timestamps where the NON-deadline
+  // future appears BEFORE the real deadline. The regex must return the LATEST
+  // future timestamp (the maximum), not the first — a shorter pause would
+  // let siblings launch into the still-suspended account after the shorter
+  // pause elapses. The maximum is fail-safe: it over-pauses on bodies with
+  // multiple future timestamps, but cannot under-pause.
+  const earlyFuture = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // +2h
+  const laterFuture = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString(); // +5h
+  ms = extractBoxedUntil(`policy_review ${earlyFuture}; suspended until ${laterFuture}`);
+  assert(ms !== undefined && ms > Date.now() + 4 * 60 * 60 * 1000,
+    "C2: two future timestamps — returns the LATEST (the maximum), not the first");
   // (c) absent (HTML gateway page) → undefined.
   ms = extractBoxedUntil("<html><body>403 Forbidden</body></html>");
   assert(ms === undefined,

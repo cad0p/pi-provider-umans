@@ -296,6 +296,16 @@ const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
  * a crafted value) is treated as ABSENT → `undefined`. pauseUntil
  * early-returns on a past deadline, so without this guard a 403 carrying a
  * past `boxed_until` would silently disable the pause + re-arm the cascade.
+ *
+ * For the regex-fallback path (prose-only bodies without a JSON boxed_until
+ * field), the LATEST future timestamp is returned (the maximum), not the
+ * first. A body can carry multiple future timestamps where a NON-deadline
+ * future timestamp appears BEFORE the real deadline; returning the first
+ * would yield a too-short pause (siblings launch into the still-suspended
+ * account after the shorter pause elapses). The maximum is fail-safe: it
+ * over-pauses on bodies with multiple future timestamps (siblings wait
+ * longer, no cascade), but cannot under-pause. The structured-JSON path is
+ * authoritative when present; the regex is a tolerant secondary.
  */
 export function extractBoxedUntil(body: string): number | undefined {
   if (!body) return undefined;
@@ -316,17 +326,26 @@ export function extractBoxedUntil(body: string): number | undefined {
       if (ms !== undefined && ms > now) return ms;
     }
   }
-  // Iterate EVERY ISO timestamp in the body, returning the first FUTURE one.
-  // A past reference before the future deadline (e.g.
+  // Iterate EVERY ISO timestamp in the body, returning the LATEST FUTURE one
+  // (the maximum). A past reference before the future deadline (e.g.
   // `account_suspended from <past> until <future>`) must not mask the real
-  // deadline: the past match fails the `t > now` guard + the loop continues
-  // to the future match. Using matchAll (requires the `g` flag on the regex)
-  // instead of match (which returns only the FIRST match).
+  // deadline: the past match fails the `t > now` guard + is skipped. Using
+  // matchAll (requires the `g` flag on the regex) instead of match (which
+  // returns only the FIRST match). Returning the MAXIMUM future timestamp
+  // (rather than the first) is fail-safe: a longer pause over-pauses on
+  // bodies carrying multiple future timestamps (siblings wait longer, no
+  // cascade), while a shorter pause is fail-dangerous (siblings launch into
+  // a still-suspended account after the shorter pause elapses). The
+  // structured-JSON path above is authoritative when present; this regex is
+  // a fallback for prose-only bodies without a JSON boxed_until field.
+  let latest: number | undefined;
   for (const m of body.matchAll(ISO_TIMESTAMP_RE)) {
     const t = Date.parse(m[0]);
-    if (!Number.isNaN(t) && t > now) return t;
+    if (!Number.isNaN(t) && t > now && (latest === undefined || t > latest)) {
+      latest = t;
+    }
   }
-  return undefined;
+  return latest;
 }
 
 function toEpochMs(b: unknown): number | undefined {
