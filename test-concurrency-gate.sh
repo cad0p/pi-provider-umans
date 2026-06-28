@@ -4,9 +4,9 @@
 # Spawns N concurrent pi print-mode turns against the gated extension with
 # UMANS_CONCURRENCY_LIMIT set low, then polls /v1/usage to record the peak
 # concurrent_sessions observed on the account. Passes if peak <= hard_cap (the
-# 429 threshold — see CORR2-1) and all turns eventually succeed.
+# 429 threshold) and all turns eventually succeed.
 #
-# CORR2-1 / ADV2-F3: the gate asserts against hard_cap (the documented burst
+# The gate asserts against hard_cap (the documented burst
 # threshold at which Umans returns 429s), NOT against `limit`. message_end
 # releases at client-side stream completion, which PRECEDES the server's
 # concurrent_sessions decrement by a network RTT + cleanup lag, so the next
@@ -93,7 +93,7 @@ BASE_HARD=$(echo "$BASELINE" | cut -d, -f3)
 echo "baseline concurrent_sessions: $BASE_CONC (limit $(echo "$BASELINE" | cut -d, -f2), hard_cap $BASE_HARD)"
 echo
 
-# CORR2-1 / COV2-MED-A: clear stale state from prior interrupted runs so a
+# Clear stale state from prior interrupted runs so a
 # leftover token/waiter entry doesn't corrupt the result. The watchdog would
 # reap it eventually, but clearing here gives a clean baseline=0.
 rm -f "$HOME/.pi/agent/umans-concurrency.json" "$HOME/.pi/agent/umans-concurrency.json.lock" 2>/dev/null || true
@@ -182,7 +182,7 @@ echo "total failed jobs: $TOTAL_FAIL"
 echo "----------------------------------------"
 
 PASS=1
-# CORR2-1 / ADV2-F3: assert against hard_cap (the 429 threshold), not limit.
+# Assert against hard_cap (the 429 threshold), not limit.
 # The message_end release race overshoots limit by 1-2 but stays within the
 # burst headroom; server-side accounting noise also stays within hard_cap.
 if ! [ "$MAX_PEAK" -le "$HARD_CAP" ] 2>/dev/null; then
@@ -193,7 +193,7 @@ if [ "$TOTAL_FAIL" -gt 0 ]; then
   echo "FAIL: $TOTAL_FAIL total jobs failed"
   PASS=0
 fi
-# COV-MED-1: guard against a vacuous pass. If peak stayed 0 and at least 2 jobs
+# Guard against a vacuous pass. If peak stayed 0 and at least 2 jobs
 # ran, the poller never observed a non-zero sample (e.g. all jobs finished
 # before the first poll landed, or /usage was unreachable) — peak 0 <= hard_cap
 # would pass trivially without proving the gate serialized anything. Require
