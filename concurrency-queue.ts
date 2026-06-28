@@ -245,8 +245,14 @@ export const STICKY_PAUSE_REASONS = new Set([PAUSE_REASON_429, PAUSE_REASON_CAP_
  * the suspension deadline inside the error message text, not as a
  * `boxed_until` field). Matches `2026-06-28T03:09:24Z` and the
  * fractional-seconds variant `2026-06-28T03:09:24.123Z`.
+ *
+ * The `g` flag enables `matchAll` iteration so a body carrying a PAST
+ * reference timestamp before the future deadline (e.g.
+ * `account_suspended from <past> until <future>`) does not mask the real
+ * deadline: the past match is skipped by the `t > now` guard + the loop
+ * continues to the future match.
  */
-const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/;
+const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
 
 /**
  * Tolerantly extract a suspension deadline (epoch-ms) from a 403 response
@@ -282,8 +288,13 @@ export function extractBoxedUntil(body: string): number | undefined {
       if (ms !== undefined && ms > now) return ms;
     }
   }
-  const m = body.match(ISO_TIMESTAMP_RE);
-  if (m) {
+  // Iterate EVERY ISO timestamp in the body, returning the first FUTURE one.
+  // A past reference before the future deadline (e.g.
+  // `account_suspended from <past> until <future>`) must not mask the real
+  // deadline: the past match fails the `t > now` guard + the loop continues
+  // to the future match. Using matchAll (requires the `g` flag on the regex)
+  // instead of match (which returns only the FIRST match).
+  for (const m of body.matchAll(ISO_TIMESTAMP_RE)) {
     const t = Date.parse(m[0]);
     if (!Number.isNaN(t) && t > now) return t;
   }

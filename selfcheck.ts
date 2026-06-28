@@ -5572,11 +5572,26 @@ if (process.platform !== "win32") {
   ms = extractBoxedUntil(JSON.stringify({ boxed_until: futureSec }));
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
     "C3: epoch-seconds numeric boxed_until extracted + converted to ms");
+  // (a''') epoch-MILLISECONDS numeric boxed_until (b > 1e12, returned as-is).
+  const futureMs = Date.now() + 3 * 60 * 60 * 1000;
+  ms = extractBoxedUntil(JSON.stringify({ boxed_until: futureMs }));
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: epoch-milliseconds numeric boxed_until extracted as-is (b > 1e12)");
   // (b) ISO timestamp embedded in an error message string.
   const msgBody = `{"error":"account_suspended until ${future}; contact support"}`;
   ms = extractBoxedUntil(msgBody);
   assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
     "C3: ISO timestamp embedded in error message string extracted via regex");
+  // (b') message string with a PAST reference BEFORE the future deadline
+  // (e.g. `account_suspended from <past> until <future>`). The regex must
+  // iterate ALL timestamps + skip the past one (t <= now) + return the future
+  // deadline. match() returns only the FIRST match, so a past-before-future
+  // body would mask the real deadline + yield the 30s floor.
+  const pastRef = new Date(Date.now() - 60 * 1000).toISOString();
+  const futureDeadline = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+  ms = extractBoxedUntil(`account_suspended from ${pastRef} until ${futureDeadline}; contact support`);
+  assert(ms !== undefined && ms > Date.now() + 2 * 60 * 60 * 1000,
+    "C3: past reference before future deadline — regex iterates + returns the future timestamp");
   // (c) absent (HTML gateway page) → undefined.
   ms = extractBoxedUntil("<html><body>403 Forbidden</body></html>");
   assert(ms === undefined,
