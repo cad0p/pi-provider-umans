@@ -117,6 +117,15 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 
 The queue polls `/v1/usage/history` every 5 min to count concurrency 429s since the most recent `cap_suspended` bucket (the server resets the counter on reactivation, so pre-pause strikes are excluded to match the dashboard's behavior). When the count reaches the dynamic threshold — **20 minus the concurrency limit** (e.g. 20−4 = 16) — the queue **defensively self-pauses for 30 min** so strikes can age out of the rolling window rather than risk the 5h ban. The margin equals the max in-flight requests that could all 429 simultaneously before our next poll tips the server's counter over. The status bar shows `Strikes X/20` so you can see how close you are. The server's exact "limit hits today" counter lives on the dashboard (`app.umans.ai/api/account/cap-health`, NextAuth web-session only — not accessible via API key); the `/v1/usage/history` sum (excluding pre-pause strikes) matches the dashboard exactly.
 
+### 403 account suspension
+
+Beyond 429 deprioritization, the Umans server can **escalate to a full account suspension** by returning HTTP 403 with a body indicating `account_suspended` / `cap_abuse` / `cap_suspended` / `billing_error` (the 403 is the HTTP symptom of the same underlying `cap_abuse` suspension the `/v1/usage` `priority.reason=cap_abuse` branch detects). The queue handles this with two user-visible reason strings:
+
+- **`account cap_abuse suspension`** (`PAUSED <countdown> (account cap_abuse suspension)`): the server has escalated to a 5h suspension. The queue pushes a full pause until the body's `boxed_until` deadline clears (capped at the 5h `MAX_PAUSE_MS` ceiling; a longer real suspension self-heals via overhang re-push). The `/v1/usage` `cap_abuse` branch, the 403 response handler, and the `/v1/usage`-403 synthetic-snapshot path all push this same tag (a single tag eliminates the reason-flip fragility where a stale `/usage` tick could wipe a freshly-written pause).
+- **`HTTP 403 bridge (awaiting body)`** (`PAUSED <countdown> (HTTP 403 bridge (awaiting body))`): a 5s **non-sticky** bridge pushed at `after_provider_response` headers time (the body has not streamed yet at headers time, so the suspend body cannot be inspected). It backs siblings off immediately + is cleared at `message_end` once the body streams (or by a stale `/usage` low===false tick, since it is not in the sticky set). This is NOT a full pause — it is a brief bridge that reconciles to the real state within 5s.
+
+During a suspension, `/v1/usage/history` itself returns 403 (the server returns 403 for everything once suspended), so the cached strike count is cleared rather than shown as a stale `Strikes 19/20` for the full 5h — the bar shows no strike count until `/history` is reachable again.
+
 ### Umans API endpoints used
 
 | Endpoint | Method | Purpose |
