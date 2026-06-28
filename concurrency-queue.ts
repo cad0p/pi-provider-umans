@@ -397,8 +397,8 @@ export function clampPauseUntil(until: number, now: number = Date.now(), ceiling
 }
 
 /**
- * Cap + sanitize a pause reason before it is stored or rendered. SEC5-1 /
- * a compromised or misconfigured gateway can push a crafted
+ * Cap + sanitize a pause reason before it is stored or rendered. A
+ * compromised or misconfigured gateway can push a crafted
  * `priority.reason` that flows unescaped into the status bar (PAUSED <Ns>
  * (<reason>)). Cap to ~64 chars and strip non-printable / control / ANSI-escape
  * characters so a crafted string cannot mangle the bar or inject control
@@ -412,7 +412,7 @@ const PAUSE_REASON_MAX_CHARS = 64;
 // and zero-width / BOM chars (U+200B-F, U+FEFF) that could spoof the displayed
 // pause reason in the status bar. Keeps printable ASCII + common printable
 // Unicode. Mirrored in sanitizeErrorBody (index.ts) via the shared
-// SANITIZE_CTRL_RE export (CLN10-3) so the character class stays in sync
+// SANITIZE_CTRL_RE export so the character class stays in sync
 // across both modules without manual duplication.
 export const SANITIZE_CTRL_RE = /[\x00-\x1f\x7f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
 export function sanitizeReason(reason: string | null | undefined): string | null {
@@ -517,7 +517,7 @@ interface CapacityInputs {
  *   than block forever; the queue still serializes launches via the token).
  * - If concurrent_sessions >= limit (or hardCap when limit absent, or
  *   inputs.limit when both snap caps are absent, minus 1 when priority.low)
- *   → not free. CORR8-1 (HIGH): an unlimited plan (inputs.limit === undefined)
+ *   → not free. An unlimited plan (inputs.limit === undefined)
  *   is NO LONGER a short-circuit — the cap check below runs so a Code Max
  *   account can't trip the account-wide burst cap; only when ALL caps are
  *   undefined (true unlimited with no burst cap reported) is the gate free
@@ -529,7 +529,7 @@ interface CapacityInputs {
  * concurrent_sessions 1-2 over the gate before the server decrements;
  * gating to `limit` leaves the full burst headroom (hard_cap - limit) to
  * absorb that race + server-side concurrent_sessions accounting noise
- * (ADV2-F3: the counter oscillates ±1 during a single serialized turn).
+ * (the counter oscillates ±1 during a single serialized turn).
  * Gating to `hard_cap` would leave zero headroom — the race would
  * immediately push past hard_cap → 429 → deprioritization.
  */
@@ -593,8 +593,8 @@ export function isCapacityFree(
  * fractional. Handles edge inputs: "2.5" (fractional → fallback, almost
  * certainly a typo — a float threshold on an integer counter silently floors
  * to 2 usable slots), " " (whitespace → 0 → fallback), "0" (non-positive →
- * fallback), "abc" (NaN → fallback), "" (empty → fallback). CLN4-3:
- * tightened from Number.isFinite to Number.isInteger so a fractional typo
+ * fallback), "abc" (NaN → fallback), "" (empty → fallback).
+ * Tightened from Number.isFinite to Number.isInteger so a fractional typo
  * falls back to the server value (a strict improvement for a slot-count knob).
  * tightened further to a strict /^\d+$/ regex test BEFORE
  * Number(trimmed) so hex ("0x10" === 16) and scientific notation ("1e3" ===
@@ -622,7 +622,7 @@ function newId(): string {
 }
 
 /**
- * Shape guard for a WaiterEntry. SEC5-2: a poisoned/hand-edited state file can
+ * Shape guard for a WaiterEntry. A poisoned/hand-edited state file can
  * put arbitrary objects into `waiters` (e.g. { pid: "not-a-number" }). Without
  * validation, `isPidDead(w.pid)` would call `process.kill("not-a-number", 0)`
  * which throws a synchronous TypeError (not an errno-coded error) that the
@@ -676,8 +676,8 @@ export function readState(path: string): QueueState {
   // guard remains as a fast-path early return for the common symlink/FIFO case.
   //
   // The prior comment claimed O_NOFOLLOW alone prevented the FIFO block —
-  // that was false (O_NOFOLLOW does not imply O_NONBLOCK). SEC12-1 (R12
-  // security) probe-confirmed the block + the fix.
+  // that was false (O_NOFOLLOW does not imply O_NONBLOCK).
+  // Probe-confirmed the block + the fix.
   try {
     let fd: number | undefined;
     try {
@@ -765,7 +765,7 @@ export function isPidDead(pid: number): boolean {
     // process.kill(pid, 0) throws ESRCH (no such process) or EPERM (process
     // exists but caller lacks permission). ESRCH -> dead. EPERM -> the process
     // IS alive (just not ours); treat it as alive so we don't falsely reap a
-    // live holder's token (CORR2-4 / CMP-LOW-1). In a single-user pi setup all
+    // live holder's token. In a single-user pi setup all
     // processes share the same UID, so EPERM is vanishingly rare; treating it
     // as alive is the fail-safe (the queue stalls briefly rather than yanking a
     // live holder's token).
@@ -783,7 +783,7 @@ export function isPidDead(pid: number): boolean {
  * Also reaps a stale pause: if pausedTs is older than MAX_PAUSE_MS, OR the
  * pause DURATION (pausedUntil - now) itself exceeds MAX_PAUSE_MS, the pause is
  * cleared (defense-in-depth, in case the clamp in pauseUntil is bypassed by a
- * compromised sibling or a hand-edited file — SEC2-MED-1). Returns the cleaned
+ * compromised sibling or a hand-edited file). Returns the cleaned
  * state; does not write to disk.
  *
  * PID reuse is a known blind spot of the kill(pid, 0) probe — if a
@@ -813,15 +813,15 @@ export function reapStale(state: QueueState, cfg: Required<QueueConfig>, now: nu
   const inflight = state.inflight.filter((e) =>
     !isPidDead(e.pid) && (now - e.ts) <= cfg.staleTokenMs
   );
-  // Reap a pause that violates the MAX_PAUSE_MS ceiling. Three conditions
-  // (SEC2-MED-1 + ADV10-1): (1) pausedTs is older than the ceiling (the original
+  // Reap a pause that violates the MAX_PAUSE_MS ceiling. Three conditions:
+  // (1) pausedTs is older than the ceiling (the original
   // defense — a clamp-bypassed poisoned value ages out); (2) the pause
   // DURATION (pausedUntil - now) itself exceeds the ceiling from the current
   // vantage, regardless of pausedTs — this catches a forward-dated pausedTs
   // (a hand-edited file setting pausedTs to the future makes `now - pausedTs`
   // negative, bypassing condition 1) paired with an oversized pausedUntil;
   // (3) the pause's OWN claimed duration (pausedUntil - pausedTs) exceeds the
-  // ceiling, independent of now — ADV10-1 closes a gap where a forward-dated
+  // ceiling, independent of now — closes a gap where a forward-dated
   // pausedTs (e.g. now+1h) paired with a sub-ceiling pausedUntil (e.g. now+4h)
   // bypasses both (1) (age is negative) and (2) (duration-from-now is 3h, under
   // the 5h ceiling), yet the pause's claimed 3h span exceeds MAX_PAUSE_MS from
@@ -913,20 +913,20 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
   while (fd === undefined) {
     try {
       fd = openSync(lockFile, "wx", 0o600);
-      // The lockfile is a zero-byte O_EXCL sentinel (SEC13-2). The prior
-      // CMP7-1 design wrote the holder PID + read it back via readFileSync
-      // for a PID-based fast-path, but SEC9-3 dropped the read (lstat→read
-      // TOCTOU). The PID write was retained as dead code until SEC13-2 dropped
-      // it — a write that is never read back is not a fencing token. The
+      // The lockfile is a zero-byte O_EXCL sentinel. The prior
+      // design wrote the holder PID + read it back via readFileSync
+      // for a PID-based fast-path, but the read was dropped (lstat→read
+      // TOCTOU). The PID write was retained as dead code until it was dropped
+      // — a write that is never read back is not a fencing token. The
       // mtime ceiling is the sole authoritative reclaim bound.
       // the only throwing call is openSync itself. If it
       // throws (EEXIST handled below; ENOSPC/EIO/EROFS re-thrown by the outer
       // catch), fd is still undefined (no leak possible — there is no
       // writeFileSync after openSync that could throw + leave fd open). The
-      // prior CORR11-1 fix wrapped a writeFileSync that no longer exists.
+      // prior fix wrapped a writeFileSync that no longer exists.
       // (EEXIST can't reach here — O_EXCL openSync only resolves when the
       // file did not exist.)
-      // No PID write — the lockfile is a zero-byte O_EXCL sentinel (SEC13-2).
+      // No PID write — the lockfile is a zero-byte O_EXCL sentinel.
       // The fd is closed by the release fn returned below.
     } catch (e: any) {
       if (e.code !== "EEXIST") throw e;
@@ -947,15 +947,15 @@ function acquireLock(lockFile: string, cfg: Required<QueueConfig>): () => void {
           continue; // retry the O_EXCL immediately
         }
         // the mtime ceiling is the authoritative reclaim bound. The
-        // PID-based fast-path (CMP7-1) was an optimization that read the
+        // PID-based fast-path was an optimization that read the
         // lockfile content via readFileSync — dropped to remove the TOCTOU
         // between lstatSync (confirms regular file) + readFileSync (follows
-        // symlinks). SEC13-2: the PID write was also dropped (dead code).
+        // symlinks). The PID write was also dropped (dead code).
         // reclaim if the lockfile is older than lockTimeoutMs
         // (the original mtime ceiling) OR if its mtime is in the future beyond
         // MAX_LOCK_FUTURE_MS (1s). A future-dated mtime — from clock skew, NTP
         // correction, resume from suspend, or a `touch -t` attack — is not a
-        // legitimate hold. The prior 60s ceiling left a 1-60s gap (SEC13-1);
+        // legitimate hold. The prior 60s ceiling left a 1-60s gap;
         // lowered to 1s to catch any human-planted touch + meaningful NTP skew
         // while tolerating sub-ms floating-point jitter from utimesSync/Date.now
         // round-trips. A lockfile < 1s in the future ages out via lockTimeoutMs.
@@ -1058,7 +1058,7 @@ const STALE_TMP_MS = 10_000;
 // cap the number of .tmp files unlinked per mutate (REAP_TMP_MAX) to
 // bound the critical section under pathological .tmp accumulation. The reaper
 // runs inside the O_EXCL lock, so unlinking thousands of stale leftovers would
-// extend the critical section past the 2s lockTimeoutMs ceiling (CMP-MED-2),
+// extend the critical section past the 2s lockTimeoutMs ceiling,
 // racing two writers. Leave the rest for the next mutate.
 const REAP_TMP_MAX = 100;
 function reapStaleTmps(path: string, now: number): void {
@@ -1074,7 +1074,7 @@ function reapStaleTmps(path: string, now: number): void {
     try {
       // use lstatSync (not statSync) so a symlink
       // .tmp → /etc/passwd is detected as non-regular + unlinked directly
-      // without following the link (matching the lockfile's SEC7-1 posture).
+      // without following the link (matching the lockfile's posture).
       // statSync would follow the symlink, read the TARGET's mtime, and
       // unlinkSync (which removes the symlink itself, safe) but the mtime
       // leak is inconsistent with the hardened posture.
@@ -1084,7 +1084,7 @@ function reapStaleTmps(path: string, now: number): void {
       // lstatSync().mtimeMs ≈ now, so the STALE_TMP_MS check below would skip
       // it, leaving it to block a future writeStateAtomic that generates the
       // same temp name (EEXIST). Matches the lockfile's non-regular → unlink
-      // posture at acquireLock (SEC7-1).
+      // posture at acquireLock.
       const st = lstatSync(full);
       // a planted .tmp DIRECTORY would make unlinkSync throw EISDIR
       // (swallowed) AND writeStateAtomic's openSync("wx") throw EEXIST (the
@@ -1130,7 +1130,7 @@ export interface ConcurrencyQueue {
    * the request completes (assistant message_end is the primary release path;
    * turn_end and agent_end are safety nets for turns that error before
    * message_end fires). Resolves with a no-op release function if the queue is
-   * disabled (CLN7-3; unreachable from the provider path, which bails on
+   * disabled (unreachable from the provider path, which bails on
    * join() === null before reaching waitForLaunch).
    *
    * Capacity check is NOT performed here — the caller polls /usage itself
@@ -1139,8 +1139,7 @@ export interface ConcurrencyQueue {
    * If `signal` aborts mid-wait, the poll loop stops, our waiter entry is
    * cancelled via `cancel(ourId)`, and the promise rejects with an
    * AbortError — so an aborted turn cannot wedge the local queue for
-   * `staleWaiterMs` (5 min) or leak the token if it is later freed
-   * (C4/ADV-2).
+   * `staleWaiterMs` (5 min) or leak the token if it is later freed.
    */
   waitForLaunch(ourId: string, signal?: AbortSignal): Promise<() => void>;
   /**
@@ -1165,10 +1164,10 @@ export interface ConcurrencyQueue {
   /**
    * Re-stamp the launch token's `ts` to `now` while we still hold it, so the
    * 120s watchdog (reapStale) does not reap a long capacity poll (a pause-
-   * bounded wait can legitimately exceed 120s — see CORR4-3). Returns `true` if
+   * bounded wait can legitimately exceed 120s). Returns `true` if
    * `state.token?.id === ourId` (we still hold it) and the stamp was advanced;
    * returns `false` if the token was reaped by a sibling's reapStale (id
-   * mismatch) or is absent. C1 (HIGH): a poller that holds the token across a
+   * mismatch) or is absent. A poller that holds the token across a
    * long /usage poll MUST call this on every iteration; if it returns false,
    * the poller must re-join the queue and wait its turn again (the sibling
    * that reaped + claimed is now sending — re-joining serializes us behind
@@ -1263,8 +1262,8 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
   // a per-instance AbortController that reset() aborts to stop any
   // in-flight waitForLaunch poll loop on the same queue instance. Without it,
   // reset() splices our waiter id from the file, but a concurrent poll loop's
-  // mutate sees stillQueued===false and RE-INSERTS the id at the tail (ADV-4's
-  // re-insert path) every 50ms until the turn's AbortSignal aborts — leaking a
+  // mutate sees stillQueued===false and RE-INSERTS the id at the tail
+  // every 50ms until the turn's AbortSignal aborts — leaking a
   // dead-PID waiter for staleWaiterMs (5 min) if the process exits before pi
   // aborts the signal. reset() aborts this controller so the poll stops + the
   // promise rejects (acquireSlot catches + returns undefined). A fresh
@@ -1277,7 +1276,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       const result = fn(now, state);
       // reap stale .tmp files inside the lock, using the injected cfg.now()
       // (was Date.now() inside writeStateAtomic — a frozen clock never
-      // exercised the reaper). ADV-1: best-effort cleanup of crashed writers'
+      // exercised the reaper). Best-effort cleanup of crashed writers'
       // leftovers; errors swallowed inside reapStaleTmps.
       reapStaleTmps(cfg.stateFile, now);
       writeStateAtomic(cfg.stateFile, state);
@@ -1321,7 +1320,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
         const poll = () => {
           // Stop polling the moment the turn is aborted; otherwise the orphaned
           // promise would claim the token when freed and resolve a release fn
-          // nobody holds (ADV-2 token leak).
+          // nobody holds (token leak).
           if (signal?.aborted || resetAbort.signal.aborted) return;
           // the FIRST poll() runs synchronously inside the Promise
           // executor, so a throw here rejects the promise and acquireSlot's
@@ -1336,14 +1335,14 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
           // siblings). Wrap the body so a throw on any re-entry clears the
           // timer, best-effort cancels our waiter entry, and rejects the
           // waitForLaunch promise — mirroring releaseSlot's release-resilience
-          // pattern (ADV3-1) so the poll loop is as resilient to lock/disk
+          // pattern so the poll loop is as resilient to lock/disk
           // errors as the release loop already is.
           let got: boolean;
           try {
             got = mutate((now, state) => {
               // if our waiter entry was reaped by staleWaiterMs (5 min)
               // while we were still queued (e.g. a deep FIFO + slow models, or
-              // a perpetually-full /usage per ADV-3), re-insert it at the tail
+              // a perpetually-full /usage), re-insert it at the tail
               // with a fresh timestamp so we don't poll forever with
               // head.id !== ourId permanently true. Only dead-PID waiters are
               // reaped for real; a live-PID waiter here means we were aged out
@@ -1374,7 +1373,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
             resolve(() => {
               // Release: remove our token and our waiter entry. A throw here
               // (lock timeout, EACCES, ENOSPC) propagates to releaseSlot in
-              // index.ts, which wraps release() in try/catch (ADV3-1) so the
+              // index.ts, which wraps release() in try/catch so the
               // release continues and the watchdog reaps the stale entry.
               mutate((_now, state) => {
                 if (state.token && state.token.id === ourId) {
@@ -1461,7 +1460,7 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
     touchToken(ourId: string): boolean {
       // the capacity-poll loop in acquireSlot holds the launch token
       // across a long /usage poll (a pause-bounded wait can legitimately
-      // exceed 120s — see CORR4-3). reapStale reaps any token whose now -
+      // exceed 120s). reapStale reaps any token whose now -
       // token.ts > staleTokenMs, regardless of liveness, so a poller that never
       // re-stamps its token gets reaped at 120s while it keeps polling — a
       // sibling claims and sends, the original poller breaks and sends too,
@@ -1563,8 +1562,8 @@ export function createConcurrencyQueue(opts?: QueueConfig & { disabled?: boolean
       // in-flight waitForLaunch poll loop on this queue instance stops +
       // rejects (acquireSlot catches + returns undefined). Without this, reset()
       // splices our waiter id from the file, but a concurrent poll loop's mutate
-      // sees stillQueued===false and RE-INSERTS the id at the tail (ADV-4's
-      // re-insert path) every 50ms until the turn's AbortSignal aborts — leaking
+      // sees stillQueued===false and RE-INSERTS the id at the tail
+      // every 50ms until the turn's AbortSignal aborts — leaking
       // a dead-PID waiter for staleWaiterMs (5 min) if the process exits before
       // pi aborts the signal. A fresh controller is created so subsequent waits
       // are not pre-aborted.
