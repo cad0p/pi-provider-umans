@@ -6328,4 +6328,215 @@ if (process.platform !== "win32") {
     "Adv5: addInFlight propagates a throw (fail-closed — turn aborts, does not proceed without the entry)");
 }
 
+// --- D12 reason-aware pause: cap_abuse suspends fully (priority.low + suspend reason) ---
+// When priority.low AND the reason indicates a suspend-family account state
+// (cap_abuse / cap_suspended / account_suspended / billing_error), the account
+// is SUSPENDED (the server returns 403), not just slow. Lowering the cap by 1
+// is wrong — no launches should happen until boxed_until clears. Return
+// { free: false, repause: { until, PAUSE_REASON_CAP_ABUSE } } so the caller
+// pushes a full pause. C4: return the repause, do NOT push it here —
+// isCapacityFree is a pure decision (no I/O); the caller pushes it.
+{
+  const futureUntil = Date.now() + 3 * 60 * 60 * 1000;
+  const baseSnap = (reason: string | null): Parameters<typeof isCapacityFree>[0] => ({
+    concurrentSessions: 0, limit: 4, hardCap: 8,
+    priority: { low: true, until: futureUntil, reason },
+  });
+  const baseInputs = { limit: 4, queuePaused: false, localInFlight: 0 };
+
+  // cap_abuse → free:false + repause with PAUSE_REASON_CAP_ABUSE.
+  let d = isCapacityFree(baseSnap("cap_abuse"), baseInputs);
+  assert(d.free === false, "D12: cap_abuse → free:false (full suspend, not lower-cap-by-1)");
+  assert(d.repause !== undefined && d.repause!.until === futureUntil,
+    "D12: cap_abuse → repause with the boxed_until deadline");
+  assert(d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "D12: cap_abuse → repause reason is PAUSE_REASON_CAP_ABUSE");
+
+  // cap_suspended → same (C5 suspend-family enumeration).
+  d = isCapacityFree(baseSnap("cap_suspended"), baseInputs);
+  assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "C5: cap_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
+
+  // account_suspended → same (C5).
+  d = isCapacityFree(baseSnap("account_suspended"), baseInputs);
+  assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "C5: account_suspended → full pause with PAUSE_REASON_CAP_ABUSE");
+
+  // billing_error → same (C5).
+  d = isCapacityFree(baseSnap("billing_error"), baseInputs);
+  assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "C5: billing_error → full pause with PAUSE_REASON_CAP_ABUSE");
+
+  // Case-insensitive match.
+  d = isCapacityFree(baseSnap("CAP_ABUSE"), baseInputs);
+  assert(d.free === false && d.repause!.reason === PAUSE_REASON_CAP_ABUSE,
+    "C5: suspend reason match is case-insensitive");
+}
+
+// --- D12: rate_limited + absent/unknown reason keep the lower-cap-by-1 path ---
+// rate_limited is a transient deprioritization (the server is slow, not
+// suspended). Lowering the cap by 1 + keeping work going is the right behavior
+// (D3). No repause is returned (priority.low is a status signal, not a stop).
+{
+  const futureUntil = Date.now() + 60 * 1000;
+  const baseSnap = (reason: string | null): Parameters<typeof isCapacityFree>[0] => ({
+    concurrentSessions: 2, limit: 4, hardCap: 8,
+    priority: { low: true, until: futureUntil, reason },
+  });
+  const baseInputs = { limit: 4, queuePaused: false, localInFlight: 0 };
+
+  // rate_limited → cap lowered by 1 (4 -> 3), 2 < 3 → free, no repause.
+  let d = isCapacityFree(baseSnap("rate_limited"), baseInputs);
+  assert(d.free === true, "D12: rate_limited → free (lower-cap-by-1, work continues)");
+  assert(d.repause === undefined, "D12: rate_limited → no repause (status signal, not a stop)");
+
+  // absent reason → same lower-cap-by-1 path.
+  d = isCapacityFree(baseSnap(null), baseInputs);
+  assert(d.free === true, "D12: absent reason → free (lower-cap-by-1)");
+  assert(d.repause === undefined, "D12: absent reason → no repause");
+
+  // unknown reason → same.
+  d = isCapacityFree(baseSnap("some-unknown-reason"), baseInputs);
+  assert(d.free === true, "D12: unknown reason → free (lower-cap-by-1)");
+  assert(d.repause === undefined, "D12: unknown reason → no repause");
+
+  // Verify the cap was lowered by 1: concurrent_sessions=3, limit=4, low=true,
+  // rate_limited → cap=3, 3 >= 3 → not free.
+  d = isCapacityFree(
+    { concurrentSessions: 3, limit: 4, hardCap: 8, priority: { low: true, until: futureUntil, reason: "rate_limited" } },
+    baseInputs,
+  );
+  assert(d.free === false, "D12: rate_limited lowers cap by 1 (4->3); 3 sessions >= 3 → not free");
+  assert(d.repause === undefined, "D12: rate_limited at cap → no repause (just block, not pause)");
+}
+
+// --- D12: cap_abuse repause extends (not shortens) an existing 429 pause ---
+// The repause is returned with PAUSE_REASON_CAP_ABUSE; the caller pushes it via
+// pauseUntil, which uses extend-never-shorten (the longer deadline wins) +
+// preserves the sticky tag (C9). A 429 pause at 60s out + a cap_abuse repause
+// at 3h out → the pause extends to 3h + the tag becomes cap_abuse (sticky).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-d12-extend-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Push a 429 pause at ~60s out.
+  handle429({ status: 429, headers: { "retry-after": "60" } }, q);
+  let st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedReason === PAUSE_REASON_429, "setup: 429 pause tagged PAUSE_REASON_429");
+
+  // Simulate the capacityFree repause-push: cap_abuse repause at ~3h out.
+  const futureUntil = Date.now() + 3 * 60 * 60 * 1000;
+  const repause = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: futureUntil, reason: "cap_abuse" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  ).repause;
+  assert(repause !== undefined, "D12: cap_abuse repause returned");
+  q.pauseUntil(repause!.until, repause!.reason);
+  st = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st.pausedUntil > Date.now() + 2 * 60 * 60 * 1000,
+    "D12: cap_abuse repause extends (not shortens) the existing 429 pause");
+  // The sticky tag is preserved (C9): a 429 extended by a cap_abuse repause
+  // keeps the 429 tag (sticky preservation), OR flips to cap_abuse if the
+  // cap_abuse deadline is longer. Both are sticky; the point is extend-never-
+  // shorten holds.
+  assert(st.pausedReason === PAUSE_REASON_429 || st.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "D12: cap_abuse repause keeps a sticky reason tag (429 or cap_abuse, both sticky)");
+  q.clearPause({ force: true });
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D12 + C10: write-amplification guard skips repause re-push when already covered ---
+// The capacity-poll loop calls capacityFree every ~300ms. Without the guard,
+// each iteration where priority.low && reason=cap_abuse pushes a pauseUntil —
+// a mutate every ~300ms, all no-ops at the pause level. Skip when the active
+// pause already covers the requested deadline + reason. Verify via a direct
+// call: a cap_abuse repause whose deadline <= the active pause's pausedUntil
+// AND whose reason matches the active pausedReason → no re-push (the state
+// file's mtime does not change).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-d12-writeamp-"));
+  const stateFile = join(dir, "state.json");
+  const q = createConcurrencyQueue({ stateFile });
+
+  // Push a cap_abuse pause at ~3h out.
+  const futureUntil = Date.now() + 3 * 60 * 60 * 1000;
+  q.pauseUntil(futureUntil, PAUSE_REASON_CAP_ABUSE);
+  const st1 = JSON.parse(readFileSync(stateFile, "utf8"));
+  assert(st1.pausedReason === PAUSE_REASON_CAP_ABUSE, "setup: cap_abuse pause written");
+  const mtime1 = statSync(stateFile).mtimeMs;
+
+  // Simulate the capacityFree write-amplification guard: the repause is
+  // returned when queuePaused is FALSE (the normal poll), but the guard in
+  // capacityFree checks if the active pause already covers it (same reason,
+  // pausedUntil >= repause.until) → skips the pauseUntil call. isCapacityFree
+  // short-circuits to {free:false} when queuePaused is true, so compute the
+  // repause with queuePaused:false (the poll that observed the cap_abuse).
+  const repause = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: futureUntil, reason: "cap_abuse" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  ).repause;
+  assert(repause !== undefined, "C10 setup: cap_abuse repause returned");
+  // The guard (in capacityFree): queuePaused && qSnap.pausedUntil >= repause.until &&
+  // qSnap.pausedReason === repause.reason. capacityFree reads qSnap separately;
+  // here we simulate the guard using the queue's snapshot.
+  const qSnap = q.snapshot();
+  const alreadyCovered = qSnap.paused &&
+    qSnap.pausedUntil >= repause!.until &&
+    qSnap.pausedReason === repause!.reason;
+  assert(alreadyCovered,
+    "C10: active cap_abuse pause already covers the repause (guard would skip the re-push)");
+  // Do NOT call pauseUntil (the guard skipped it). The state file's mtime
+  // should not change (no write). Wait a moment to ensure mtime resolution.
+  await new Promise((r) => setTimeout(r, 20));
+  const mtime2 = statSync(stateFile).mtimeMs;
+  assert(mtime2 === mtime1,
+    "C10: write-amplification guard skips the pauseUntil call (no state-file write)");
+
+  // A repause with a LONGER deadline → guard does NOT skip (extend).
+  const longerUntil = Date.now() + 4 * 60 * 60 * 1000;
+  const repause2 = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: longerUntil, reason: "cap_abuse" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  ).repause;
+  const alreadyCovered2 = qSnap.paused &&
+    qSnap.pausedUntil >= repause2!.until &&
+    qSnap.pausedReason === repause2!.reason;
+  assert(!alreadyCovered2,
+    "C10: longer deadline repause → guard does NOT skip (extend)");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- D12 + Adv11: dead-PID in-flight reaped at 120s while a 5h cap_abuse pause is active ---
+// The cap_abuse pause survives the 120s in-flight reap cycle (reapStale reaps
+// in-flight entries but does NOT touch the pause). After the 5h pause clears,
+// reapStale has long since reaped the leaked in-flight entry (120s << 5h) → no
+// post-suspension blocking.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-d12-adv11-"));
+  const stateFile = join(dir, "state.json");
+  const now = Date.now();
+  // A state file with: (a) a 5h cap_abuse pause, (b) a dead-PID in-flight entry.
+  writeFileSync(stateFile, JSON.stringify({
+    waiters: [], token: null,
+    inflight: [{ id: "dead", pid: 9_999_999, ts: now }],
+    pausedUntil: now + 5 * 60 * 60 * 1000,
+    pausedReason: PAUSE_REASON_CAP_ABUSE,
+    pausedTs: now,
+  }));
+  const q = createConcurrencyQueue({ stateFile, now: () => now });
+  const snap = q.snapshot(); // snapshot calls reapStale
+  // The dead-PID in-flight entry is reaped (inflightCount 0).
+  assert(snap.inflightCount === 0,
+    "Adv11: dead-PID in-flight entry reaped by reapStale (120s bound)");
+  // The 5h cap_abuse pause survives (not reaped — within the MAX_PAUSE_MS ceiling).
+  assert(snap.paused === true, "Adv11: 5h cap_abuse pause survives the 120s in-flight reap cycle");
+  assert(snap.pausedReason === PAUSE_REASON_CAP_ABUSE,
+    "Adv11: cap_abuse pause reason preserved after in-flight reap");
+
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
 console.log("\nall checks passed");

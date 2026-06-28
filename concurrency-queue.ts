@@ -493,6 +493,21 @@ export function isCapacityFree(
 ): { free: boolean; repause?: { until: number; reason: string | null } } {
   if (inputs.queuePaused) return { free: false };
   if (!snap) return { free: true }; // /usage unreachable → trust headroom
+  // D12 reason-aware pause: when priority.low AND the reason indicates a
+  // suspend-family account state (cap_abuse / cap_suspended / account_suspended
+  // / billing_error), the account is SUSPENDED (the server returns 403), not
+  // just slow. Lowering the cap by 1 is wrong — no launches should happen
+  // until boxed_until clears. Return { free: false, repause } so the caller
+  // pushes a full PAUSE_REASON_CAP_ABUSE pause. The cap_abuse pause uses the
+  // 5h MAX_PAUSE_MS ceiling (the non-429 branch of pauseUntil). A >5h real
+  // suspension self-heals via overhang re-push (the 5h pause reaps, the next
+  // poll re-observes cap_abuse + re-pushes with the remaining boxed_until).
+  // C4: return the repause, do NOT push it here — isCapacityFree is a pure
+  // decision (no I/O); the caller in capacityFree pushes it. This mirrors how
+  // a priority.low repause is already returned + pushed.
+  if (snap.priority.low && isSuspendReason(snap.priority.reason)) {
+    return { free: false, repause: { until: snap.priority.until, reason: PAUSE_REASON_CAP_ABUSE } };
+  }
   // max(localInFlight, concurrentSessions): whichever is higher wins. Local
   // in-flight catches within-machine bursts (no /usage lag — the 300ms-2s
   // server accounting lag is what let 6 researchers all poll a stale-low

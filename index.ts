@@ -1420,16 +1420,33 @@ export default async function (pi: ExtensionAPI) {
           localInFlight: qSnap.inflightCount,
         });
         if (decision.repause) {
-          // COV4-2: pauseUntil runs mutate -> writeStateAtomic -> renameSync,
-          // which can throw on disk failure (EACCES, ENOSPC, EROFS). The pause
-          // is a best-effort coordination signal (the server's priority.low +
-          // the 120s watchdog bound it); it must not abort a turn that already
-          // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
-          // ADV3-1 release-resilience pattern.
-          try {
-            concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
-          } catch (err) {
-            console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
+          // C10 write-amplification guard: skip the pauseUntil call when the
+          // active pause already covers the requested deadline + reason. The
+          // capacity-poll loop calls capacityFree every ~300ms; with D12, each
+          // iteration where priority.low && reason=cap_abuse returns a repause,
+          // + the caller pushes pauseUntil — a mutate (O_EXCL lock + readState
+          // + reapStale + writeStateAtomic + renameSync) every ~300ms. Over a
+          // 5h suspension that is ~60,000 lock acquisitions + file writes,
+          // all no-ops at the pause level (extend-never-shorten means the
+          // deadline does not move). Skip when queuePaused &&
+          // qSnap.pausedUntil >= decision.repause.until &&
+          // qSnap.pausedReason === decision.repause.reason. qSnap was read
+          // once per iteration (CORR11-3 pattern — no straddle-await race).
+          const alreadyCovered = queuePaused &&
+            qSnap.pausedUntil >= decision.repause.until &&
+            qSnap.pausedReason === decision.repause.reason;
+          if (!alreadyCovered) {
+            // COV4-2: pauseUntil runs mutate -> writeStateAtomic -> renameSync,
+            // which can throw on disk failure (EACCES, ENOSPC, EROFS). The pause
+            // is a best-effort coordination signal (the server's priority.low +
+            // the 120s watchdog bound it); it must not abort a turn that already
+            // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
+            // ADV3-1 release-resilience pattern.
+            try {
+              concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
+            } catch (err) {
+              console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
+            }
           }
         }
         return decision.free;
