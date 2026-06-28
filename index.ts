@@ -143,7 +143,7 @@ const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age 
  * - `launch`: capacity is free — proceed with the send.
  * - `abort`: the turn's AbortSignal fired mid-poll — cancel + reject.
  * - `failOpen`: the poll cap elapsed AND no known pause is active — launch
- *   ungated (ADV-3) so a wedged /usage doesn't block forever. CORR4-3: a
+ *   ungated so a wedged /usage doesn't block forever. A
  *   known active pause keeps the gate waiting (bounded by the pause deadline
  *   + the 120s watchdog) — fail-open for a POSITIVE deprio signal would launch
  *   into a still-deprioritized account.
@@ -594,8 +594,8 @@ export function handle429(
     // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or an
     // HTTP-date. We only accept the integer form: Number() accepts hex
     // ("0x10"=16), scientific notation ("1e10"=1e10), and other misparses
-    // that can wedge the queue (S2/S4). Parse strictly and cap the resulting
-    // deadline at now + MAX_PAUSE_429_MS via clampPauseUntil (ADV4-2: a
+    // that can wedge the queue. Parse strictly and cap the resulting
+    // deadline at now + MAX_PAUSE_429_MS via clampPauseUntil (a
     // 429-sourced pause is clamped tighter than the 5h ceiling so a
     // misconfigured UMANS_BASE_URL returning 429 forever cannot wedge the
     // account for hours; pauseUntil also enforces this ceiling).
@@ -616,11 +616,11 @@ export function handle429(
 /**
  * shared !res.ok handler for the side-call sites (analyzeImage,
  * searchWeb). Both sites duplicated the same 429-push + read-body + sanitize +
- * throw block. This helper runs the 429 push (CORR8-2: a side-call 429
+ * throw block. This helper runs the 429 push (a side-call 429
  * deprioritizes the whole account — per D6 the side-call consumes a real
  * concurrency slot — so push the shared pause so sibling pi processes + the
  * main turn on its next launch back off, do NOT merely throw), reads + caps +
- * sanitizes the gateway error body (SEC7-4: attacker-controlled body must not
+ * sanitizes the gateway error body (attacker-controlled body must not
  * inject control sequences or mangle the tool result), then throws an Error
  * carrying HTTP status + the sanitized body. The Promise<never> return type
  * preserves control-flow narrowing (no dangling code after the call).
@@ -685,7 +685,7 @@ function readRetryAfter(headers: Headers | Record<string, string> | undefined | 
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
  */
 // ConcurrencyQueue is imported directly and used at the
-// factory call site. CLN4-1: WaiterEntry / TokenState / CapacitySnapshot /
+// factory call site. WaiterEntry / TokenState / CapacitySnapshot /
 // CapacityInputs are intentionally private (shape guards / internal
 // decision inputs); QueueState + QueueConfig are the exported types (see
 // concurrency-queue.ts). Local type alias for the release function returned
@@ -751,7 +751,7 @@ async function analyzeImage(
     });
     if (!res.ok) {
       // delegated to raiseForUmansStatus (shared with searchWeb) —
-      // runs the 429 push (CORR8-2), reads + sanitizes the body (SEC7-4), throws.
+      // runs the 429 push, reads + sanitizes the body, throws.
       await raiseForUmansStatus(res, concurrencyQueue);
     }
     const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
@@ -818,7 +818,7 @@ async function searchWeb(
     });
     if (!res.ok) {
       // delegated to raiseForUmansStatus (shared with analyzeImage) —
-      // runs the 429 push (CORR8-2), reads + sanitizes the body (SEC7-4), throws.
+      // runs the 429 push, reads + sanitizes the body, throws.
       await raiseForUmansStatus(res, concurrencyQueue);
     }
     const data = (await res.json()) as {
@@ -1135,7 +1135,7 @@ export default async function (pi: ExtensionAPI) {
     setWidget(ctx, statusText(lastMetrics));
   }
 
-  // Shared /v1/usage fetch skeleton (CLN2-M2). refreshUsage and
+  // Shared /v1/usage fetch skeleton. refreshUsage and
   // fetchUsageSnapshot both build the identical AbortController + fetch +
   // JSON-parse skeleton; this helper dedupes ~15 lines. Returns the parsed
   // { limits, usage } on a 2xx, or null on any failure (caller decides how to
@@ -1335,13 +1335,13 @@ export default async function (pi: ExtensionAPI) {
   // the token + our waiter entry; call it on assistant message_end (the
   // primary release path) or turn_end/agent_end as a safety net. Returns
   // undefined when the queue is disabled (fire-and-forget) or when the turn's
-  // AbortSignal fires mid-poll (clean cancellation, not a throw — CLN7-2). The
+  // AbortSignal fires mid-poll (clean cancellation, not a throw). The
   // `apiKey` is used for the head-waiter poll.
   //
   // this function BLOCKS until the slot is acquired — it is NOT a fast
   // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
   // contention) + the /usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
-  // 60s fail-open, or longer while a known pause is active per CORR4-3). All
+  // 60s fail-open, or longer while a known pause is active). All
   // callers (before_provider_request + the three side-call sites) await it inline
   // on the critical path of the turn — by design, the whole point is to
   // serialize launches so the account stays under its soft cap.
@@ -1350,7 +1350,7 @@ export default async function (pi: ExtensionAPI) {
   // any token held >120s (or whose PID died) is reclaimed by the next acquirer,
   // so a crashed/aborted turn can stall the queue for at most 120s. For an
   // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
-  // waitForLaunch cancels the waiter entry and rejects immediately (C4/ADV-2).
+  // waitForLaunch cancels the waiter entry and rejects immediately.
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
     const initialId = concurrencyQueue.join();
     if (!initialId) return undefined; // queue disabled
@@ -1361,13 +1361,13 @@ export default async function (pi: ExtensionAPI) {
     let ourId: string = initialId;
     // Track whether we have already released our waiter entry so a throw
     // between join() and the return of a release fn cannot leak the waiter
-    // for staleWaiterMs (5 min) (ADV-5). waitForLaunch itself cancels on
+    // for staleWaiterMs (5 min). waitForLaunch itself cancels on
     // signal abort; this finally covers the non-abort throw paths (lock
-    // timeout, EACCES, ENOSPC) and the C1 token-reaped re-join path.
+    // timeout, EACCES, ENOSPC) and the token-reaped re-join path.
     let released = false;
     // if our launch token is reaped by a sibling's reapStale while
     // we hold it across a long capacity poll (a pause-bounded wait can
-    // legitimately exceed 120s — see CORR4-3), touchToken returns false and
+    // legitimately exceed 120s), touchToken returns false and
     // we must re-join the queue + wait our turn again rather than race a
     // concurrent send. Guarded re-entry: bail after a bounded number of
     // re-joins so a pathological state (e.g. a sibling that reaps + crashes
@@ -1490,7 +1490,7 @@ export default async function (pi: ExtensionAPI) {
       // steadily full. Start at 300ms, grow by 1.5× on each "wait" decision,
       // cap at 2000ms; reset to 300ms on "launch" / "failOpen". Reduces /usage
       // RPS from ~3.3/s to ~0.5/s during a sustained pause. The ±100ms jitter
-      // breaks phase-locking across machines (CORR5-4 / ADV5-2).
+      // breaks phase-locking across machines.
       let pollIntervalMs = POLL_INTERVAL_BASE_MS;
       // the branch logic lives in decideLaunch (pure, unit-tested). The
       // loop here drives the /usage fetch (capacityFree, I/O) and applies the
@@ -1597,7 +1597,7 @@ export default async function (pi: ExtensionAPI) {
     } finally {
       // If we exited without returning a release fn (throw, abort, or a path
       // that didn't set `released`), cancel our waiter entry so it doesn't
-      // pollute the FIFO for staleWaiterMs (ADV-5). On the happy path the
+      // pollute the FIFO for staleWaiterMs. On the happy path the
       // returned release fn owns the cancellation, so `released` is true
       // and this is a no-op.
       if (!released) {
@@ -1655,7 +1655,7 @@ export default async function (pi: ExtensionAPI) {
       }
       // The side-call consumes a concurrency slot on the account; gate it
       // through the same cross-process FIFO so a burst of searches can't push
-      // the main turn past the soft cap. ADV4-3 / CORR5-3: do NOT assign to
+      // the main turn past the soft cap. Do NOT assign to
       // mainTurnRelease — side-calls manage their own release via releaseSlot
       // in the finally below. mainTurnRelease is main-turn-only (message_end
       // releases it); a side-call assigned there could be released instead of
@@ -2027,7 +2027,7 @@ export default async function (pi: ExtensionAPI) {
   // ordering to get wrong.
   let mainTurnRelease: Release | undefined;
   // release() calls mutate() -> withLock -> acquireLock, which can
-  // throw (e.g. O_EXCL lock timeout after 2s per CMP-MED-2, EACCES, ENOSPC).
+  // throw (e.g. O_EXCL lock timeout after 2s, EACCES, ENOSPC).
   // A throw propagating out of releaseSlot would abort the caller (message_end /
   // turn_end / agent_end / session_shutdown), leaking the token until the 120s
   // watchdog. Wrap release() in a try/catch: on throw, warn (the lock-timeout
@@ -2052,7 +2052,7 @@ export default async function (pi: ExtensionAPI) {
   }
   // Release the main-turn slot if held. Called at assistant message_end
   // (primary), turn_end / agent_end (safety nets), and session_shutdown
-  // (cleanup). At most one main-turn slot is ever outstanding (CORR5-3), so a
+  // (cleanup). At most one main-turn slot is ever outstanding, so a
   // single release is sufficient.
   function releaseMainTurn(): void {
     releaseSlot(mainTurnRelease);
@@ -2081,9 +2081,9 @@ export default async function (pi: ExtensionAPI) {
     // on the lockfile or state file) does NOT break the user's turn as an
     // uncaught extension error. The queue must not break inference, only the
     // gate. Fail-open ungated (proceed without a release fn), matching the
-    // /usage-unreachable stance at isCapacityFree + the ADV-3 poll-timeout
+    // /usage-unreachable stance at isCapacityFree + the poll-timeout
     // fail-open. The watchdog + hard_cap burst headroom absorb one ungated
-    // send. This mirrors the COV4-2 hardening applied to pauseUntil/handle429.
+    // send. This mirrors the hardening applied to pauseUntil/handle429.
     let release: Release | undefined;
     try {
       release = await acquireSlot(apiKey, ctx.signal);
@@ -2281,7 +2281,7 @@ export default async function (pi: ExtensionAPI) {
     if (ctx.model?.provider !== "umans") return;
     liveRequest = undefined;
     // Release any slot still held (e.g. aborted turns that never reached
-    // message_end / turn_end) so the gate never deadlocks. CORR5-3: at most one
+    // message_end / turn_end) so the gate never deadlocks. At most one
     // main-turn slot is outstanding, so a single release is sufficient.
     releaseMainTurn();
     updateStatus(ctx);
@@ -2293,8 +2293,8 @@ export default async function (pi: ExtensionAPI) {
     lastMetrics = {};
     imageStore.clear();
     // release the main-turn slot by invoking its release fn (not just
-    // dropping the reference), so the token/waiter entry is cleaned up. CORR5-3:
-    // at most one main-turn slot is outstanding (side-calls manage their own
+    // dropping the reference), so the token/waiter entry is cleaned up.
+    // At most one main-turn slot is outstanding (side-calls manage their own
     // release in a finally). reset() only clears ourTokenId's entry, so
     // releasing here ensures the held slot's token/waiter is released.
     releaseMainTurn();
