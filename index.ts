@@ -1042,18 +1042,25 @@ export default async function (pi: ExtensionAPI) {
   }
 
   async function refreshStrikes(apiKey: string) {
-    const count = await fetch429Strikes(apiKey);
-    if (count === null) {
-      // Adv6: /v1/usage/history may also return 403 during a suspension
-      // (the server returns 403 for everything once suspended). The prior
-      // code left the last cached strikes value, so the status bar showed
-      // a stale "Strikes 19/20" for the full 5h suspension. Clear it so the
-      // bar reflects that the count is unknown (the threshold check below
-      // is skipped — extend-never-shorten holds regardless because a cap_abuse
+    const result = await fetch429Strikes(apiKey);
+    if (result.suspended) {
+      // /v1/usage/history may also return 403 during a suspension (the
+      // server returns 403 for everything once suspended). The prior code
+      // left the last cached strikes value, so the status bar showed a stale
+      // "Strikes 19/20" for the full 5h suspension. Clear it so the bar
+      // reflects that the count is unknown (the threshold check below is
+      // skipped — extend-never-shorten holds regardless because a cap_abuse
       // pause is sticky + longer than any strike pause).
       strikes24h = undefined;
       return;
     }
+    // Transient failure (network timeout, 5xx, JSON parse): preserve the
+    // cached count so a single blip does not lose the strike count + skip
+    // the defensive self-pause right when it matters most. The threshold
+    // check is skipped (count === null), matching the prior behavior, but
+    // the cached value survives until the next poll (5min).
+    if (result.count === null) return;
+    const count = result.count;
     strikes24h = count;
     // Dynamic threshold: server limit minus the max in-flight requests (the
     // concurrency limit). A burst of in-flight requests can all 429 before our
@@ -1212,8 +1219,17 @@ export default async function (pi: ExtensionAPI) {
   // reactivation (a reactivation revokes + rotates API keys), so we exclude
   // strikes from before the most recent cap_suspended bucket — matching the
   // dashboard's behavior so our count stays accurate after a reactivation.
-  // Returns null on any failure (caller leaves the cached value).
-  async function fetch429Strikes(apiKey: string): Promise<number | null> {
+  //
+  // Returns a typed result so the caller can distinguish a SUSPEND-403 (the
+  // server returns 403 for /history too once the account is suspended — clear
+  // the cached count, the status bar should not show a stale "Strikes 19/20"
+  // for the full 5h) from a TRANSIENT failure (network timeout, 5xx, JSON
+  // parse error — preserve the cached count so a single blip does not lose the
+  // strike count + skip the defensive self-pause for the 5min poll interval).
+  // The prior code returned null on ANY failure + the caller wiped the cache,
+  // so a 2s DNS hiccup during an approach-to-threshold would lose the count +
+  // skip the self-pause right when it mattered most.
+  async function fetch429Strikes(apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
     const now = Date.now();
     const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
     const to = new Date(now).toISOString();
@@ -1231,9 +1247,21 @@ export default async function (pi: ExtensionAPI) {
           },
         },
       );
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // A 403 FROM /v1/usage/history is a POSITIVE suspension signal (the
+        // server returns 403 for everything once suspended). Distinguish it from
+        // a transient !res.ok (5xx, etc.) so the caller clears the cache only
+        // on a real suspension + preserves the cached count on a transient
+        // failure. A non-403 !res.ok is transient (count null, suspended false)
+        // — the caller leaves the cached value.
+        if (res.status === 403) {
+          const txt = await res.text().catch(() => "");
+          if (isSuspendBody(txt)) return { count: null, suspended: true };
+        }
+        return { count: null, suspended: false };
+      }
       const data = await res.json() as { buckets?: Array<{ bucket?: string; error_category?: string | null; requests?: number }> };
-      if (!Array.isArray(data.buckets)) return null;
+      if (!Array.isArray(data.buckets)) return { count: null, suspended: false };
       // Find the most recent cap_suspended bucket timestamp. Strikes before it
       // are excluded (the counter resets on reactivation). If there's no
       // cap_suspended in the window, all strikes count.
@@ -1244,7 +1272,7 @@ export default async function (pi: ExtensionAPI) {
           if (ts > lastPauseTs) lastPauseTs = ts;
         }
       }
-      return data.buckets
+      const strikes = data.buckets
         .filter((b) => b.error_category === "rate_limit_concurrency")
         .filter((b) => {
           // Exclude strikes before the most recent cap_suspended (counter reset).
@@ -1253,8 +1281,9 @@ export default async function (pi: ExtensionAPI) {
           return ts > lastPauseTs;
         })
         .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
+      return { count: strikes, suspended: false };
     } catch {
-      return null;
+      return { count: null, suspended: false };
     } finally {
       clearTimeout(timer);
     }
@@ -1263,12 +1292,28 @@ export default async function (pi: ExtensionAPI) {
   async function refreshUsage(apiKey: string) {
     const data = await fetchUsage(apiKey, 5000);
     if (!data) return; // leave cached values; status bar will show "?"
-    // null ?? undefined normalizes unlimited (null) limits so the display
-    // guards below hide them instead of rendering "x/null".
-    guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined;
-    currentConcurrency = data.usage?.concurrent_sessions;
-    requestLimit = data.limits?.requests?.limit ?? undefined;
-    requestsUsed = data.usage?.requests_in_window;
+    // The synthetic cap_abuse return (fetchUsage on a /v1/usage 403 with a
+    // suspend body) carries no `limits` field — only usage + priority. Skip
+    // the limits-derived assignments so the cached guaranteedConcurrency /
+    // requestLimit are preserved for the full suspension window. Without this
+    // guard, the synthetic object would wipe guaranteedConcurrency to
+    // undefined (data.limits?.concurrency?.limit ?? undefined evaluates to
+    // undefined when data.limits is absent), hiding the concurrency limit
+    // display during a suspension + deflating isCapacityFree's baseCap to
+    // undefined (gating still holds because the cap_abuse branch fires before
+    // the cap check, but a future reason=rate_limited synthetic would not).
+    if (data.limits) {
+      // null ?? undefined normalizes unlimited (null) limits so the display
+      // guards below hide them instead of rendering "x/null".
+      guaranteedConcurrency = data.limits.concurrency?.limit ?? undefined;
+      currentConcurrency = data.usage?.concurrent_sessions;
+      requestLimit = data.limits.requests?.limit ?? undefined;
+      requestsUsed = data.usage?.requests_in_window;
+    } else {
+      // Synthetic cap_abuse object: only usage.concurrent_sessions is present
+      // (0). Update the live concurrency display but preserve the cached limits.
+      currentConcurrency = data.usage?.concurrent_sessions;
+    }
     // Track the deprioritization state for the status bar (DEPRIO banner).
     // priority.low is a STATUS signal, not a stop condition: the gate lowers
     // the cap by 1 (isCapacityFree) to reduce race risk, but does NOT push a

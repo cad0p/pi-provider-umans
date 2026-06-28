@@ -6212,6 +6212,210 @@ if (process.platform !== "win32") {
   }
 }
 
+// --- refreshUsage preserves guaranteedConcurrency when /v1/usage returns 403-suspend (C3) ---
+// The synthetic cap_abuse object (fetchUsage on a /v1/usage 403 with a suspend
+// body) carries no `limits` field. The prior code unconditionally assigned
+// guaranteedConcurrency = data.limits?.concurrency?.limit ?? undefined, wiping
+// the cached limit to undefined for the full 5h suspension. Now refreshUsage
+// skips the limits-derived assignments when data.limits is absent, preserving
+// the cached value. Observe via the status bar's `Conc <current>/<guaranteed>`
+// render: a preserved limit shows `Conc 0/2`; a wiped limit shows `Conc 0/?`.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c3-guaranteed-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // Phase 1: /v1/usage returns 200 with limits.concurrency.limit=2 → caches 2.
+  // Phase 2: /v1/usage returns 403-suspend (synthetic, no limits) → must preserve 2.
+  let usagePhase = 1;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      if (usagePhase === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          limits: { concurrency: { limit: 2, hard_cap: 4 } },
+          usage: { concurrent_sessions: 0, priority: { low: false } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }
+      // Phase 2: 403 with suspend body → fetchUsage returns the synthetic cap_abuse
+      // object (no limits field).
+      const future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { type: "account_suspended", boxed_until: future } }),
+        { status: 403, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // Phase 1: session_start fetches /usage (200, limit 2) → caches 2 + renders.
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const phase1 = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    assert(phase1.includes("Conc 0/2"),
+      `C3: phase 1 caches guaranteedConcurrency=2 (status shows Conc 0/2), got '${phase1}'`);
+    // Phase 2: model_select triggers a second refreshUsage. /usage now returns
+    // 403-suspend (synthetic, no limits). The cached limit must be preserved.
+    usagePhase = 2;
+    await dispatch("model_select", { type: "model_select", model: { provider: "umans", id: "umans-flash" } });
+    const phase2 = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    assert(phase2.includes("Conc 0/2"),
+      `C3: phase 2 (synthetic cap_abuse, no limits) preserves guaranteedConcurrency=2 (Conc 0/2, not Conc 0/?), got '${phase2}'`);
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- refreshStrikes preserves strikes24h on a transient /history failure (C4) ---
+// The prior code wiped strikes24h to undefined on ANY fetch429Strikes null —
+// including a transient 5xx / network timeout. Now fetch429Strikes returns a
+// typed result: a 403-suspend clears the cache (suspended: true), but a
+// transient failure (5xx, timeout, JSON parse) preserves the cached count
+// (suspended: false, count: null → refreshStrikes returns early). Observe via
+// the status bar's `Strikes X/20` render: a preserved count shows `Strikes 19/20`
+// after a transient 5xx; a wiped count shows no `Strikes` part.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-c4-strikes-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(savedEnv)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // Phase 1: /history returns 200 with 19 rate_limit_concurrency strikes.
+  // Phase 2: /history returns 503 (transient) → must preserve the cached 19.
+  let historyPhase = 1;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      if (historyPhase === 1) {
+        return Promise.resolve(new Response(JSON.stringify({
+          buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }
+      // Phase 2: transient 503 (not a 403-suspend) → fetch429Strikes returns
+      // { count: null, suspended: false } → refreshStrikes preserves the cache.
+      return Promise.resolve(new Response("", { status: 503 }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // Phase 1: session_start → scheduleStrikePoll(immediate) fetches /history (200, 19 strikes).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    // Phase 2: model_select triggers refreshUsage (re-renders). The strike poll
+    // runs on its 5min timer, but to test the transient-failure preservation we
+    // need a second refreshStrikes. scheduleStrikePoll fires immediately only on
+    // session_start; model_select does not re-trigger the immediate poll. So we
+    // directly verify the phase-1 cache survived by checking the status bar shows
+    // Strikes 19/20, then flip /history to 503 + trigger a second strike poll
+    // via a model_select-then-session_start cycle is not available. Instead,
+    // observe that after phase 1 the cache holds 19 (Strikes 19/20 renders),
+    // then flip + dispatch a second session_start (which re-runs the immediate
+    // strike poll) → the transient 503 must NOT wipe the 19.
+    historyPhase = 2;
+    widgetTexts.length = 0;
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // After the transient 503, the cached 19 must survive (Strikes 19/20 renders).
+    // A wipe would show no `Strikes` part (strikes24h === undefined).
+    const strikeRender = widgetTexts.filter((t) => t.includes("Strikes")).pop() ?? "";
+    assert(strikeRender.includes("Strikes 19/20"),
+      `C4: transient /history 503 preserves the cached strikes count (Strikes 19/20, not wiped), got '${strikeRender}'`);
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- D11 local in-flight: addInFlight/removeInFlight + snapshot().inflightCount ---
 // acquireSlot increments local in-flight BEFORE releasing the token (C8: the
 // order is load-bearing — the next head's readState must see our entry before
