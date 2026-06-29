@@ -205,15 +205,23 @@ function coerceSettings(parsed: unknown, sourceLabel: string): UmansSettings {
   // Number check: rejects strings, booleans, objects, null. Number.isFinite
   // rejects NaN + Infinity. The > 0 check rejects 0 + negatives.
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
-    console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier=${JSON.stringify(raw)} is invalid (must be a finite number > 0); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
+    // Echo the value's TYPE, not the value itself. concurrencyMultiplier is
+    // attacker-controlled (a hostile repo can write .pi/umans.json with a
+    // crafted string or object); echoing JSON.stringify(raw) would flow that
+    // payload into console output (which pi captures into model context — an
+    // info-leak / prompt-injection vector). Mirrors the content-free principle
+    // applied to the malformed-JSON warn above.
+    console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier is ${typeof raw} (must be a finite number > 0); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
     return base;
   }
   // Sane-maximum cap: reject a huge finite multiplier (e.g. 1e300) that would
   // bypass the hard_cap clamp during the startup window + self-DoS the account
   // via 429s. The documented useful range is 0.5–3.0; anything above 100 has no
-  // legitimate use.
+  // legitimate use. Drop the raw value from the warn (a finite number above the
+  // cap is not a payload risk, but consistency with the invalid-value warn +
+  // the content-free principle for attacker-controlled settings keeps it out).
   if (raw > MAX_CONCURRENCY_MULTIPLIER) {
-    console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier=${raw} exceeds the maximum (${MAX_CONCURRENCY_MULTIPLIER}); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
+    console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier exceeds the maximum (${MAX_CONCURRENCY_MULTIPLIER}); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
     return base;
   }
   return { concurrencyMultiplier: raw };

@@ -7689,6 +7689,39 @@ for (const [label, raw, expected] of [
   }
 }
 
+// --- invalid multiplier value: warn does not echo attacker-controlled payload ---
+// The malformed-JSON warn is content-free (the block above). The invalid-VALUE
+// warn in coerceSettings must also be content-free: concurrencyMultiplier is
+// attacker-controlled (a hostile repo can write .pi/umans.json with a crafted
+// string or object), and echoing JSON.stringify(raw) would flow that payload
+// into console output (which pi captures into model context — an info-leak /
+// prompt-injection vector). The hardened warn echoes the value's TYPE, not the
+// value. Mirrors the malformed-JSON content-free principle.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-invalid-value-noleak-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  const canary = "SECRET_TOKEN_canary";
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: canary }));
+  const originalWarn = console.warn;
+  const warned: string[] = [];
+  console.warn = (msg: string) => { warned.push(String(msg)); };
+  try {
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: string multiplier → default");
+  } finally {
+    console.warn = originalWarn;
+  }
+  const joined = warned.join("\n");
+  // The warn fires (the value is invalid) + echoes the type, not the value.
+  assert(joined.includes("concurrencyMultiplier is string"),
+    "readSettings: invalid multiplier warn echoes the type (string), not the value");
+  assert(!joined.includes(canary),
+    "readSettings: invalid multiplier warn does not echo attacker-controlled value (info-leak guard)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
 // --- concurrency multiplier wired into concurrencyLimit() (status-bar proof) ---
 // concurrencyLimit() is a closure inside the factory (not exported), so the
 // multiplier wiring is observed via the status bar's `Conc <current>/<limit>`
@@ -7911,6 +7944,34 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
   );
   assert(d3.free === false,
     "deprio + multiplier 3.0 (clamped to hard_cap 8): 7 sessions >= cap 7 (8-1) → not free");
+}
+
+// --- sub-1 multiplier + deprio: post-deprio cap floored to 1 (not 0) ---
+// The concurrencyLimit floor-of-1 (Math.max(1, Math.floor(serverLimit * multiplier)))
+// guarantees at least 1 slot for a sub-1 multiplier (e.g. 0.1 with limit 4 →
+// floor(0.4)=0 → floored to 1). isCapacityFree's deprio lowering must floor the
+// POST-deprio cap to 1 as well, so a sub-1 multiplier under deprio does not drop
+// the cap to 0 (max(0, 1-1)=0) → every poll reports not-free → a 60s stall before
+// fail-open on every launch while deprioritized. With the floor, the gate keeps
+// at least 1 slot live: cap = max(1, 1-1) = 1, so concurrentSessions 0 < 1 → free.
+// This is the wedge case: floor-to-1 THEN deprio lowering by 1.
+{
+  // multiplier 0.1: effectiveLimit = max(1, floor(4*0.1)) = max(1, 0) = 1.
+  // Under deprio, cap = max(1, 1-1) = max(1, 0) = 1 (floored, not 0).
+  const d = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 1, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d.free === true,
+    "sub-1 multiplier (effectiveLimit 1) + deprio: 0 sessions < cap 1 (max(1, 1-1)) → free (not wedged at cap 0)");
+  // At 1 session under the same config, cap 1 is reached → not free (the gate
+  // still honors the deprio lowering — it just doesn't wedge at 0).
+  const d2 = isCapacityFree(
+    { concurrentSessions: 1, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 1, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2.free === false,
+    "sub-1 multiplier (effectiveLimit 1) + deprio: 1 session >= cap 1 (max(1, 1-1)) → not free (gate still honors deprio)");
 }
 
 // --- web-search split: standalone factory registers umans_web_search ---

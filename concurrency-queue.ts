@@ -582,7 +582,17 @@ export function isCapacityFree(
   // parallelism by one slot. Requests still go through (just slower); this
   // is a status signal, not a stop condition. Actual 429s + the strike
   // counter handle the hard pause.
-  const cap = snap.priority.low && baseCap !== undefined ? Math.max(0, baseCap - 1) : baseCap;
+  //
+  // Floor the post-deprio cap at 1 (not 0). The concurrencyLimit floor-of-1
+  // (Math.max(1, Math.floor(serverLimit * multiplier))) guarantees at least 1
+  // slot for a sub-1 multiplier; without this matching floor here, a sub-1
+  // multiplier (e.g. 0.1 with limit 4 → floored to 1) under deprio would drop
+  // the cap to 0 (max(0, 1-1)=0) → every poll reports not-free → a 60s stall
+  // before fail-open on every launch while deprioritized. The two floors
+  // together guarantee the gate keeps at least 1 slot live even under deprio
+  // + a sub-1 multiplier, so a user who asked for "conservative" does not
+  // get a 60s stall on every launch.
+  const cap = snap.priority.low && baseCap !== undefined ? Math.max(1, baseCap - 1) : baseCap;
   if (cap !== undefined && cur >= cap) return { free: false };
   return { free: true };
 }
