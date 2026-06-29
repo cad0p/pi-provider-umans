@@ -6,6 +6,7 @@
   "main": "index.ts",
   "files": [
     "index.ts",
+    "concurrency-queue.ts",
     "README.md",
     "LICENSE"
   ],
@@ -17,8 +18,11 @@
     "pi",
     "coding-agent"
   ],
-  "author": "",
+  "author": "Umans AI <dev@umans.ai>",
   "license": "MIT",
+  "engines": {
+    "node": ">=20.10.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/umans-ai/pi-provider-umans.git"
@@ -28,14 +32,15 @@
   },
   "homepage": "https://github.com/umans-ai/pi-provider-umans#readme",
   "scripts": {
-    "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build'",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types selfcheck.ts",
+    "test:integration": "./test-concurrency-gate.sh"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.7",
     "@earendil-works/pi-coding-agent": "^0.79.7",
-    "typebox": "^1.3.0"
+    "typebox": "^1.3.0",
+    "typescript": "^6.0.3"
   },
   "pi": {
     "extensions": [

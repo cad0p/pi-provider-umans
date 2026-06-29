@@ -40,6 +40,20 @@ export UMANS_API_KEY="${UMANS_API_KEY:-}"
 # pi binary; rebuilt in run_one since arrays don't export across xargs.
 PI_BIN=pi
 
+# Use gtimeout on macOS (brew install coreutils), timeout on Linux. macOS ships
+# no `timeout(1)` — without this detection the test fails with
+# `timeout: command not found` (exit 127) on every model. CI/environment
+# portability: the project's own selfcheck + test-concurrency-gate.sh use
+# gtimeout; this script is the last holdout.
+if command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=gtimeout
+elif command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=timeout
+else
+  echo "error: neither gtimeout nor timeout found (install coreutils)" >&2
+  exit 2
+fi
+
 # Enumerate models from the live provider registration.
 mapfile -t MODELS < <("$PI_BIN" -e "$EXT" --no-extensions --list-models umans 2>/dev/null | awk '$1 == "umans" { print $2 }')
 if [ "${#MODELS[@]}" -eq 0 ]; then
@@ -59,7 +73,7 @@ run_one() {
   local attempt rc body t0 t1 secs status
   for attempt in 1 2 3; do
     t0=$(date +%s.%N)
-    timeout 90 "$PI_BIN" -e "$EXT" --no-extensions --no-session --no-tools \
+    $TIMEOUT_BIN 90 "$PI_BIN" -e "$EXT" --no-extensions --no-session --no-tools \
       --model "umans/$model" --thinking "$THINKING" -p "$PROMPT" >"$out" 2>"$err"
     rc=$?
     t1=$(date +%s.%N)
@@ -74,7 +88,7 @@ run_one() {
   [ "$status" = PASS ] || tail -n 3 "$err" >"$TMP/$model.tail"
 }
 export -f run_one
-export PI_BIN EXT TMP THINKING PROMPT EXPECT
+export PI_BIN EXT TMP THINKING PROMPT EXPECT TIMEOUT_BIN
 
 # Parallel fan-out.
 printf '%s\n' "${MODELS[@]}" | xargs -I{} -P "$PARALLEL" bash -c 'run_one "$@"' _ {}

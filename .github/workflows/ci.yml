@@ -16,10 +16,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # CLN11-6/CLN12-8: pin to 20.10 (the engines floor in package.json,
+          # required for AbortSignal.any used in concurrency-queue.ts AND the
+          # `with { type: "json" }` ESM import attribute used for USER_AGENT
+          # derivation in index.ts). "20" alone is looser + a 20.0/20.1
+          # setup-node image would fail at runtime.
+          node-version: "20.10"
 
       - name: Install dependencies
         run: npm install
 
       - name: Type check
         run: npm run check
+
+      - name: Selfcheck
+        run: npm test
