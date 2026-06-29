@@ -296,9 +296,6 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // Seed the refresh loops on session_start so the multiplier + strikes values
-  // are populated before the first side-call. session_shutdown stops the
-  // loops + resets this process's queue entry (mirrors index.ts).
-  // Seed the refresh loops on session_start so the multiplier + strikes values
   // are populated before the first side-call. restartRefreshLoop starts BOTH
   // the periodic refreshUsage (5s) AND the immediate strike poll — mirroring
   // index.ts's session_start wiring so the multiplier + strike count stay

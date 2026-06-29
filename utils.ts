@@ -270,7 +270,7 @@ const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
 const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
 
 // /usage poll-interval backoff tuning (used by nextPollInterval + acquireSlotCore).
-export const POLL_INTERVAL_BASE_MS = 300;
+const POLL_INTERVAL_BASE_MS = 300;
 const POLL_INTERVAL_CAP_MS = 2_000;
 const POLL_INTERVAL_GROWTH = 1.5;
 
@@ -441,7 +441,7 @@ export function concurrencyLimit(rt: ConcurrencyRuntime): number | undefined {
  * non-suspend 403 (auth error on /usage) keeps fail-open (return null).
  * Returns null on any other failure (caller leaves cached values).
  */
-export async function fetchUsage(rt: ConcurrencyRuntime, apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<UsageData | null> {
+async function fetchUsage(rt: ConcurrencyRuntime, apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<UsageData | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const composed = parentSignal ? AbortSignal.any([parentSignal, ctrl.signal]) : ctrl.signal;
@@ -485,7 +485,7 @@ export async function fetchUsage(rt: ConcurrencyRuntime, apiKey: string, timeout
  * doesn't stall the head-waiter poll; reads only the capacity-decision fields.
  * Returns null on any failure (caller retries).
  */
-export async function fetchUsageSnapshot(rt: ConcurrencyRuntime, apiKey: string, parentSignal?: AbortSignal): Promise<{
+async function fetchUsageSnapshot(rt: ConcurrencyRuntime, apiKey: string, parentSignal?: AbortSignal): Promise<{
   concurrentSessions: number | undefined;
   limit: number | undefined;
   hardCap: number | undefined;
@@ -512,7 +512,7 @@ export async function fetchUsageSnapshot(rt: ConcurrencyRuntime, apiKey: string,
  * clears the cached count) vs transient failure (caller preserves the cached
  * count so a blip does not skip the self-pause).
  */
-export async function fetch429Strikes(rt: ConcurrencyRuntime, apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
+async function fetch429Strikes(rt: ConcurrencyRuntime, apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
   const now = Date.now();
   const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
   const to = new Date(now).toISOString();
@@ -701,7 +701,7 @@ function scheduleRefresh(rt: ConcurrencyRuntime, apiKey: string): void {
  * first poll fires immediately (immediate=true) so the strike count is known
  * at startup. Re-schedules itself.
  */
-export function scheduleStrikePoll(rt: ConcurrencyRuntime, apiKey: string, immediate = false): void {
+function scheduleStrikePoll(rt: ConcurrencyRuntime, apiKey: string, immediate = false): void {
   if (rt.refreshStopped || !apiKey) return;
   rt.strikeTimer = setTimeout(async () => {
     await refreshStrikes(rt, apiKey);

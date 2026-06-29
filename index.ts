@@ -753,7 +753,7 @@ export default async function (pi: ExtensionAPI) {
   // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
   // contention) + the /v1/usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
   // 60s fail-open, or longer while a known pause is active). All callers
-  // (before_provider_request + the three side-call sites) await it inline on
+  // (before_provider_request + the side-call sites) await it inline on
   // the critical path of the turn — by design, the whole point is to serialize
   // launches so the account stays under its soft cap.
   //
