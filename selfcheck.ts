@@ -21,6 +21,13 @@ import {
   type UmansModelInfo,
 } from "./utils.ts";
 import {
+  readSettings,
+  defaultSettings,
+  deepMergeSettings,
+  DEFAULT_CONCURRENCY_MULTIPLIER,
+  type UmansSettings,
+} from "./settings.ts";
+import {
   parsePriority,
   readState,
   reapStale,
@@ -7005,6 +7012,186 @@ if (process.platform !== "win32") {
   assert(snap.pausedReason === PAUSE_REASON_CAP_ABUSE,
     "cap_abuse pause reason preserved after in-flight reap");
 
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- settings.ts: readSettings + deepMergeSettings + UmansSettings ---
+// The concurrency multiplier is read from ~/.pi/agent/umans.json (global) +
+// .pi/umans.json (project), deep-merged (project wins per-key). Malformed JSON
+// + invalid multiplier values fall back to defaults. The DI seam (path
+// overrides) lets these tests point at temp files without monkey-patching
+// homedir/cwd, so they're deterministic + hermetic.
+
+// deepMergeSettings: primitives → project wins
+assert(deepMergeSettings(1, 2) === 2, "deepMerge: primitive project wins");
+assert(deepMergeSettings(1, undefined) === 1, "deepMerge: undefined project keeps global");
+
+// deepMergeSettings: arrays → fully replaced (NOT concatenated)
+{
+  const merged = deepMergeSettings([1, 2], [3]) as unknown[];
+  assert(Array.isArray(merged) && merged.length === 1 && merged[0] === 3,
+    "deepMerge: array project replaces global entirely");
+}
+
+// deepMergeSettings: nested objects → deep merged (global siblings survive)
+{
+  const g = { search: { maxResults: 5, timeout: 30 } };
+  const p = { search: { maxResults: 10 } };
+  const merged = deepMergeSettings(g, p) as { search: { maxResults: number; timeout: number } };
+  assert(merged.search.maxResults === 10, "deepMerge: project overrides its key");
+  assert(merged.search.timeout === 30, "deepMerge: global sibling survives");
+}
+
+// deepMergeSettings: object replaces array (type change → project wins outright)
+{
+  const merged = deepMergeSettings([1, 2], { a: 1 });
+  assert(typeof merged === "object" && !Array.isArray(merged) && (merged as { a: number }).a === 1,
+    "deepMerge: object project replaces array global");
+}
+
+// defaultSettings
+{
+  const d = defaultSettings();
+  assert(d.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "defaultSettings: multiplier is the default (1.0)");
+  assert(DEFAULT_CONCURRENCY_MULTIPLIER === 1.0, "DEFAULT_CONCURRENCY_MULTIPLIER is 1.0");
+}
+
+// readSettings: missing files → defaults (hermetic via DI seam)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-missing-"));
+  const globalPath = join(dir, "missing-global.json");
+  const projectPath = join(dir, "missing-project.json");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: missing files → default multiplier");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: global-only
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-global-"));
+  const globalPath = join(dir, "umans.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 0.5,
+    "readSettings: global-only → global value (0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: project-only
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-project-"));
+  const globalPath = join(dir, "missing-global.json");
+  const projectPath = join(dir, "umans.json");
+  writeFileSync(projectPath, JSON.stringify({ concurrencyMultiplier: 1.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 1.5,
+    "readSettings: project-only → project value (1.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: project overrides global
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-override-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  writeFileSync(projectPath, JSON.stringify({ concurrencyMultiplier: 1.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 1.5,
+    "readSettings: project overrides global (1.5, not 0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: malformed global falls back to defaults (warns, doesn't crash)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  // trailing comma + unquoted key → invalid JSON
+  writeFileSync(globalPath, "{concurrencyMultiplier: 1.0,}");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: malformed global → default multiplier (no crash)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: malformed project falls back to global (when global is valid)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-proj-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  writeFileSync(projectPath, "{not valid json");
+  const s = readSettings({ globalPath, projectPath });
+  // Malformed project → null → deepMergeSettings(0.5-parsed, null) → the
+  // global object wins (isPlainObject(null) is false → project returned as
+  // null, but the merge treats null project as "no override" so global survives).
+  assert(s.concurrencyMultiplier === 0.5,
+    "readSettings: malformed project → global value survives (0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: invalid multiplier values fall back to default
+// (0, negative, NaN, string, object, Infinity all rejected)
+for (const [label, raw] of [
+  ["zero", 0],
+  ["negative", -1],
+  ["NaN", NaN],
+  ["string", "1.0"],
+  ["object", { x: 1 }],
+  ["Infinity", Infinity],
+] as [string, unknown][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-settings-invalid-${label}-`));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: raw }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    `readSettings: invalid multiplier (${label}) → default`);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: valid multiplier values accepted (0.5, 1.0, 2.0, 3.0)
+for (const [label, raw, expected] of [
+  ["half", 0.5, 0.5],
+  ["full", 1.0, 1.0],
+  ["double", 2.0, 2.0],
+  ["triple", 3.0, 3.0],
+] as [string, number, number][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-settings-valid-${label}-`));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: raw }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === expected,
+    `readSettings: valid multiplier (${label}=${raw}) accepted`);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: extra unknown keys ignored (forward-compat)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-extra-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 2.0, futureField: "ignored" }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 2.0,
+    "readSettings: extra unknown keys ignored (multiplier still read)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: empty object → defaults (key absent → no warn, default returned)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-empty-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, "{}");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: empty object → default (key absent, no warn)");
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
