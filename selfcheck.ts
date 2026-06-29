@@ -8040,4 +8040,130 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
   }
 }
 
+// --- web-search factory: rt.multiplier wired into the capacity gate ---
+// The multiplier-wiring status-bar proof (above) drives umansFactory (index.ts)
+// exclusively — web-search.ts has no status bar, so no test observes rt.multiplier
+// flowing into the web-search factory's acquireSlot/isCapacityFree path at a
+// non-default value. A regression dropping multiplier from web-search.ts's rt
+// literal (e.g. hardcoding 1.0, or omitting the field -> NaN -> gate wedges)
+// would go uncaught. This test loads ONLY webSearchFactory with a settings file
+// at concurrencyMultiplier: 0.5, mocks /v1/usage with limit 4, and drives a
+// real searchTool.execute. With multiplier 0.5, effectiveLimit = floor(4*0.5) =
+// 2. At concurrent_sessions 2 (== cap 2) the gate reports not-free -> acquireSlot
+// polls /v1/usage more than once (gated). At concurrent_sessions 0 (< cap 2) the
+// gate launches immediately (one poll). The contrast proves the cap is 2 (the
+// multiplied value), not 4 (the unmultiplied server limit) — so rt.multiplier
+// flows into the web-search factory's acquireSlot path.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-mult-wiring-"));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_LIMIT; // no env override — multiplier path
+
+  const realFetch = globalThis.fetch;
+  // concurrentSessions controls what /v1/usage reports for the capacity gate.
+  // Phase 1: 2 (== multiplied cap 2) -> gated (not-free, polls repeatedly).
+  // Phase 2: 0 (< multiplied cap 2) -> free (launches after one poll).
+  let concurrentSessions = 2;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: concurrentSessions, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "search result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    // Load ONLY the standalone web-search factory — index.ts's factory must NOT
+    // have run, so the capacity gate is driven by the web-search instance's rt.
+    await webSearchFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const searchTool = tools.get("umans_web_search")!;
+
+    // Phase 1: concurrent_sessions 2 == multiplied cap 2 (floor(4*0.5)). The
+    // gate reports not-free -> acquireSlot polls /v1/usage repeatedly. Use a
+    // short abort timeout so the gated execute returns (fail-open or abort)
+    // rather than waiting the full 60s. Assert >1 /v1/usage poll happened
+    // (the gate is live + gating against the multiplied cap, not 4).
+    concurrentSessions = 2;
+    usageCalls = 0;
+    const abortCtrl1 = new AbortController();
+    const exec1 = searchTool.execute("call-1", { query: "test gated" }, abortCtrl1.signal, undefined, makeCtx());
+    // Give the gate a moment to poll a few times, then abort to unblock.
+    await new Promise((r) => setTimeout(r, 500));
+    abortCtrl1.abort();
+    await exec1.catch(() => {});
+    assert(usageCalls > 1,
+      `web-search factory multiplier 0.5: concurrent_sessions 2 == cap 2 -> acquireSlot polled /v1/usage ${usageCalls} times (gated, not free)`);
+
+    // Phase 2: concurrent_sessions 0 < multiplied cap 2. The gate reports free
+    // immediately -> acquireSlot polls /v1/usage once + launches. The /v1/messages
+    // fetch fires (the side-call proceeded). Assert exactly the launch happened.
+    concurrentSessions = 0;
+    usageCalls = 0;
+    const res = await searchTool.execute("call-2", { query: "test free" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof res?.content?.[0]?.text === "string" && res.content[0].text.length > 0,
+      "web-search factory multiplier 0.5: concurrent_sessions 0 < cap 2 -> side-call launched (result text returned)");
+    // At least one /v1/usage poll + the /v1/messages side-call fired (proving
+    // the gate let the launch through). usageCalls >= 1 (the launch poll);
+    // it may be >1 if the periodic refreshUsage also ran, so just assert >= 1.
+    assert(usageCalls >= 1,
+      `web-search factory multiplier 0.5: concurrent_sessions 0 -> gate let launch through (polled /v1/usage ${usageCalls} times)`);
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 console.log("\nall checks passed");

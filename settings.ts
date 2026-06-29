@@ -163,7 +163,11 @@ function readSettingsFile(path: string): unknown {
     fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.size > MAX_SETTINGS_BYTES) {
-      closeSync(fd);
+      // Non-regular (FIFO, device, swapped symlink) or oversized — treat as
+      // missing so the caller falls back to defaults without allocating/crashing.
+      // Do NOT closeSync(fd) here: the finally block below owns fd cleanup, so an
+      // early close would be double-closed (EBADF, swallowed) — a code-cleanliness
+      // inconsistency vs. the readState pattern this mirrors.
       return null;
     }
     const buf = Buffer.alloc(st.size);
