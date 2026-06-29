@@ -7230,6 +7230,9 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
     const conc = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
     assert(conc.includes(`Conc 0/${expectedLimit}`),
       `concurrencyLimit multiplier ${label}: status shows Conc 0/${expectedLimit}, got '${conc}'`);
+    // Dispatch session_shutdown to stop the factory's refresh + strike timers so
+    // the event loop drains and the process can exit cleanly.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
@@ -7307,6 +7310,9 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
     // Env override 3 wins over multiplier 0.5 (→ 2). hard_cap 8 doesn't clamp 3.
     assert(conc.includes("Conc 0/3"),
       `UMANS_CONCURRENCY_LIMIT=3 overrides multiplier 0.5: status shows Conc 0/3, got '${conc}'`);
+    // Dispatch session_shutdown to stop the factory's refresh + strike timers so
+    // the event loop drains and the process can exit cleanly.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
   } finally {
     globalThis.fetch = realFetch;
     for (const [k, v] of Object.entries(savedEnv)) {
