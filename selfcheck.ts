@@ -7195,4 +7195,218 @@ for (const [label, raw, expected] of [
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
+// --- concurrency multiplier wired into concurrencyLimit() (status-bar proof) ---
+// concurrencyLimit() is a closure inside the factory (not exported), so the
+// multiplier wiring is observed via the status bar's `Conc <current>/<limit>`
+// render. effectiveLimit = min(floor(serverLimit * multiplier), hardCap). The
+// deprio lowering (priority.low → cap - 1) is applied separately in
+// isCapacityFree (unchanged), so the status bar shows the pre-deprio multiplied
+// cap while the gate lowers by 1 when deprioritized — matching the prior
+// behavior where guaranteedConcurrency (pre-deprio) was shown.
+//
+// Each case: write a settings file, mock /v1/usage (limit + hard_cap),
+// dispatch session_start, assert the rendered `Conc 0/<expected>`.
+for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
+  // multiplier 0.5 → floor(4 * 0.5) = 2
+  ["0.5 halves (4->2)", 0.5, 4, 8, 2],
+  // multiplier 1.0 → floor(4 * 1.0) = 4 (full server limit)
+  ["1.0 full (4->4)", 1.0, 4, 8, 4],
+  // multiplier 3.0 → floor(4 * 3.0) = 12, clamped to hard_cap 8
+  ["3.0 clamps to hard_cap (4->8)", 3.0, 4, 8, 8],
+  // multiplier 2.0 → floor(4 * 2.0) = 8, exactly hard_cap (no clamp needed)
+  ["2.0 to hard_cap (4->8)", 2.0, 4, 8, 8],
+  // multiplier 1.0, no hard_cap reported → just floor(4 * 1.0) = 4 (no clamp)
+  ["1.0 no hard_cap (4->4)", 1.0, 4, undefined, 4],
+] as [string, number, number, number | undefined, number][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-mult-${label.replace(/[^a-z0-9]/gi, "-")}-`));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: multiplier }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_LIMIT; // no env override — multiplier path
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: serverLimit, ...(hardCapVal !== undefined ? { hard_cap: hardCapVal } : {}) } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const conc = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    assert(conc.includes(`Conc 0/${expectedLimit}`),
+      `concurrencyLimit multiplier ${label}: status shows Conc 0/${expectedLimit}, got '${conc}'`);
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- UMANS_CONCURRENCY_LIMIT env override still wins (bypasses multiplier) ---
+// The env var is the deprecated absolute override (testing knob): when set it
+// takes precedence over the multiplier. A settings file with multiplier 0.5
+// (→ effective 2) is bypassed by UMANS_CONCURRENCY_LIMIT=3 → effective 3.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-mult-env-override-"));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+    UMANS_CONCURRENCY_LIMIT: "3",
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const conc = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    // Env override 3 wins over multiplier 0.5 (→ 2). hard_cap 8 doesn't clamp 3.
+    assert(conc.includes("Conc 0/3"),
+      `UMANS_CONCURRENCY_LIMIT=3 overrides multiplier 0.5: status shows Conc 0/3, got '${conc}'`);
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- deprio + multiplier interaction (isCapacityFree lowers multiplied cap) ---
+// The multiplier applies in concurrencyLimit() (pre-deprio); the deprio
+// lowering (priority.low → cap - 1) is applied in isCapacityFree (unchanged).
+// multiplier 1.0 + limit 4 → effectiveLimit 4; deprio → isCapacityFree gates
+// against 3. multiplier 0.5 + limit 4 → effectiveLimit 2; deprio → gates 1.
+// Assert the multiplied cap is lowered by 1 under deprio via the pure
+// isCapacityFree decision (no factory spin-up needed).
+{
+  // multiplier 1.0: effectiveLimit 4, deprio → cap 3
+  const d1 = isCapacityFree(
+    { concurrentSessions: 3, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d1.free === false,
+    "deprio + multiplier 1.0 (limit 4): 3 sessions >= cap 3 (4-1) → not free");
+  const d1b = isCapacityFree(
+    { concurrentSessions: 2, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d1b.free === true,
+    "deprio + multiplier 1.0 (limit 4): 2 sessions < cap 3 (4-1) → free");
+  // multiplier 0.5: effectiveLimit 2 (floor(4*0.5)), deprio → cap 1
+  const d2 = isCapacityFree(
+    { concurrentSessions: 1, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 2, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2.free === false,
+    "deprio + multiplier 0.5 (effectiveLimit 2): 1 session >= cap 1 (2-1) → not free");
+  const d2b = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 2, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2b.free === true,
+    "deprio + multiplier 0.5 (effectiveLimit 2): 0 sessions < cap 1 (2-1) → free");
+  // multiplier 3.0 clamped to hard_cap 8, deprio → cap 7
+  const d3 = isCapacityFree(
+    { concurrentSessions: 7, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 8, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d3.free === false,
+    "deprio + multiplier 3.0 (clamped to hard_cap 8): 7 sessions >= cap 7 (8-1) → not free");
+}
+
 console.log("\nall checks passed");

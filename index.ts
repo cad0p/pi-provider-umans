@@ -64,6 +64,7 @@ import {
   type ModelCapabilities,
   type ReasoningInfo,
 } from "./utils.ts";
+import { readSettings } from "./settings.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -79,6 +80,10 @@ const SEARCH_DISABLE_ENV = "UMANS_SEARCH_DISABLE";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
 const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
 const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
+// Override for the global settings file (~/.pi/agent/umans.json). Mirrors
+// UMANS_CONCURRENCY_STATE_FILE: lets selfcheck point readSettings at a temp
+// file without monkey-patching homedir. No-op in normal use.
+const SETTINGS_FILE_ENV = "UMANS_SETTINGS_FILE";
 const VISION_MAX_TOKENS = 1024;
 const VISION_TIMEOUT_MS = 60_000;
 const VISION_ANALYSIS_PROMPT =
@@ -763,6 +768,11 @@ export default async function (pi: ExtensionAPI) {
   // === Status bar: TTFT | TPS | Conc current/guaranteed ===
   const STATUS_KEY = "umans";
   let guaranteedConcurrency: number | undefined;
+  // Account-wide hard burst cap (the 429 threshold). The multiplier clamps the
+  // effective limit to this so a high multiplier (e.g. 3.0 with limit 4 → 12)
+  // cannot push past the server's burst ceiling. Populated from
+  // /v1/usage limits.concurrency.hard_cap alongside guaranteedConcurrency.
+  let hardCap: number | undefined;
   let currentConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
@@ -782,8 +792,10 @@ export default async function (pi: ExtensionAPI) {
   // the live /v1/usage response polled by the head waiter, so multiple pi
   // processes (and multiple machines) coordinate through the server, not a
   // local count. UMANS_CONCURRENCY_DISABLE opts out (fire-and-forget).
-  // UMANS_CONCURRENCY_LIMIT is now only a display/testing hint: when set, the
-  // capacity check uses it instead of the server's limits.concurrency.limit.
+  // UMANS_CONCURRENCY_LIMIT is a deprecated absolute override (testing knob):
+  // when set it wins outright, bypassing the concurrency multiplier. The
+  // user-facing knob is the concurrencyMultiplier setting (~/.pi/agent/
+  // umans.json + .pi/umans.json); see concurrencyLimit + settings.ts.
   // UMANS_CONCURRENCY_STATE_FILE overrides the state file path so the
   // handler-wiring harness mock in selfcheck can point the real queue at a
   // tmpdir (isolating the test from the live ~/.pi/agent state file). Also
@@ -795,8 +807,34 @@ export default async function (pi: ExtensionAPI) {
     disabled: concurrencyDisabled,
     ...(concurrencyStateFile ? { stateFile: concurrencyStateFile } : {}),
   });
+  // Cache settings once at startup. concurrencyLimit() is on the hot path
+  // (called per acquireSlot poll iteration ~300ms + per status-bar render),
+  // so re-reading the file each call would hammer the filesystem. Restart
+  // picks up changes; a live-reload watcher is not required.
+  // UMANS_SETTINGS_FILE overrides the global path (~/.pi/agent/umans.json)
+  // so selfcheck can point at a temp file; the project path (.pi/umans.json)
+  // resolves against cwd as in production.
+  const settingsGlobalPath = process.env[SETTINGS_FILE_ENV]?.trim() || undefined;
+  const cachedSettings = readSettings(
+    settingsGlobalPath ? { globalPath: settingsGlobalPath } : undefined,
+  );
   function concurrencyLimit(): number | undefined {
-    return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
+    // UMANS_CONCURRENCY_LIMIT env var is the absolute override (testing knob):
+    // when set it wins outright, bypassing the multiplier. Takes precedence
+    // over everything so existing CI/test scripts keep working.
+    if (process.env[CONCURRENCY_LIMIT_ENV] !== undefined) {
+      return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
+    }
+    // No env override: scale the server's soft cap by the multiplier, then
+    // clamp to hard_cap so a high multiplier cannot push past the server's
+    // burst ceiling (the 429 threshold). multiplier 1.0 = full guaranteed
+    // concurrency (the default); 0.5 = half; 2.0 = burst into hard_cap headroom.
+    // floor() because concurrency is an integer slot count (0.5 of 4 = 2).
+    const serverLimit = guaranteedConcurrency;
+    if (serverLimit === undefined) return undefined; // /v1/usage not yet populated
+    const multiplier = cachedSettings.concurrencyMultiplier;
+    const scaled = Math.floor(serverLimit * multiplier);
+    return hardCap !== undefined ? Math.min(scaled, hardCap) : scaled;
   }
 
   type LiveRequest = {
@@ -1107,6 +1145,7 @@ export default async function (pi: ExtensionAPI) {
       // null ?? undefined normalizes unlimited (null) limits so the display
       // guards below hide them instead of rendering "x/null".
       guaranteedConcurrency = data.limits.concurrency?.limit ?? undefined;
+      hardCap = data.limits.concurrency?.hard_cap ?? undefined;
       currentConcurrency = data.usage?.concurrent_sessions;
       requestLimit = data.limits.requests?.limit ?? undefined;
       requestsUsed = data.usage?.requests_in_window;
