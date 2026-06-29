@@ -39,58 +39,37 @@ import { createHash } from "node:crypto";
 import {
   createConcurrencyQueue,
   parsePriority,
-  clampPauseUntil,
   isCapacityFree,
   parseConcurrencyLimit,
-  PRIORITY_BACKOFF_MS,
-  PAUSE_REASON_429,
   PAUSE_REASON_STRIKES,
-  PAUSE_REASON_CAP_ABUSE,
   PAUSE_REASON_403_BRIDGE,
   PAUSE_403_BRIDGE_MS,
   STICKY_PAUSE_REASONS,
-  extractBoxedUntil,
-  isSuspendBody,
-  MAX_PAUSE_429_MS,
-  SANITIZE_CTRL_RE,
+  PRIORITY_BACKOFF_MS,
   type ConcurrencyQueue,
   type PriorityState,
 } from "./concurrency-queue.ts";
+import {
+  USER_AGENT,
+  SEARCH_TIMEOUT_MS,
+  SEARCH_MAX_TOKENS,
+  pickSearchModel,
+  sanitizeErrorBody,
+  handle429,
+  raiseForUmansStatus,
+  readRetryAfter,
+  extractBoxedUntil,
+  isSuspendBody,
+  type UmansModelInfo,
+  type ModelCapabilities,
+  type ReasoningInfo,
+} from "./utils.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-// Derive USER_AGENT from package.json so the version doesn't drift on
-// release. ESM JSON import attribute `with { type: "json" }` is stable in
-// Node 20.10+ (the engines floor is >=20.10.0, matching this requirement).
-import pkg from "./package.json" with { type: "json" };
-
-type ReasoningInfo = {
-  supported: boolean;
-  can_disable: boolean;
-  levels: string[];
-  default_level: string;
-};
-
-type ModelCapabilities = {
-  max_completion_tokens?: number;
-  recommended_max_tokens?: number;
-  context_window?: number;
-  supports_vision?: boolean | "via-handoff";
-  supports_tools?: boolean;
-  reasoning?: ReasoningInfo;
-};
-
-type UmansModelInfo = {
-  name: string;
-  display_name?: string;
-  description?: string;
-  deprecation?: unknown;
-  capabilities: ModelCapabilities;
-};
 
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
-const USER_AGENT = `pi-umans-provider/${pkg.version}`;
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
 // Client-side vision handoff env + tuning. See header doc for the design.
@@ -106,10 +85,6 @@ const VISION_ANALYSIS_PROMPT =
   "You are a vision assistant for a text-only coding model. Analyze the attached image thoroughly but concisely. " +
   "Capture: any visible text (verbatim), UI/layout, code/errors/stack traces, diagrams/charts, and other notable details. " +
   "Write a compact structured report. Do not speculate beyond what is visible.";
-
-// Web search side-call tuning. See searchWeb / the umans_web_search tool.
-const SEARCH_TIMEOUT_MS = 30_000;
-const SEARCH_MAX_TOKENS = 2048;
 
 // PRIORITY_BACKOFF_MS is imported from concurrency-queue.ts (the single
 // source of truth — it's also the parsePriority fallback for a null boxed_until).
@@ -444,19 +419,6 @@ export function pickVisionModel(catalog: Record<string, UmansModelInfo>): string
 }
 
 /**
- * Pick the model used to run the side-call web search. Defaults to umans-flash
- * (fastest); falls back to the first tool-capable model if flash is absent.
- */
-export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string {
-  const defaultId = "umans-flash";
-  if (catalog[defaultId] && !catalog[defaultId].deprecation) return defaultId;
-  for (const [id, info] of Object.entries(catalog)) {
-    if (!info.deprecation && info.capabilities?.supports_tools) return id;
-  }
-  return defaultId;
-}
-
-/**
  * Formats a human-readable countdown to a future deadline (e.g. " 3h12m",
  * " 45m", " 2s", " 0s"). Returns "" for past deadlines (already cleared).
  * Used by the DEPRIO + PAUSED status-bar banners so the user sees how long
@@ -531,153 +493,6 @@ export function formatStatusText(opts: {
 
 export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
-}
-
-/**
- * cap + sanitize a gateway error body before echoing it into a tool
- * result / thrown error message. Gateway error bodies are attacker-controlled
- * (a compromised/misconfigured gateway can push crafted text) + flow into the
- * model's context (prompt-injection surface). Cap to 80 chars (down from 200)
- * + strip non-printable / control / ANSI-escape chars so a crafted body cannot
- * mangle the message or inject control sequences. Mirrors sanitizeReason's
- * approach. Exported so selfcheck can unit-test the cap + strip.
- */
-const ERROR_BODY_MAX_CHARS = 80;
-// mirror sanitizeReason's strip — control + ESC + Unicode
-// bidi/RTL overrides + zero-width/BOM chars that could spoof displayed text.
-// uses the shared SANITIZE_CTRL_RE export from concurrency-queue.ts
-// so the character class stays in sync with sanitizeReason without manual
-// duplication. The 80-char cap stays local (sanitizeReason caps at 64).
-export function sanitizeErrorBody(body: string): string {
-  const cleaned = body.replace(SANITIZE_CTRL_RE, "").trim();
-  return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
-}
-
-/**
- * Shared 429 handler: parse Retry-After (strict integer form only), clamp to
- * MAX_PAUSE_429_MS, push the shared pause (PAUSE_REASON_429) so sibling pi
- * processes back off, and return the resolved `until` deadline so the caller
- * can notify. COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS)
- * — the lost pause is bounded by the 120s watchdog + the 5s refreshUsage poll,
- * so warn + swallow so the caller's turn is not aborted.
- *
- * extracted from after_provider_response so the side-call sites
- * (analyzeImage, searchWeb) push the SAME shared pause when they receive a
- * 429. Per D6 each side-call consumes a real account concurrency slot, and
- * per Umans docs each concurrency 429 deprioritizes the whole account ~30
- * min — so a side-call 429 must back off siblings (and the main turn on its
- * next launch), not merely throw.
- *
- * Accepts either a fetch Response (res.headers.get) or a pi after_provider_
- * response event (event.headers[...]) — the Retry-After header lookup is
- * duck-typed so the same helper drives all three sites.
- */
-export function handle429(
-  source: { status: number; headers?: Headers | Record<string, string> | undefined | null },
-  concurrencyQueue: { pauseUntil(until: number, reason?: string | null): void },
-): number {
-  // readRetryAfter calls headers.get("retry-after") which could
-  // throw on a malformed pi event (a buggy/Headers-like object whose .get
-  // throws). The surrounding handle429 only wrapped pauseUntil in try/catch,
-  // so a throwing .get propagated out as an unhandled extension error. Wrap
-  // the header parse + fall back to the PRIORITY_BACKOFF_MS deadline on throw,
-  // mirroring the pauseUntil guard below.
-  let retryAfter: string | undefined;
-  try {
-    retryAfter = readRetryAfter(source.headers);
-  } catch (err) {
-    console.warn("umans: readRetryAfter threw in 429 handler (falling back to default backoff):", err instanceof Error ? err.message : err);
-    retryAfter = undefined;
-  }
-  let until = Date.now() + PRIORITY_BACKOFF_MS;
-  if (retryAfter) {
-    // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or an
-    // HTTP-date. We only accept the integer form: Number() accepts hex
-    // ("0x10"=16), scientific notation ("1e10"=1e10), and other misparses
-    // that can wedge the queue. Parse strictly and cap the resulting
-    // deadline at now + MAX_PAUSE_429_MS via clampPauseUntil (a
-    // 429-sourced pause is clamped tighter than the 5h ceiling so a
-    // misconfigured UMANS_BASE_URL returning 429 forever cannot wedge the
-    // account for hours; pauseUntil also enforces this ceiling).
-    const trimmed = String(retryAfter).trim();
-    if (/^\d+$/.test(trimmed)) {
-      const secs = parseInt(trimmed, 10);
-      if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000, Date.now(), MAX_PAUSE_429_MS);
-    }
-  }
-  try {
-    concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
-  } catch (err) {
-    console.warn("umans: pauseUntil threw in 429 handler (continuing):", err instanceof Error ? err.message : err);
-  }
-  return until;
-}
-
-/**
- * shared !res.ok handler for the side-call sites (analyzeImage,
- * searchWeb). Both sites duplicated the same 429-push + read-body + sanitize +
- * throw block. This helper runs the 429 push (a side-call 429
- * deprioritizes the whole account — per D6 the side-call consumes a real
- * concurrency slot — so push the shared pause so sibling pi processes + the
- * main turn on its next launch back off, do NOT merely throw), reads + caps +
- * sanitizes the gateway error body (attacker-controlled body must not
- * inject control sequences or mangle the tool result), then throws an Error
- * carrying HTTP status + the sanitized body. The Promise<never> return type
- * preserves control-flow narrowing (no dangling code after the call).
- *
- * Accepts the same duck-typed { status, headers } shape as handle429 (a fetch
- * Response) + the optional concurrencyQueue (omitted when the caller has no
- * queue — then only the body sanitize + throw run, matching the prior inline
- * behavior).
- */
-export async function raiseForUmansStatus(
-  res: { status: number; headers?: Headers | Record<string, string> | undefined | null; text(): Promise<string> },
-  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
-): Promise<never> {
-  if (res.status === 429 && concurrencyQueue) {
-    handle429(res, concurrencyQueue);
-  }
-  // read text() ONCE into a local. A fetch Response body can only be
-  // consumed once; reading it again returns "". The 403 suspend-body check
-  // + the sanitizeErrorBody call below both operate on this same string.
-  const txt = await res.text().catch(() => "");
-  // 403 suspend-family body (account_suspended / cap_abuse / cap_suspended /
-  // billing_error) → treat like a 429: extractBoxedUntil + push
-  // PAUSE_REASON_CAP_ABUSE so siblings back off. isSuspendBody gates; a
-  // non-suspend 403 (auth error, proxy HTML) does NOT pause — the turn still
-  // throws, but the gate is not poisoned for siblings. See extractBoxedUntil
-  // for the tolerant-extraction + past-as-absent rationale.
-  if (res.status === 403 && concurrencyQueue && isSuspendBody(txt)) {
-    const now = Date.now();
-    const extracted = extractBoxedUntil(txt);
-    const until = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
-    try {
-      concurrencyQueue.pauseUntil(until, PAUSE_REASON_CAP_ABUSE);
-    } catch (err) {
-      console.warn("umans: pauseUntil threw in 403 handler (continuing):", err instanceof Error ? err.message : err);
-    }
-  }
-  // cap + sanitize the gateway error body before echoing it (cap 80,
-  // strip non-printable / ANSI-escape) so a crafted body cannot inject
-  // control sequences or mangle the tool result.
-  const safe = sanitizeErrorBody(txt);
-  throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
-}
-
-/** Duck-typed Retry-After header lookup (fetch Headers .get OR a plain record). */
-function readRetryAfter(headers: Headers | Record<string, string> | undefined | null): string | undefined {
-  if (!headers) return undefined;
-  // fetch Response.headers (Headers) exposes .get; pi's after_provider_response
-  // event.headers is a plain record indexed by lowercased header name.
-  if (typeof (headers as Headers).get === "function") {
-    return (headers as Headers).get("retry-after") ?? undefined;
-  }
-  const rec = headers as Record<string, string>;
-  // Try exact + case-insensitive (Retry-After / retry-after / RETRY-AFTER).
-  for (const k of Object.keys(rec)) {
-    if (k.toLowerCase() === "retry-after") return rec[k];
-  }
-  return undefined;
 }
 
 /*

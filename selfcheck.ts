@@ -8,7 +8,18 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, countdown, sanitizeErrorBody, handle429, raiseForUmansStatus } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, formatStatusText, countdown } from "./index.ts";
+import {
+  pickSearchModel,
+  sanitizeErrorBody,
+  handle429,
+  raiseForUmansStatus,
+  readRetryAfter,
+  USER_AGENT,
+  SEARCH_TIMEOUT_MS,
+  SEARCH_MAX_TOKENS,
+  type UmansModelInfo,
+} from "./utils.ts";
 import {
   parsePriority,
   readState,
@@ -5341,13 +5352,25 @@ if (process.platform !== "win32") {
 // block inlined in their !res.ok branch. The refactor extracts a single
 // raiseForUmansStatus(res, concurrencyQueue) helper + calls it from both sites.
 // A regression re-inlining the block (or dropping the 429 push / sanitize at one
-// site) would not be caught by the existing COV9-4 side-call 429 tests alone.
+// site) would not be caught by the existing side-call 429 tests alone.
 // Pin the helper exists + is called from both sites by source inspection.
+// The helper lives in utils.ts (pure helpers module); the call sites
+// (analyzeImage + searchWeb) live in index.ts until the web-search split.
 {
-  const src = readFileSync("index.ts", "utf8");
-  assert(src.includes("async function raiseForUmansStatus("),
-    "raiseForUmansStatus helper defined in index.ts");
+  const utilsSrc = readFileSync("utils.ts", "utf8");
+  assert(utilsSrc.includes("export async function raiseForUmansStatus("),
+    "raiseForUmansStatus helper defined in utils.ts");
+  // The helper runs the 429 push (handle429) + the body sanitize
+  // (sanitizeErrorBody) — pin both are referenced inside it.
+  const helperStart = utilsSrc.indexOf("export async function raiseForUmansStatus(");
+  const helperEnd = utilsSrc.indexOf("\n}\n", helperStart);
+  const helperBody = utilsSrc.slice(helperStart, helperEnd);
+  assert(helperBody.includes("handle429(res, concurrencyQueue)"),
+    "raiseForUmansStatus runs the 429 push (handle429)");
+  assert(helperBody.includes("sanitizeErrorBody(txt)"),
+    "raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
   // Both side-call sites call the helper in their !res.ok branch.
+  const src = readFileSync("index.ts", "utf8");
   const analyzeIdx = src.indexOf("async function analyzeImage(");
   const searchIdx = src.indexOf("async function searchWeb(");
   assert(analyzeIdx >= 0 && searchIdx > analyzeIdx,
@@ -5358,15 +5381,6 @@ if (process.platform !== "win32") {
     "analyzeImage !res.ok branch calls raiseForUmansStatus");
   assert(searchCallIdx > searchIdx,
     "searchWeb !res.ok branch calls raiseForUmansStatus");
-  // The helper runs the 429 push (handle429) + the body sanitize
-  // (sanitizeErrorBody) — pin both are referenced inside it.
-  const helperStart = src.indexOf("async function raiseForUmansStatus(");
-  const helperEnd = src.indexOf("\n}\n", helperStart);
-  const helperBody = src.slice(helperStart, helperEnd);
-  assert(helperBody.includes("handle429(res, concurrencyQueue)"),
-    "raiseForUmansStatus runs the 429 push (handle429)");
-  assert(helperBody.includes("sanitizeErrorBody(txt)"),
-    "raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
 }
 
 // --- concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
@@ -5410,8 +5424,10 @@ if (process.platform !== "win32") {
 // postversion hook or a build step the hardcoded string would stay stale.
 // Pin that USER_AGENT is built from pkg.version (imported from package.json)
 // + that it currently matches the released version, so drift is caught in CI.
+// USER_AGENT + the package.json import live in utils.ts (the pure-helpers
+// module that owns the shared constants).
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   const pkg = JSON.parse(readFileSync("package.json", "utf8"));
   // USER_AGENT must be a template literal interpolating pkg.version, not a
   // hardcoded version string.
