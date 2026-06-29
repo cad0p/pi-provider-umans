@@ -25,14 +25,16 @@
  * cross-process coordination already does. The apiKey is resolved at tool
  * execute time via ctx.modelRegistry.getApiKeyForProvider("umans") (available
  * to any extension via ctx — no shared closure with index.ts needed), and
- * baseUrl resolves from UMANS_BASE_URL (re-resolved locally; trivial).
+ * baseUrl resolves via the shared resolveBaseUrl() helper (UMANS_BASE_URL or
+ * the default).
  *
  * The refresh + fetch + capacity-poll machinery (refreshStrikes,
  * refreshUsage, fetchUsage, fetchUsageSnapshot, fetch429Strikes, decideLaunch,
- * nextPollInterval, resolveApiKey, concurrencyLimit, the capacity-poll +
- * strike constants) is imported from utils.ts — ONE copy shared with index.ts
- * so the two factories cannot diverge on the strike-pause gate (a prior
- * duplicated copy missed the deprioritized gate + never started the periodic
+ * nextPollInterval, resolveApiKey, concurrencyLimit, acquireSlotCore, the
+ * capacity-poll + strike constants) is imported from utils.ts — ONE copy
+ * shared with index.ts so the two factories cannot diverge on the
+ * strike-pause gate or the capacity-poll loop (a prior duplicated copy
+ * missed the deprioritized gate + never started the periodic refreshUsage
  * refreshUsage loop). Each factory builds a ConcurrencyRuntime carrying its
  * own queue instance + mutable capacity state + calls the shared functions
  * with it. searchWeb + raiseForUmansStatus + pickSearchModel + the search
@@ -40,7 +42,6 @@
  */
 import {
   createConcurrencyQueue,
-  isCapacityFree,
   type ConcurrencyQueue,
 } from "./concurrency-queue.ts";
 import {
@@ -49,13 +50,10 @@ import {
   SEARCH_MAX_TOKENS,
   pickSearchModel,
   raiseForUmansStatus,
-  decideLaunch,
-  nextPollInterval,
-  POLL_INTERVAL_BASE_MS,
-  fetchUsageSnapshot,
   resolveApiKey,
-  concurrencyLimit as sharedConcurrencyLimit,
+  acquireSlotCore,
   releaseSlotCore,
+  resolveBaseUrl,
   stopRefreshLoop,
   restartRefreshLoop,
   refreshUsage as sharedRefreshUsage,
@@ -66,7 +64,6 @@ import { readSettings } from "./settings.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
 const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
 // Override for the global settings file (~/.pi/agent/umans.json). Mirrors
@@ -76,11 +73,12 @@ const SETTINGS_FILE_ENV = "UMANS_SETTINGS_FILE";
 
 // The capacity-poll + strike-counter constants (CAPACITY_POLL_TIMEOUT_MS,
 // STRIKE_*, POLL_INTERVAL_*), the pure decideLaunch / nextPollInterval
-// helpers, and the resolveApiKey / concurrencyLimit / refresh + fetch
-// machinery all live in utils.ts — shared with index.ts so the two factories
-// cannot diverge on the strike-pause gate. This factory builds a
-// ConcurrencyRuntime carrying its own queue instance + mutable capacity state
-// + calls the shared functions with it.
+// helpers, and the resolveApiKey / resolveBaseUrl / concurrencyLimit /
+// acquireSlotCore / refresh + fetch machinery all live in utils.ts — shared
+// with index.ts so the two factories cannot diverge on the strike-pause gate
+// or the capacity-poll loop. This factory builds a ConcurrencyRuntime
+// carrying its own queue instance + mutable capacity state + calls the
+// shared functions with it.
 
 /**
  * Run a web search by making a sub-request to the Umans gateway with the
@@ -189,8 +187,7 @@ function fallbackCatalogForSearch(): Record<string, UmansModelInfo> {
 export default async function (pi: ExtensionAPI) {
   if (process.env.UMANS_DISABLE === "1") return;
 
-  const baseUrl =
-    process.env.UMANS_BASE_URL?.trim().replace(/\/$/, "") || DEFAULT_BASE_URL;
+  const baseUrl = resolveBaseUrl();
 
   // The search model is picked from the static fallback (web-search.ts does not
   // fetch /v1/models/info — that's index.ts's job). pickSearchModel defaults to
@@ -242,103 +239,15 @@ export default async function (pi: ExtensionAPI) {
     refreshStopped: false,
   };
 
-  // Acquire a concurrency slot for the web-search side-call. Mirrors index.ts's
-  // acquireSlot: joins the cross-process FIFO, waits until head + claims the
-  // launch token, polls /v1/usage until a free slot, returns a release fn. The
-  // `apiKey` is used for the head-waiter poll. Returns undefined when the queue
-  // is disabled or the turn's AbortSignal fires mid-poll.
+  // Acquire a concurrency slot for the web-search side-call. Delegates to the
+  // shared acquireSlotCore (utils.ts, one copy shared with index.ts so the
+  // capacity-poll loop cannot diverge) which joins the cross-process FIFO,
+  // waits until head + claims the launch token, polls /v1/usage until a free
+  // slot, and returns a release fn. Returns undefined when the queue is
+  // disabled or the turn's AbortSignal fires mid-poll. The `apiKey` is used
+  // for the head-waiter poll.
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<(() => void) | undefined> {
-    const initialId = concurrencyQueue.join();
-    if (!initialId) return undefined; // queue disabled
-    let ourId: string = initialId;
-    let released = false;
-    const MAX_TOKEN_REJOINS = 3;
-    let releaseToken: () => void = () => {};
-    try {
-    tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
-      let releaseTokenThisIter: () => void;
-      try {
-        releaseTokenThisIter = await concurrencyQueue.waitForLaunch(ourId, signal);
-      } catch (err) {
-        if (signal?.aborted) {
-          released = true;
-          return undefined;
-        }
-        throw err;
-      }
-      releaseToken = releaseTokenThisIter;
-      const limit = sharedConcurrencyLimit(rt);
-      const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
-        const snap = await fetchUsageSnapshot(rt, apiKey, signal);
-        const qSnap = concurrencyQueue.snapshot();
-        const decision = isCapacityFree(snap, {
-          limit,
-          queuePaused,
-          localInFlight: qSnap.inflightCount,
-        });
-        if (decision.repause) {
-          const alreadyCovered = queuePaused &&
-            qSnap.pausedUntil >= decision.repause.until &&
-            qSnap.pausedReason === decision.repause.reason;
-          if (!alreadyCovered) {
-            try {
-              concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
-            } catch (err) {
-              console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
-            }
-          }
-        }
-        return decision.free;
-      };
-      const pollStart = Date.now();
-      let pollIntervalMs = POLL_INTERVAL_BASE_MS;
-      for (;;) {
-        if (!concurrencyQueue.touchToken(ourId)) {
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-          if (rejoins >= MAX_TOKEN_REJOINS) {
-            releaseToken = () => {};
-            break;
-          }
-          ourId = concurrencyQueue.join()!;
-          continue tokenAcquire;
-        }
-        const queuePaused = concurrencyQueue.snapshot().paused;
-        const isFree = await capacityFree(queuePaused);
-        const decision = decideLaunch({
-          isFree,
-          elapsedMs: Date.now() - pollStart,
-          queuePaused,
-          signalAborted: !!signal?.aborted,
-        });
-        if (decision === "launch") break;
-        if (decision === "abort") {
-          try { releaseToken(); } catch { /* best-effort */ }
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-          released = true;
-          return undefined;
-        }
-        if (decision === "failOpen") {
-          break;
-        }
-        await new Promise((r) => setTimeout(r, pollIntervalMs + Math.floor(Math.random() * 100)));
-        pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
-      }
-      concurrencyQueue.addInFlight(ourId);
-      try { releaseToken(); } catch { /* best-effort — release-resilience */ }
-      releaseToken = () => {};
-      released = true;
-      return () => {
-        releaseToken();
-        try { concurrencyQueue.removeInFlight(ourId); } catch { /* best-effort */ }
-        concurrencyQueue.cancel(ourId);
-      };
-    }
-    return undefined;
-    } finally {
-      if (!released) {
-        try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-      }
-    }
+    return acquireSlotCore(rt, apiKey, signal);
   }
 
   // releaseSlotCore (from utils.ts) runs the release closure swallowing

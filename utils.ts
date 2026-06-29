@@ -264,24 +264,38 @@ export const CAPACITY_POLL_TIMEOUT_MS = 60_000;
 // in-flight (the concurrency limit, e.g. 4), so a burst of in-flight requests
 // between the poll + the server's counter update can't tip us over before we
 // react. With limit=4 → threshold=16.
-export const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
-export const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
-export const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
-export const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
+const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
+const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
+const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
 
-// /usage poll-interval backoff tuning (used by nextPollInterval + acquireSlot).
+// /usage poll-interval backoff tuning (used by nextPollInterval + acquireSlotCore).
 export const POLL_INTERVAL_BASE_MS = 300;
-export const POLL_INTERVAL_CAP_MS = 2_000;
-export const POLL_INTERVAL_GROWTH = 1.5;
+const POLL_INTERVAL_CAP_MS = 2_000;
+const POLL_INTERVAL_GROWTH = 1.5;
+
+/** Default gateway base URL when UMANS_BASE_URL is unset. */
+const DEFAULT_BASE_URL = "https://api.code.umans.ai";
+
+/**
+ * Resolve the gateway base URL from UMANS_BASE_URL (trimmed, trailing slash
+ * normalized) or fall back to DEFAULT_BASE_URL. Both factories call this once at
+ * startup + assign to rt.baseUrl, so the literal + the normalization live in
+ * one place.
+ */
+export function resolveBaseUrl(): string {
+  return process.env.UMANS_BASE_URL?.trim().replace(/\/$/, "") || DEFAULT_BASE_URL;
+}
 
 const API_KEY_ENV = "UMANS_API_KEY";
 const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
 
 /**
  * The /v1/usage response shape (the fields the refresh machinery reads).
- * Exported so the afterRefreshUsage status-bar hook can be typed.
+ * afterRefreshUsage (the status-bar hook on ConcurrencyRuntime) receives it,
+ * so the type stays in the same module as the runtime.
  */
-export type UsageData = {
+type UsageData = {
   limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
   usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
 };
@@ -336,7 +350,7 @@ export interface ConcurrencyRuntime {
  *   still-deprioritized account.
  * - `wait`: keep polling (300ms + jitter).
  */
-export type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
+type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
 export function decideLaunch(opts: {
   isFree: boolean;
   elapsedMs: number;
@@ -674,7 +688,7 @@ export function restartRefreshLoop(rt: ConcurrencyRuntime, apiKey: string): void
 }
 
 /** Schedule the next periodic refreshUsage (5s). Re-schedules itself. */
-export function scheduleRefresh(rt: ConcurrencyRuntime, apiKey: string): void {
+function scheduleRefresh(rt: ConcurrencyRuntime, apiKey: string): void {
   if (rt.refreshStopped || !apiKey) return;
   rt.refreshTimer = setTimeout(async () => {
     await refreshUsage(rt, apiKey);
@@ -709,5 +723,181 @@ export function releaseSlotCore(release: (() => void) | undefined): void {
     release();
   } catch (err) {
     console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
+  }
+}
+
+/**
+ * Acquire a concurrency slot for an outbound request (main turn or a
+ * side-call). Joins the cross-process FIFO, waits until head + claims the
+ * launch token, polls /v1/usage until the server reports a free slot, then
+ * returns a release fn that drops the token + waiter entry. Returns undefined
+ * when the queue is disabled or the turn's AbortSignal fires mid-poll (clean
+ * cancellation, not a throw).
+ *
+ * This function BLOCKS until the slot is acquired — it is NOT a fast
+ * non-blocking check. The wait is the FIFO queue wait (possibly minutes under
+ * contention) + the /v1/usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
+ * 60s fail-open, or longer while a known pause is active).
+ *
+ * The `apiKey` is used for the head-waiter poll. All captured state lives on
+ * `rt` (the ConcurrencyRuntime), so this helper has no per-factory closure state
+ * — both factories call it with their own rt. index.ts wraps the returned
+ * release fn in its own releaseSlot (mainTurnRelease tracking + status-bar
+ * re-render); web-search.ts uses it directly.
+ */
+export async function acquireSlotCore(rt: ConcurrencyRuntime, apiKey: string, signal?: AbortSignal): Promise<(() => void) | undefined> {
+  const queue = rt.queue;
+  const initialId = queue.join();
+  if (!initialId) return undefined; // queue disabled
+  let ourId: string = initialId;
+  let released = false;
+  const MAX_TOKEN_REJOINS = 3;
+  let releaseToken: () => void = () => {};
+  try {
+    tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
+      let releaseTokenThisIter: () => void;
+      try {
+        releaseTokenThisIter = await queue.waitForLaunch(ourId, signal);
+      } catch (err) {
+        // waitForLaunch rejects with "waitForLaunch aborted" when the signal is
+        // already aborted (or aborts mid-wait). Return undefined (matching the
+        // disabled-mode shape) so Ctrl-C surfaces as a clean cancellation, not an
+        // uncaught extension error. waitForLaunch already cancelled our waiter.
+        if (signal?.aborted) {
+          released = true;
+          return undefined;
+        }
+        throw err; // non-abort throw (lock timeout, EACCES) — propagate
+      }
+      releaseToken = releaseTokenThisIter;
+      const limit = concurrencyLimit(rt);
+      // Read queuePaused ONCE per poll iteration into a local const + pass the
+      // same value to capacityFree + decideLaunch. Two unlocked snapshot reads
+      // straddling an await could let capacityFree see queuePaused:true then
+      // decideLaunch see queuePaused:false + elapsedMs >= 60s → failOpen into a
+      // pause. Reading once makes the fail-open-during-pause guard structural.
+      const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
+        const snap = await fetchUsageSnapshot(rt, apiKey, signal);
+        const qSnap = queue.snapshot();
+        const decision = isCapacityFree(snap, {
+          limit,
+          queuePaused,
+          localInFlight: qSnap.inflightCount,
+        });
+        if (decision.repause) {
+          // Write-amplification guard: skip the pauseUntil call when the
+          // active pause already covers the requested deadline + reason. The
+          // poll loop calls capacityFree every ~300ms; over a long suspension
+          // that would be thousands of no-op lock acquisitions + file writes
+          // (extend-never-shorten means the deadline does not move).
+          const alreadyCovered = queuePaused &&
+            qSnap.pausedUntil >= decision.repause.until &&
+            qSnap.pausedReason === decision.repause.reason;
+          if (!alreadyCovered) {
+            // pauseUntil can throw on disk failure (EACCES, ENOSPC, EROFS). The
+            // pause is a best-effort coordination signal (the server's
+            // priority.low + the 120s watchdog bound it); warn + swallow so a
+            // disk error does not abort a turn that already waited its FIFO
+            // place.
+            try {
+              queue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
+            } catch (err) {
+              console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
+            }
+          }
+        }
+        return decision.free;
+      };
+      const pollStart = Date.now();
+      // Exponential backoff on the poll interval when capacity is steadily full
+      // (300ms → 2000ms by 1.5×; reset to 300ms on launch/failOpen). The ±100ms
+      // jitter breaks phase-locking across machines polling /usage on the same
+      // tick. The branch logic lives in decideLaunch (pure, unit-tested).
+      let pollIntervalMs = POLL_INTERVAL_BASE_MS;
+      for (;;) {
+        // Re-stamp our token's ts each iteration so the 120s watchdog does not
+        // reap a legitimately long capacity poll. If the token was already
+        // reaped by a sibling's reapStale (id mismatch or absent), touchToken
+        // returns false — bail out of this poll, cancel our (now-stale) waiter,
+        // re-join the queue, + wait our turn again. Guarded re-entry: bail
+        // after MAX_TOKEN_REJOINS so a pathological state cannot wedge us here
+        // forever (fall back to fail-open, bounded by the watchdog + hard_cap
+        // headroom).
+        if (!queue.touchToken(ourId)) {
+          try { queue.cancel(ourId); } catch { /* best-effort */ }
+          if (rejoins >= MAX_TOKEN_REJOINS) {
+            // Pathological state: reaped + re-joined too many times. Fail open
+            // rather than loop forever (bounded by the watchdog + the hard_cap
+            // headroom). Clear the stale releaseToken closure before break —
+            // it still points at the prior iteration's closure (a no-op since
+            // the token was reaped, but confusing: the returned closure would
+            // pretend to release a token we no longer hold). Point it at an
+            // explicit no-op so fail-open proceeds without holding (or pretending
+            // to release) a token.
+            releaseToken = () => {};
+            break;
+          }
+          ourId = queue.join()!;
+          continue tokenAcquire;
+        }
+        const queuePaused = queue.snapshot().paused;
+        const isFree = await capacityFree(queuePaused);
+        const decision = decideLaunch({
+          isFree,
+          elapsedMs: Date.now() - pollStart,
+          queuePaused,
+          signalAborted: !!signal?.aborted,
+        });
+        if (decision === "launch") break; // capacity free — proceed to send
+        if (decision === "abort") {
+          // Ctrl-C mid-poll → return undefined (matching the disabled-mode
+          // shape) instead of throwing. We already hold the token, so release it
+          // before returning so the next head can poll immediately.
+          try { releaseToken(); } catch { /* best-effort */ }
+          try { queue.cancel(ourId); } catch { /* best-effort */ }
+          released = true;
+          return undefined;
+        }
+        if (decision === "failOpen") {
+          // Only fail open when no known pause is active. A known pause means
+          // the gate has a positive deprio signal; keep waiting (bounded by the
+          // pause deadline + the 120s token watchdog). The decideLaunch guard
+          // already checked queuePaused, so fail-open here is safe.
+          break;
+        }
+        // decision === "wait"
+        await new Promise((r) => setTimeout(r, pollIntervalMs + Math.floor(Math.random() * 100)));
+        pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
+      }
+      // local in-flight tracking: add an in-flight entry BEFORE releasing the
+      // token (the order is load-bearing — the next head's readState must see
+      // our entry before it can claim the token, so max(localInFlight,
+      // concurrent_sessions) counts us + blocks a sibling from launching into
+      // our still-in-flight request). addInFlight is fail-closed: a throw
+      // propagates to the finally, which cancels the waiter + token.
+      queue.addInFlight(ourId);
+      // Release the token IMMEDIATELY (not at message_end) so the next head can
+      // poll + launch. The token serializes the /usage poll; holding it across
+      // the send serializes to 1-at-a-time. Releasing here lets the next head
+      // poll right away; the server's /usage lag means it sees a stale-low
+      // concurrent_sessions + launches, achieving limit-concurrent saturation.
+      try { releaseToken(); } catch { /* best-effort — release-resilience */ }
+      releaseToken = () => {}; // no-op for the returned release fn
+      released = true;
+      return () => {
+        releaseToken(); // no-op (token released above)
+        try { queue.removeInFlight(ourId); } catch { /* best-effort: watchdog reaps at 120s */ }
+        queue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present
+      };
+    }
+    return undefined;
+  } finally {
+    // If we exited without returning a release fn (throw, abort, or a path that
+    // didn't set `released`), cancel our waiter entry so it doesn't pollute the
+    // FIFO for staleWaiterMs. On the happy path the returned release fn owns the
+    // cancellation, so `released` is true + this is a no-op.
+    if (!released) {
+      try { queue.cancel(ourId); } catch { /* best-effort */ }
+    }
   }
 }

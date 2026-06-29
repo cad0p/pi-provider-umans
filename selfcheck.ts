@@ -3208,19 +3208,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // pretends to release a token we no longer hold). The fix sets
 // `releaseToken = () => {}` before the break so the returned closure's
 // releaseToken() is an explicit no-op documenting fail-open proceeds without
-// holding the token. COV7-2 already drives the live fail-open path; pin the
-// clear is present at the MAX_TOKEN_REJOINS break site by source inspection.
+// holding the token. The capacity-poll loop was extracted to acquireSlotCore
+// in utils.ts (shared with web-search.ts so the two factories cannot diverge),
+// so the source inspection reads utils.ts. COV7-2 already drives the live
+// fail-open path; pin the clear is present at the MAX_TOKEN_REJOINS break site
+// by source inspection.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   const rejoinIdx = src.indexOf("rejoins >= MAX_TOKEN_REJOINS");
-  assert(rejoinIdx >= 0, "MAX_TOKEN_REJOINS fail-open guard present in index.ts");
+  assert(rejoinIdx >= 0, "MAX_TOKEN_REJOINS fail-open guard present in utils.ts (acquireSlotCore)");
   // The clear must sit inside the if-block, before the break.
   const blockEnd = src.indexOf("break;", rejoinIdx);
   assert(blockEnd > rejoinIdx, "break present in MAX_TOKEN_REJOINS block");
   const block = src.slice(rejoinIdx, blockEnd);
   assert(block.includes("releaseToken = () => {};"),
     "releaseToken cleared to no-op before MAX_TOKEN_REJOINS break (no stale closure)");
-  assert(block.includes("clear the stale releaseToken closure"),
+  assert(block.includes("Clear the stale releaseToken closure"),
     "clear documented with a comment at the MAX_TOKEN_REJOINS break");
 }
 
@@ -3231,14 +3234,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // between the two reads could let capacityFree see queuePaused:true then
 // decideLaunch see queuePaused:false + elapsedMs >= 60s -> failOpen into a
 // pause. The fix reads queuePaused once into a local const + passes the same
-// value to both. Pin the single-read structure by source inspection.
+// value to both. The capacity-poll loop was extracted to acquireSlotCore in
+// utils.ts (shared with web-search.ts), so the source inspection reads
+// utils.ts. Pin the single-read structure by source inspection.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   // capacityFree now takes queuePaused as a parameter (no internal snapshot read).
   assert(src.includes("const capacityFree = async (queuePaused: boolean): Promise<boolean> =>"),
     "capacityFree takes queuePaused as a parameter (no internal snapshot read)");
   // The call site reads queuePaused once into a local const + passes it to both.
-  const callIdx = src.indexOf("const queuePaused = concurrencyQueue.snapshot().paused;");
+  const callIdx = src.indexOf("const queuePaused = queue.snapshot().paused;");
   assert(callIdx >= 0, "queuePaused read once into a local const before capacityFree");
   // The same const is passed to capacityFree + decideLaunch (no second snapshot read).
   assert(src.includes("const isFree = await capacityFree(queuePaused);"),
@@ -3246,14 +3251,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const decideIdx = src.indexOf("const decision = decideLaunch({");
   assert(decideIdx > callIdx, "decideLaunch call follows the single queuePaused read");
   const decideBlock = src.slice(decideIdx, src.indexOf("});", decideIdx) + 3);
-  assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("concurrencyQueue.snapshot().paused"),
+  assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("queue.snapshot().paused"),
     "decideLaunch receives the same queuePaused const (no second snapshot read)");
-  // No remaining `concurrencyQueue.snapshot().paused` inside capacityFree's body.
+  // No remaining `queue.snapshot().paused` inside capacityFree's body.
   const capIdx = src.indexOf("const capacityFree = async (queuePaused: boolean):");
   const capEnd = src.indexOf("return decision.free;", capIdx);
   const capBody = src.slice(capIdx, capEnd);
-  assert(!capBody.includes("concurrencyQueue.snapshot().paused"),
-    "capacityFree body no longer reads concurrencyQueue.snapshot().paused");
+  assert(!capBody.includes("queue.snapshot().paused"),
+    "capacityFree body no longer reads queue.snapshot().paused");
 }
 
 // --- concurrentSessions ?? 0 + full cap fallback chain ---
@@ -5606,17 +5611,18 @@ if (process.platform !== "win32") {
 // without a try/catch, unlike its 3 sibling cancel call sites. A lock-timeout
 // or disk error during the cancel would surface a Ctrl-C as an uncaught
 // extension error, defeating the C3 "return undefined, don't throw" contract.
+// The capacity-poll loop (including the abort path) was extracted to
+// acquireSlotCore in utils.ts (shared with web-search.ts), so the source
+// inspection reads utils.ts.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   // Find the abort path block.
   const abortBlock = src.match(/if \(decision === "abort"\) \{[\s\S]*?return undefined;\n\s*\}/)?.[0] ?? "";
   assert(abortBlock.length > 0,
-    "abort path block found in index.ts");
+    "abort path block found in utils.ts (acquireSlotCore)");
   // The cancel(ourId) call in the abort path must be wrapped in try/catch.
-  assert(abortBlock.includes('try { concurrencyQueue.cancel(ourId); } catch'),
+  assert(abortBlock.includes('try { queue.cancel(ourId); } catch'),
     "cancel(ourId) in abort path wrapped in try/catch (best-effort)");
-  // The sibling cancel calls must also be wrapped (regression guard).
-  const touchReapBlock = src.match(/touchToken.*?reaped[\s\S]*?\n\s*\}/)?.[0] ?? "";
 }
 
 // --- before_provider_request wraps acquireSlot in try/catch (fail-open on lock/disk error) ---

@@ -11,5 +11,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": []
   },
-  "include": ["index.ts", "utils.ts", "settings.ts", "concurrency-queue.ts", "selfcheck.ts"]
+  "include": ["index.ts", "web-search.ts", "utils.ts", "settings.ts", "concurrency-queue.ts", "selfcheck.ts"]
 }

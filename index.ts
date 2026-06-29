@@ -36,7 +36,6 @@
 import { createHash } from "node:crypto";
 import {
   createConcurrencyQueue,
-  isCapacityFree,
   PAUSE_REASON_403_BRIDGE,
   PAUSE_403_BRIDGE_MS,
   type ConcurrencyQueue,
@@ -45,16 +44,14 @@ import {
   USER_AGENT,
   handle429,
   raiseForUmansStatus,
-  decideLaunch,
-  nextPollInterval,
-  fetchUsageSnapshot,
   resolveApiKey,
   concurrencyLimit as sharedConcurrencyLimit,
+  acquireSlotCore,
   releaseSlotCore,
+  resolveBaseUrl,
   stopRefreshLoop,
   restartRefreshLoop,
   refreshUsage as sharedRefreshUsage,
-  POLL_INTERVAL_BASE_MS,
   type ConcurrencyRuntime,
   type ModelCapabilities,
   type ReasoningInfo,
@@ -65,7 +62,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
@@ -87,9 +83,10 @@ const VISION_ANALYSIS_PROMPT =
 
 // The capacity-poll + strike-counter constants (CAPACITY_POLL_TIMEOUT_MS,
 // STRIKE_*, POLL_INTERVAL_*), the pure decideLaunch / nextPollInterval
-// helpers, and the resolveApiKey / concurrencyLimit / refresh + fetch
-// machinery all live in utils.ts now — shared with web-search.ts so the two
-// factories cannot diverge on the strike-pause gate. Each factory builds a
+// helpers, and the resolveApiKey / resolveBaseUrl / concurrencyLimit /
+// acquireSlotCore / refresh + fetch machinery all live in utils.ts now —
+// shared with web-search.ts so the two factories cannot diverge on the
+// strike-pause gate or the capacity-poll loop. Each factory builds a
 // ConcurrencyRuntime (below) carrying its own queue instance + mutable
 // capacity state + calls the shared functions with it.
 
@@ -502,8 +499,7 @@ async function analyzeImage(
 export default async function (pi: ExtensionAPI) {
   if (process.env.UMANS_DISABLE === "1") return;
 
-  const baseUrl =
-    process.env.UMANS_BASE_URL?.trim().replace(/\/$/, "") || DEFAULT_BASE_URL;
+  const baseUrl = resolveBaseUrl();
 
   // The model-info endpoint is public, so this works even before the user has
   // configured an API key. It lets pi --list-models report accurate models.
@@ -744,22 +740,22 @@ export default async function (pi: ExtensionAPI) {
   }
 
   // Acquire a concurrency slot for an outbound Umans request (main turn or a
-  // vision/search side-call). Joins the cross-process FIFO, waits until we are
-  // head + have claimed the launch token, then polls /v1/usage until the server
-  // reports a free slot (and no priority.low). Returns a release fn that drops
-  // the token + our waiter entry; call it on assistant message_end (the
-  // primary release path) or turn_end/agent_end as a safety net. Returns
-  // undefined when the queue is disabled (fire-and-forget) or when the turn's
-  // AbortSignal fires mid-poll (clean cancellation, not a throw). The
-  // `apiKey` is used for the head-waiter poll.
+  // vision/search side-call). Delegates to the shared acquireSlotCore (utils.ts,
+  // one copy shared with web-search.ts so the capacity-poll loop cannot diverge)
+  // which joins the cross-process FIFO, waits until head + claims the launch
+  // token, polls /v1/usage until the server reports a free slot (and no
+  // priority.low), and returns a release fn. Returns undefined when the queue is
+  // disabled (fire-and-forget) or when the turn's AbortSignal fires mid-poll
+  // (clean cancellation, not a throw). The `apiKey` is used for the head-waiter
+  // poll.
   //
   // this function BLOCKS until the slot is acquired — it is NOT a fast
   // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
-  // contention) + the /usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
-  // 60s fail-open, or longer while a known pause is active). All
-  // callers (before_provider_request + the three side-call sites) await it inline
-  // on the critical path of the turn — by design, the whole point is to
-  // serialize launches so the account stays under its soft cap.
+  // contention) + the /v1/usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
+  // 60s fail-open, or longer while a known pause is active). All callers
+  // (before_provider_request + the three side-call sites) await it inline on
+  // the critical path of the turn — by design, the whole point is to serialize
+  // launches so the account stays under its soft cap.
   //
   // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
   // any token held >120s (or whose PID died) is reclaimed by the next acquirer,
@@ -767,258 +763,7 @@ export default async function (pi: ExtensionAPI) {
   // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
   // waitForLaunch cancels the waiter entry and rejects immediately.
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
-    const initialId = concurrencyQueue.join();
-    if (!initialId) return undefined; // queue disabled
-    // ourId may be re-assigned below when touchToken returns false
-    // (token reaped by a sibling's reapStale) and we re-join the queue. join()
-    // returns null only when the queue is disabled, which is a creation-time
-    // flag — it cannot flip mid-loop — so the re-assignment is non-null.
-    let ourId: string = initialId;
-    // Track whether we have already released our waiter entry so a throw
-    // between join() and the return of a release fn cannot leak the waiter
-    // for staleWaiterMs (5 min). waitForLaunch itself cancels on
-    // signal abort; this finally covers the non-abort throw paths (lock
-    // timeout, EACCES, ENOSPC) and the token-reaped re-join path.
-    let released = false;
-    // if our launch token is reaped by a sibling's reapStale while
-    // we hold it across a long capacity poll (a pause-bounded wait can
-    // legitimately exceed 120s), touchToken returns false and
-    // we must re-join the queue + wait our turn again rather than race a
-    // concurrent send. Guarded re-entry: bail after a bounded number of
-    // re-joins so a pathological state (e.g. a sibling that reaps + crashes
-    // in a tight loop) cannot wedge us here forever — fall back to fail-open
-    // (the watchdog bounds the sibling's hold, and the hard_cap headroom
-    // absorbs one extra send, matching the /usage-unreachable stance).
-    const MAX_TOKEN_REJOINS = 3;
-    let releaseToken: () => void = () => {};
-    try {
-    tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
-      let releaseTokenThisIter: () => void;
-      try {
-        releaseTokenThisIter = await concurrencyQueue.waitForLaunch(ourId, signal);
-      } catch (err) {
-        // waitForLaunch rejects with "waitForLaunch aborted" when the
-        // signal is already aborted (or aborts mid-wait). Return undefined
-        // (matching the disabled-mode shape) instead of surfacing the throw
-        // as an uncaught extension error on Ctrl-C. The handler's `if (release)`
-        // guard becomes the abort path. waitForLaunch already cancelled our
-        // waiter entry; the finally is a no-op (released stays false → cancel
-        // is a belt-and-suspenders no-op since the id is already gone).
-        if (signal?.aborted) {
-          released = true;
-          return undefined;
-        }
-        throw err; // non-abort throw (lock timeout, EACCES) — propagate
-      }
-      releaseToken = releaseTokenThisIter;
-      // We are head + hold the launch token. Poll /usage until the server reports
-      // a free slot (or the plan is unlimited) and the account isn't deprioritized.
-      // The token serializes the /usage POLL (no thundering herd on the capacity
-      // endpoint); it is released as soon as the capacity check passes (before
-      // the send), NOT held across the send. Holding the token across the send
-      // serializes to 1-at-a-time (over-serialization). Releasing immediately
-      // lets the next head poll right away; the server's /usage lag means it
-      // sees a stale-low concurrent_sessions + launches — achieving
-      // limit-concurrent saturation (4/4). The hard_cap burst headroom
-      // absorbs any overshoot from the lag.
-      const limit = sharedConcurrencyLimit(rt);
-      // Unlimited plan: skip the capacity check (still honor priority.low).
-      // read queuePaused ONCE per poll iteration into a local const
-      // + pass the same value to capacityFree + decideLaunch. Previously
-      // capacityFree read concurrencyQueue.snapshot().paused inside itself
-      // + decideLaunch read it again after the await — two unlocked snapshot
-      // reads straddling an await, so a sibling writing pausedUntil between
-      // them could let capacityFree see queuePaused:true then decideLaunch see
-      // queuePaused:false + elapsedMs >= 60s -> failOpen into a pause. Reading
-      // once makes the fail-open-during-pause guard structural.
-      const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
-        // consult the SHARED pause before launching. A 429 observed by any
-        // local process writes pausedUntil to the shared file; reading it here
-        // makes every sibling back off immediately, even before /usage
-        // propagates priority.low (5s refresh lag, or a transient gateway-side
-        // blip not yet reflected in /usage). Without this, process B would see
-        // priority.low === false and launch right into the 429 that A just hit.
-        const snap = await fetchUsageSnapshot(rt, apiKey, signal);
-        // pass localInFlight IN (see CapacityInputs) so isCapacityFree stays
-        // pure. snapshot() calls reapStale, so inflightCount is the post-reap count.
-        const qSnap = concurrencyQueue.snapshot();
-        const decision = isCapacityFree(snap, {
-          limit,
-          queuePaused,
-          localInFlight: qSnap.inflightCount,
-        });
-        if (decision.repause) {
-          // write-amplification guard: skip the pauseUntil call when the
-          // active pause already covers the requested deadline + reason. The
-          // capacity-poll loop calls capacityFree every ~300ms; with the reason-aware
-          // iteration where priority.low && reason=cap_abuse returns a repause,
-          // + the caller pushes pauseUntil — a mutate (O_EXCL lock + readState
-          // + reapStale + writeStateAtomic + renameSync) every ~300ms. Over a
-          // 5h suspension that is ~60,000 lock acquisitions + file writes,
-          // all no-ops at the pause level (extend-never-shorten means the
-          // deadline does not move). Skip when queuePaused &&
-          // qSnap.pausedUntil >= decision.repause.until &&
-          // qSnap.pausedReason === decision.repause.reason. qSnap was read
-          // once per iteration (no straddle-await race).
-          const alreadyCovered = queuePaused &&
-            qSnap.pausedUntil >= decision.repause.until &&
-            qSnap.pausedReason === decision.repause.reason;
-          if (!alreadyCovered) {
-            // pauseUntil runs mutate -> writeStateAtomic -> renameSync,
-            // which can throw on disk failure (EACCES, ENOSPC, EROFS). The pause
-            // is a best-effort coordination signal (the server's priority.low +
-            // the 120s watchdog bound it); it must not abort a turn that already
-            // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
-            // release-resilience pattern.
-            try {
-              concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
-            } catch (err) {
-              console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
-            }
-          }
-        }
-        return decision.free;
-      };
-      // Poll at 300ms + up to 100ms jitter while full/deprioritized. If the turn
-      // is aborted mid-poll, `signal` cancels the waiter; otherwise the watchdog
-      // reaps the token after >120s and session_shutdown clears the waiter on exit.
-      // the ±100ms jitter breaks phase-locking across machines —
-      // D1 designs for multiple machines each running their own local queue and
-      // polling /usage; without jitter, N machines' head waiters synchronize on
-      // the same 300ms tick and amplify /usage load N× per cycle.
-      // cap the total poll elapsed at CAPACITY_POLL_TIMEOUT_MS so a
-      // hostile/misbehaving /usage (always reports full, or an account stuck
-      // at the cap) cannot wedge the queue forever. After the cap, fail open
-      // (launch anyway) — matching the /usage-unreachable fallback's stance
-      // that the queue must not block indefinitely.
-      // do NOT fail open during a KNOWN active pause (shared
-      // pausedUntil, e.g. a 429 the gate observed). Fail-open for an
-      // unreachable /usage is fine (no signal); fail-open for a POSITIVE
-      // deprio signal launches into a still-deprioritized account, risking
-      // another 429 and extending the account-wide deprioritization — exactly
-      // what the gate exists to prevent. Keep waiting when a known pause is
-      // active; the pause has a bounded deadline (clamped to MAX_PAUSE_MS)
-      // and C1's touchToken keeps the watchdog from reaping a legitimately
-      // long poll (the watchdog now only reaps a TRULY hung poller).
-      const pollStart = Date.now();
-      // exponential backoff on the poll interval when capacity is
-      // steadily full. Start at 300ms, grow by 1.5× on each "wait" decision,
-      // cap at 2000ms; reset to 300ms on "launch" / "failOpen". Reduces /usage
-      // RPS from ~3.3/s to ~0.5/s during a sustained pause. The ±100ms jitter
-      // breaks phase-locking across machines.
-      let pollIntervalMs = POLL_INTERVAL_BASE_MS;
-      // the branch logic lives in decideLaunch (pure, unit-tested). The
-      // loop here drives the /usage fetch (capacityFree, I/O) and applies the
-      // decision each iteration.
-      for (;;) {
-        // re-stamp our token's ts each iteration so the 120s
-        // watchdog does not reap a legitimately long capacity poll. If the
-        // token was already reaped by a sibling's reapStale (id mismatch or
-        // absent), touchToken returns false — bail out of this poll, cancel
-        // our (now-stale) waiter entry, re-join the queue, and wait our turn
-        // again. The sibling that reaped + claimed is now sending; re-joining
-        // serializes us behind it rather than racing a concurrent send that
-        // would defeat the gate.
-        if (!concurrencyQueue.touchToken(ourId)) {
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-          if (rejoins >= MAX_TOKEN_REJOINS) {
-            // Pathological state: reaped + re-joined too many times. Fail
-            // open rather than loop forever (bounded by the watchdog + the
-            // hard_cap headroom, same stance as /usage-unreachable).
-            // clear the stale releaseToken closure before break.
-            // releaseToken still points at the prior iteration's closure
-            // (a no-op — the token was reaped — but confusing). The returned
-            // closure below calls releaseToken(); point it at an explicit
-            // no-op so fail-open proceeds without holding (or pretending to
-            // release) a token.
-            releaseToken = () => {};
-            break;
-          }
-          ourId = concurrencyQueue.join()!;
-          // join() returns null only when the queue is disabled, which is a
-          // creation-time flag — it cannot flip mid-loop. The non-null
-          // assertion mirrors the initial join() above.
-          continue tokenAcquire; // re-wait our turn
-        }
-        // read queuePaused ONCE here, pass the same value to
-        // capacityFree + decideLaunch (see capacityFree def for rationale).
-        const queuePaused = concurrencyQueue.snapshot().paused;
-        const isFree = await capacityFree(queuePaused);
-        const decision = decideLaunch({
-          isFree,
-          elapsedMs: Date.now() - pollStart,
-          queuePaused,
-          signalAborted: !!signal?.aborted,
-        });
-        if (decision === "launch") break; // capacity free — proceed to send
-        if (decision === "abort") {
-          // return undefined on abort (matching the disabled-mode shape)
-          // instead of throwing. The handler's `if (release)` guard becomes
-          // the abort path, so a Ctrl-C mid-poll surfaces as a clean
-          // cancellation rather than an uncaught extension error toast/log.
-          // We already hold the token (touchToken returned true above), so
-          // release it before returning — the watchdog would reap it
-          // eventually, but releasing now frees the next head immediately.
-          try { releaseToken(); } catch { /* best-effort */ }
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort: COV12-1 */ }
-          released = true;
-          return undefined;
-        }
-        if (decision === "failOpen") {
-          // only fail open when no known pause is active. A known
-          // pause means the gate has a positive deprio signal; keep waiting
-          // (bounded by the pause deadline + the 120s token watchdog).
-          break; // fail open below
-        }
-        // decision === "wait"
-        await new Promise((r) => setTimeout(r, pollIntervalMs + Math.floor(Math.random() * 100)));
-        // back off the next poll interval (grows 1.5×, caps at 2000ms).
-        pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
-      }
-      // fail-open after the cap. The turn proceeds ungated; the watchdog still bounds
-      // the token hold. We deliberately do not throw — a wedged /usage should
-      // not break the user's turn, only the gate. The status bar's `q <queued>*`
-      // already reflects the wait; the launch itself is silent so as not to
-      // spam notifies on every poll.
-      //
-      // local in-flight tracking: add an in-flight entry BEFORE releasing
-      // the token (the order is load-bearing — the next head's readState
-      // must see our entry before it can claim the token, so max(localInFlight,
-      // concurrent_sessions) counts us + blocks a sibling from launching into
-      // our still-in-flight request). addInFlight is fail-closed (Adv5): a throw
-      // (lock timeout, EACCES, ENOSPC) propagates to the finally, which cancels
-      // the waiter + token + aborts the turn — do NOT swallow, a missing entry
-      // deflates the gate for siblings. The returned release fn calls
-      // removeInFlight (best-effort, mirroring releaseToken) in addition to the
-      // existing token + waiter cleanup.
-      concurrencyQueue.addInFlight(ourId);
-      // Throughput fix: release the token IMMEDIATELY (not at message_end) so
-      // the next head can poll + launch. The token serializes the /usage poll;
-      // holding it across the send serializes to 1-at-a-time. Releasing here
-      // lets the next head poll right away — the server's /usage lag means it
-      // sees a stale-low concurrent_sessions + launches, achieving
-      // limit-concurrent saturation. The hard_cap absorbs overshoot.
-      try { releaseToken(); } catch { /* best-effort — release-resilience */ }
-      releaseToken = () => {}; // no-op for the returned release fn (token already released)
-      released = true;
-      return () => {
-        releaseToken(); // no-op (token released above)
-        try { concurrencyQueue.removeInFlight(ourId); } catch { /* best-effort: watchdog reaps at 120s */ }
-        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present (also splices in-flight)
-      };
-    } // end tokenAcquire
-    // Unreachable: the loop above always either returns or throws. Defensive.
-    return undefined;
-    } finally {
-      // If we exited without returning a release fn (throw, abort, or a path
-      // that didn't set `released`), cancel our waiter entry so it doesn't
-      // pollute the FIFO for staleWaiterMs. On the happy path the
-      // returned release fn owns the cancellation, so `released` is true
-      // and this is a no-op.
-      if (!released) {
-        try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-      }
-    }
+    return acquireSlotCore(rt, apiKey, signal) as Promise<Release | undefined>;
   }
 
   // resolveApiKey is imported from utils.ts (shared with web-search.ts) —
