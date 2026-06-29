@@ -26,13 +26,16 @@
  *
  * Malformed JSON → console.warn + defaults (don't crash the provider).
  * Missing file → defaults.
- * Invalid concurrencyMultiplier (0, negative, NaN, non-number) → warn + default.
+ * Invalid concurrencyMultiplier (0, negative, NaN, non-number, > max) → warn + default.
  *
- * File format + read path mirror auth.json reading (fs.readFileSync +
- * JSON.parse). The settings file is owned by this package; pi's settings.json
- * schema is owned by the pi CLI and extensions don't add fields to it.
+ * File format + read path mirror concurrency-queue.ts's readState (lstat
+ * + O_NOFOLLOW | O_NONBLOCK open-then-read + fd-based read + size cap), so
+ * the settings file has the same hardening standard as the concurrency state
+ * file. Malformed JSON → console.warn + defaults (don't crash the provider).
+ * The settings file is owned by this package; pi's settings.json schema is
+ * owned by the pi CLI and extensions don't add fields to it.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, openSync, closeSync, readSync, fstatSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -48,6 +51,15 @@ export const DEFAULT_CONCURRENCY_MULTIPLIER = 1.0;
  * multiplier at the edge, independent of hard_cap.
  */
 const MAX_CONCURRENCY_MULTIPLIER = 100;
+
+/**
+ * Maximum settings file size. A settings file holds one number + should be
+ * < 100 bytes; a hostile repo with a 1 GB .pi/umans.json (or a symlink to a
+ * large file) would allocate ~1 GB on startup before JSON.parse runs. Reject
+ * oversized files before the read allocates. Mirrors concurrency-queue.ts's
+ * MAX_STATE_BYTES cap.
+ */
+const MAX_SETTINGS_BYTES = 64 * 1024;
 
 export interface UmansSettings {
   concurrencyMultiplier: number;
@@ -114,23 +126,68 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 /**
  * Read + validate a single settings file. Returns the parsed JSON (unknown) on
- * success, or null on missing/malformed (caller falls back to defaults).
- * Malformed JSON warns so the user sees the file is being ignored.
+ * success, or null on missing/malformed/unreadable (caller falls back to
+ * defaults). Hardened to mirror concurrency-queue.ts's readState: lstat-is-
+ * file guard (rejects a planted symlink at the path), O_NOFOLLOW | O_NONBLOCK
+ * open-then-read (rejects a path swap into a symlink or a FIFO wedge), a 64 KiB
+ * size cap (rejects a hostile huge file before the read allocates), + a
+ * content-free malformed-JSON warn (Node 20's JSON.parse message echoes a
+ * snippet of the input — an info-leak vector via a symlink to a secrets file).
+ * Missing file returns null (caller falls back to defaults).
  */
 function readSettingsFile(path: string): unknown {
-  if (!existsSync(path)) return null;
-  let txt: string;
+  let fd: number | undefined;
   try {
-    txt = readFileSync(path, "utf8");
+    let lstat: ReturnType<typeof lstatSync>;
+    try {
+      // lstatSync (not statSync) so a symlink settings file is detected as
+      // non-regular + treated as missing without following the link (a planted
+      // symlink at .pi/umans.json cannot redirect the read to an arbitrary file).
+      lstat = lstatSync(path);
+    } catch {
+      // ENOENT (missing file) is the common case → return null (defaults).
+      // Other errors (EACCES on the parent dir) → warn + null.
+      return null;
+    }
+    if (!lstat.isFile() || lstat.size > MAX_SETTINGS_BYTES) {
+      // Non-regular (FIFO, device, symlink) or oversized — treat as missing so
+      // the caller falls back to defaults without allocating/crashing.
+      return null;
+    }
+    // Open the fd AFTER the lstat guard with O_NOFOLLOW | O_NONBLOCK so a path
+    // swap between the lstat + the open cannot redirect the open into a symlink
+    // (ELOOP) or block on a swapped FIFO (O_NONBLOCK makes the open return
+    // immediately). fstat operates on the fd we already hold; readSync reads
+    // from that fd. Re-check isFile + size on the fd in case the file was swapped
+    // between the lstat + the open.
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_SETTINGS_BYTES) {
+      closeSync(fd);
+      return null;
+    }
+    const buf = Buffer.alloc(st.size);
+    readSync(fd, buf, 0, st.size, 0);
+    const txt = buf.toString("utf8");
+    try {
+      return JSON.parse(txt);
+    } catch {
+      // Do NOT include err.message in the warn — Node 20's JSON.parse SyntaxError
+      // message echoes ~10 chars of the input. If the settings file is a
+      // symlink to a secrets file (caught by the lstat guard above, but
+      // defense-in-depth), the snippet would be an info-leak vector via console
+      // output captured into model context. A position-free generic message is
+      // enough for the user to find the bad file.
+      console.warn(`umans: settings file ${path} is not valid JSON; using defaults`);
+      return null;
+    }
   } catch (err) {
     console.warn(`umans: settings file ${path} unreadable (${err instanceof Error ? err.message : err}); using defaults`);
     return null;
-  }
-  try {
-    return JSON.parse(txt);
-  } catch (err) {
-    console.warn(`umans: settings file ${path} is malformed JSON (${err instanceof Error ? err.message : err}); using defaults`);
-    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best-effort */ }
+    }
   }
 }
 

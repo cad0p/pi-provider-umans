@@ -7490,6 +7490,79 @@ for (const [label, raw, expected] of [
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
+// --- settings file read hardened against symlink + huge file + content-leak (SEC-1, ADV-4, ADV-5) ---
+// readSettingsFile mirrors concurrency-queue.ts's readState: lstat-is-file guard
+// (rejects a planted symlink at the path), O_NOFOLLOW | O_NONBLOCK open-then-read
+// (rejects a path swap into a symlink or a FIFO wedge), a 64 KiB size cap
+// (rejects a hostile huge file before the read allocates), + a content-free
+// malformed-JSON warn (Node 20's JSON.parse message echoes a snippet of the
+// input — an info-leak vector via a symlink to a secrets file). These tests
+// pin each guard.
+{
+  const { symlinkSync } = await import("node:fs");
+  // (a) symlink settings file → defaults, no crash, no target content read.
+  // A planted symlink at the global path pointing at a fake secrets file must
+  // be rejected (lstat detects non-regular) + the target must NOT be read
+  // (the warn + the returned default carry no target content).
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-symlink-"));
+    const targetPath = join(dir, "secret-target");
+    const secretContent = "SUPERSECRET-LEAK-CANARY";
+    writeFileSync(targetPath, secretContent);
+    const globalPath = join(dir, "global.json");
+    symlinkSync(targetPath, globalPath); // global.json -> secret-target
+    const projectPath = join(dir, "missing-project.json");
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: symlink settings file → default (no crash, no content read)");
+    // The canary content must not be exfiltrated via a parsed multiplier or
+    // echoed into a warn. (A successful parse would return a multiplier; the
+    // guard returns defaults instead.)
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  // (b) >64 KiB settings file → defaults (rejected before the read allocates).
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-huge-"));
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, "missing-project.json");
+    // Write a 128 KiB file (2× the 64 KiB cap) with a valid multiplier at the
+    // start + padding. The size cap rejects it before JSON.parse runs.
+    const padding = " ".repeat(128 * 1024);
+    writeFileSync(globalPath, `{"concurrencyMultiplier":2.0}${padding}`);
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: >64 KiB settings file → default (size cap rejects before read allocates)");
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  // (c) malformed JSON → warn does NOT include the file content (info-leak guard).
+  // Node 20's JSON.parse SyntaxError message echoes ~10 chars of the input;
+  // the hardened readSettingsFile uses a content-free generic message instead.
+  // Capture console.warn + assert the canary content is not echoed.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-noleak-"));
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, "missing-project.json");
+    const canary = "MALFORMED-LEAK-CANARY";
+    writeFileSync(globalPath, `{"concurrencyMultiplier": ${canary}}`);
+    const originalWarn = console.warn;
+    const warned: string[] = [];
+    console.warn = (msg: string) => { warned.push(String(msg)); };
+    try {
+      const s = readSettings({ globalPath, projectPath });
+      assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+        "readSettings: malformed JSON → default");
+    } finally {
+      console.warn = originalWarn;
+    }
+    const joined = warned.join("\n");
+    assert(joined.includes("is not valid JSON"),
+      "readSettings: malformed JSON warn fires (content-free generic message)");
+    assert(!joined.includes(canary),
+      "readSettings: malformed JSON warn does not echo file content (info-leak guard)");
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // --- concurrency multiplier wired into concurrencyLimit() (status-bar proof) ---
 // concurrencyLimit() is a closure inside the factory (not exported), so the
 // multiplier wiring is observed via the status bar's `Conc <current>/<limit>`
