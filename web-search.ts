@@ -311,8 +311,38 @@ export default async function (pi: ExtensionAPI) {
     restartRefreshLoop(rt, apiKey || "");
   });
 
+  // Stop the refresh loop when the user switches away from the umans
+  // provider, so this factory stops polling /v1/usage + /v1/usage/history
+  // against an account it's no longer actively driving (mirrors index.ts's
+  // model_select handler). Re-seed the loop when switching back to umans.
+  pi.on("model_select", async (event, ctx) => {
+    if (event.model.provider !== "umans") {
+      stopRefreshLoop(rt);
+      return;
+    }
+    const apiKey = await resolveApiKey(ctx);
+    if (apiKey) await sharedRefreshUsage(rt, apiKey);
+    restartRefreshLoop(rt, apiKey || "");
+  });
+
   pi.on("session_shutdown", async () => {
     stopRefreshLoop(rt);
     concurrencyQueue.reset();
+  });
+
+  // /umans-web-search: operator discoverability for the standalone web-search
+  // extension. The factory loading means web-search.ts is enabled (no `pi config`
+  // `-web-search.ts` entry). Print the toggle status + instructions to disable
+  // or re-enable it via `pi config`'s +/- prefix on the extensions array.
+  pi.registerCommand("umans-web-search", {
+    description: "Umans web search: show toggle status + pi config instructions",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(
+        "Umans web search: enabled (this factory is loaded). " +
+          "Toggle with `pi config`: add `-web-search.ts` to the extensions array to disable, " +
+          "or `+web-search.ts` (or remove the entry) to re-enable.",
+        "info",
+      );
+    },
   });
 }

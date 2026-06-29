@@ -8166,4 +8166,179 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
   }
 }
 
+// --- web-search factory: model_select stops the refresh loop on provider switch ---
+// web-search.ts's session_start seeds the periodic refreshUsage (5s) + strike
+// poll (5min). index.ts has a model_select handler that stops its refresh
+// loop when the user switches away from the umans provider; web-search.ts
+// must mirror that so it doesn't keep polling /v1/usage + /v1/usage/history
+// against an account the user is no longer actively driving. Load ONLY
+// webSearchFactory, dispatch session_start (drives refreshUsage), then
+// model_select to a non-umans provider, wait >5s (the periodic interval),
+// + assert no further /v1/usage poll fired (the loop stopped). Then dispatch
+// model_select back to umans + assert refreshUsage re-drove (re-seed path).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-model-select-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({ strikes: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, ctx ?? makeCtx());
+    }
+    await webSearchFactory(pi as any);
+
+    // session_start seeds the refresh loop: refreshUsage fires immediately +
+    // the periodic 5s loop is armed.
+    await dispatch("session_start", { type: "session_start" });
+    await new Promise((r) => setTimeout(r, 30));
+    const usageAfterStart = usageCalls;
+    assert(usageAfterStart > 0, "web-search session_start drove refreshUsage (fetch /v1/usage)");
+
+    // model_select to a non-umans provider: must stop the refresh loop. Wait
+    // >5s (the periodic interval) + assert no further /v1/usage poll fired.
+    await dispatch("model_select",
+      { type: "model_select", model: { provider: "openai", id: "gpt-4" } },
+      makeCtx({ provider: "openai", id: "gpt-4" }));
+    await new Promise((r) => setTimeout(r, 5200));
+    assert(usageCalls === usageAfterStart,
+      `web-search model_select non-umans stopped the refresh loop (no further /v1/usage poll; calls still ${usageCalls}, was ${usageAfterStart})`);
+
+    // model_select back to umans: re-seeds the refresh loop. refreshUsage
+    // fires immediately, so usageCalls must increase.
+    const usageBeforeReSeed = usageCalls;
+    await dispatch("model_select",
+      { type: "model_select", model: { provider: "umans", id: "umans-flash" } },
+      makeCtx({ provider: "umans", id: "umans-flash" }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert(usageCalls > usageBeforeReSeed,
+      "web-search model_select back to umans re-seeded the refresh loop (refreshUsage re-drove)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- /umans-web-search operator command registered through wiring ---
+// The standalone web-search factory registers a /umans-web-search operator
+// command for discoverability (prints toggle status + pi config instructions).
+// Load ONLY webSearchFactory, capture the command def, + assert it's registered
+// + dispatching its handler produces a notify mentioning the toggle + pi config.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-cmd-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: any) =>
+    Promise.resolve(new Response("", { status: 404 }))) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const cmds = new Map<string, { handler: (args: string, ctx: any) => Promise<any> }>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {},
+      registerCommand(name: string, def: any) { cmds.set(name, def); },
+      registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget() {}, setStatus() {},
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await webSearchFactory(pi as any);
+    assert(cmds.has("umans-web-search"), "/umans-web-search command registered through wiring");
+    const cmd = cmds.get("umans-web-search")!;
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const note = notifications.find((n) => n.msg.includes("Umans web search"));
+    assert(!!note, "/umans-web-search handler produced a notify");
+    assert(note!.msg.includes("enabled"), "/umans-web-search notify mentions enabled status");
+    assert(note!.msg.includes("pi config"), "/umans-web-search notify mentions pi config toggle instructions");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 console.log("\nall checks passed");
