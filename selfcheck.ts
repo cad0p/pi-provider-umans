@@ -4569,6 +4569,114 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- umans_web_search.execute with empty + very-long query (no crash, no truncation) ---
+// An empty query flows into searchWeb's prompt → a /v1/messages POST with an
+// empty user query. A very-long query (10k chars) must flow through without
+// truncation or crash. The existing fallback test drove execute with a
+// non-empty benign string only; the empty + adversarial-long inputs were
+// unasserted. Drive both through the real factory wiring.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-empty-long-query-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // Capture the /v1/messages request body so the long-query case can assert the
+  // full query flows through (no truncation). /v1/messages returns content: []
+  // for both cases → searchWeb's '(no search results returned)' fallback.
+  let lastMessagesBody: string | undefined;
+  const captureMessagesBody = (init?: any): void => {
+    lastMessagesBody = typeof init?.body === "string" ? init.body : undefined;
+  };
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      captureMessagesBody(init);
+      return Promise.resolve(new Response(JSON.stringify({ content: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const searchTool = tools.get("umans_web_search")!;
+
+    // (a) empty query → /v1/messages 200 with content: [] → the
+    // '(no search results returned)' fallback. Confirms an empty query does
+    // not crash + surfaces the empty-content fallback.
+    lastMessagesBody = undefined;
+    const emptyRes = await searchTool.execute("call-empty", { query: "" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof emptyRes?.content?.[0]?.text === "string" &&
+      emptyRes.content[0].text === "(no search results returned)",
+      `empty query → '(no search results returned)' fallback (got: ${emptyRes?.content?.[0]?.text})`);
+    const emptyBody = lastMessagesBody as string | undefined;
+    assert(emptyBody !== undefined && emptyBody.includes("Query: "),
+      "empty query flows into the /v1/messages POST body (prompt suffix present)");
+    assert(emptyBody !== undefined && !emptyBody.includes("x".repeat(100)),
+      "empty query body does not carry a long query string (sanity)");
+
+    // (b) very-long query (10k chars) → no crash, + the full query flows into
+    // the POST body (no truncation at the provider boundary).
+    const longQuery = "x".repeat(10_000);
+    lastMessagesBody = undefined;
+    const longRes = await searchTool.execute("call-long", { query: longQuery }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof longRes?.content?.[0]?.text === "string",
+      "very-long query (10k chars) does not crash + returns a text result");
+    const longBody = lastMessagesBody as string | undefined;
+    assert(longBody !== undefined && longBody.includes(longQuery),
+      "very-long query (10k chars) flows into the /v1/messages POST body in full (no truncation)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // --- multi-image transformMessageImages Promise.all path driven through wiring ---
 // transformMessageImages does Promise.all over N image blocks, each calling
 // acquireSlot → join → mutate + analyzeImage (fetch /v1/messages). The
@@ -7340,6 +7448,14 @@ assert(deepMergeSettings(1, undefined) === 1, "deepMerge: undefined project keep
     "deepMerge: object project replaces array global");
 }
 
+// deepMergeSettings: JSON null project wins outright (not merged)
+// A valid JSON literal {"concurrencyMultiplier": null} parses to project null.
+// deepMergeSettings returns null outright (null is not a plain object), so the
+// caller falls back to defaults via coerceSettings(null) → isPlainObject(null)
+// === false. A future refactor special-casing null would silently break.
+assert(deepMergeSettings({ a: 1 }, null) === null,
+  "deepMerge: null project wins outright (not merged)");
+
 // defaultSettings
 {
   const d = defaultSettings();
@@ -7434,6 +7550,10 @@ for (const [label, raw] of [
   ["string", "1.0"],
   ["object", { x: 1 }],
   ["Infinity", Infinity],
+  // A JSON literal null for the multiplier field ({"concurrencyMultiplier":null})
+  // is rejected (typeof null !== "number"). Mirrors the deepMerge null-project
+  // case: a null field falls back to the default, not a merge.
+  ["null", null],
   // Huge finite multipliers would bypass the hard_cap clamp during the startup
   // window + self-DoS the account via 429s. Rejected at validation time.
   ["huge 1e300", 1e300],
