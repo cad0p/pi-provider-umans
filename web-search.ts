@@ -27,34 +27,39 @@
  * to any extension via ctx — no shared closure with index.ts needed), and
  * baseUrl resolves from UMANS_BASE_URL (re-resolved locally; trivial).
  *
- * Pure helpers (searchWeb, raiseForUmansStatus, sanitizeErrorBody, handle429,
- * pickSearchModel, the search constants) are imported from utils.ts — the
- * single source of truth shared with index.ts.
+ * The refresh + fetch + capacity-poll machinery (refreshStrikes,
+ * refreshUsage, fetchUsage, fetchUsageSnapshot, fetch429Strikes, decideLaunch,
+ * nextPollInterval, resolveApiKey, concurrencyLimit, the capacity-poll +
+ * strike constants) is imported from utils.ts — ONE copy shared with index.ts
+ * so the two factories cannot diverge on the strike-pause gate (a prior
+ * duplicated copy missed the deprioritized gate + never started the periodic
+ * refreshUsage loop). Each factory builds a ConcurrencyRuntime carrying its
+ * own queue instance + mutable capacity state + calls the shared functions
+ * with it. searchWeb + raiseForUmansStatus + pickSearchModel + the search
+ * constants are also imported from utils.ts.
  */
 import {
   createConcurrencyQueue,
   isCapacityFree,
-  parsePriority,
-  parseConcurrencyLimit,
-  PAUSE_REASON_STRIKES,
-  PAUSE_REASON_403_BRIDGE,
-  PAUSE_403_BRIDGE_MS,
-  STICKY_PAUSE_REASONS,
-  PRIORITY_BACKOFF_MS,
   type ConcurrencyQueue,
-  type PriorityState,
 } from "./concurrency-queue.ts";
 import {
   USER_AGENT,
   SEARCH_TIMEOUT_MS,
   SEARCH_MAX_TOKENS,
   pickSearchModel,
-  sanitizeErrorBody,
-  handle429,
   raiseForUmansStatus,
-  readRetryAfter,
-  extractBoxedUntil,
-  isSuspendBody,
+  decideLaunch,
+  nextPollInterval,
+  POLL_INTERVAL_BASE_MS,
+  fetchUsageSnapshot,
+  resolveApiKey,
+  concurrencyLimit as sharedConcurrencyLimit,
+  releaseSlotCore,
+  stopRefreshLoop,
+  restartRefreshLoop,
+  refreshUsage as sharedRefreshUsage,
+  type ConcurrencyRuntime,
   type UmansModelInfo,
 } from "./utils.ts";
 import { readSettings } from "./settings.ts";
@@ -62,55 +67,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const DEFAULT_BASE_URL = "https://api.code.umans.ai";
-const API_KEY_ENV = "UMANS_API_KEY";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
-const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
 const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
 // Override for the global settings file (~/.pi/agent/umans.json). Mirrors
 // UMANS_CONCURRENCY_STATE_FILE: lets selfcheck point readSettings at a temp
 // file without monkey-patching homedir. No-op in normal use.
 const SETTINGS_FILE_ENV = "UMANS_SETTINGS_FILE";
 
-// max time the head-waiter capacity poll will wait for a free slot
-// before failing open (launching anyway). Bounds the queue against a
-// hostile/misbehaving /usage that always reports full.
-const CAPACITY_POLL_TIMEOUT_MS = 60_000;
-
-// 429 strike counter bounds (mirrors index.ts — the side-call can't trip the
-// 5h ban on its own, but the poll interval + window must match so a shared
-// state file isn't wedged by mismatched constants).
-const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
-const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
-const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
-const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
-
-export const POLL_INTERVAL_BASE_MS = 300;
-export const POLL_INTERVAL_CAP_MS = 2_000;
-export const POLL_INTERVAL_GROWTH = 1.5;
-
-type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
-function decideLaunch(opts: {
-  isFree: boolean;
-  elapsedMs: number;
-  queuePaused: boolean;
-  signalAborted: boolean;
-}): LaunchDecision {
-  if (opts.signalAborted) return "abort";
-  if (opts.isFree) return "launch";
-  if (opts.elapsedMs >= CAPACITY_POLL_TIMEOUT_MS && !opts.queuePaused) return "failOpen";
-  return "wait";
-}
-
-function nextPollInterval(currentMs: number, decision: LaunchDecision, opts?: { base?: number; cap?: number; growth?: number }): number {
-  const base = opts?.base ?? POLL_INTERVAL_BASE_MS;
-  const cap = opts?.cap ?? POLL_INTERVAL_CAP_MS;
-  const growth = opts?.growth ?? POLL_INTERVAL_GROWTH;
-  if (decision === "wait") {
-    const next = Math.round(currentMs * growth);
-    return Math.min(next > 0 ? next : base, cap);
-  }
-  return base;
-}
+// The capacity-poll + strike-counter constants (CAPACITY_POLL_TIMEOUT_MS,
+// STRIKE_*, POLL_INTERVAL_*), the pure decideLaunch / nextPollInterval
+// helpers, and the resolveApiKey / concurrencyLimit / refresh + fetch
+// machinery all live in utils.ts — shared with index.ts so the two factories
+// cannot diverge on the strike-pause gate. This factory builds a
+// ConcurrencyRuntime carrying its own queue instance + mutable capacity state
+// + calls the shared functions with it.
 
 /**
  * Run a web search by making a sub-request to the Umans gateway with the
@@ -251,227 +221,26 @@ export default async function (pi: ExtensionAPI) {
     settingsGlobalPath ? { globalPath: settingsGlobalPath } : undefined,
   );
 
-  // Account-wide hard burst cap (the 429 threshold). The multiplier clamps the
-  // effective limit to this so a high multiplier cannot push past the server's
-  // burst ceiling. Populated from /v1/usage limits.concurrency.hard_cap.
-  let hardCap: number | undefined;
-  // Server soft cap (limits.concurrency.limit). The multiplier scales this
-  // before the hard_cap clamp.
-  let guaranteedConcurrency: number | undefined;
-  let strikes24h: number | undefined;
-
-  function concurrencyLimit(): number | undefined {
-    // UMANS_CONCURRENCY_LIMIT env var is the absolute override (testing knob):
-    // when set it wins outright, bypassing the multiplier. Takes precedence
-    // over everything so existing CI/test scripts keep working.
-    if (process.env[CONCURRENCY_LIMIT_ENV] !== undefined) {
-      return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
-    }
-    // No env override: scale the server's soft cap by the multiplier, then
-    // clamp to hard_cap so a high multiplier cannot push past the server's
-    // burst ceiling. multiplier 1.0 = full guaranteed concurrency (default);
-    // 0.5 = half; 2.0 = burst into hard_cap headroom. floor() keeps the slot
-    // count integral (0.5 of 4 = 2).
-    const serverLimit = guaranteedConcurrency;
-    if (serverLimit === undefined) return undefined; // /v1/usage not yet populated
-    const multiplier = cachedSettings.concurrencyMultiplier;
-    const scaled = Math.floor(serverLimit * multiplier);
-    return hardCap !== undefined ? Math.min(scaled, hardCap) : scaled;
-  }
-
-  // Strike-counter refresh loop (mirrors index.ts). The side-call can't trip
-  // the 5h ban on its own, but the poll keeps the shared strikes24h value
-  // current so the threshold check runs against a fresh count. Bounded by
-  // STRIKE_POLL_INTERVAL_MS (5 min) so /history RPS stays low.
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  let strikeTimer: ReturnType<typeof setTimeout> | undefined;
-  let refreshStopped = false;
-
-  function stopRefreshLoop() {
-    refreshStopped = true;
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = undefined;
-    }
-    if (strikeTimer) {
-      clearTimeout(strikeTimer);
-      strikeTimer = undefined;
-    }
-  }
-
-  function scheduleStrikePoll(apiKey: string, immediate = false) {
-    if (refreshStopped || !apiKey) return;
-    strikeTimer = setTimeout(async () => {
-      await refreshStrikes(apiKey);
-      scheduleStrikePoll(apiKey);
-    }, immediate ? 0 : STRIKE_POLL_INTERVAL_MS);
-  }
-
-  async function resolveApiKey(ctx?: any): Promise<string | undefined> {
-    const envKey = process.env[API_KEY_ENV]?.trim();
-    if (envKey) return envKey;
-    try {
-      return await ctx?.modelRegistry?.getApiKeyForProvider("umans");
-    } catch {
-      return undefined;
-    }
-  }
-
-  async function fetchUsage(apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<{
-    limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
-    usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
-  } | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const composed = parentSignal ? AbortSignal.any([parentSignal, ctrl.signal]) : ctrl.signal;
-    try {
-      const res = await fetch(`${baseUrl}/v1/usage`, {
-        signal: composed,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-          "User-Agent": USER_AGENT,
-        },
-      });
-      if (!res.ok) {
-        // a 403 FROM /v1/usage is a POSITIVE suspension signal, not absence —
-        // the server returns 403 for everything once the account is suspended.
-        // Return a synthetic priority.low + reason=cap_abuse snapshot so the
-        // cap_abuse branch in isCapacityFree fires + pushes the real pause.
-        if (res.status === 403) {
-          const txt = await res.text().catch(() => "");
-          if (isSuspendBody(txt)) {
-            const now = Date.now();
-            const extracted = extractBoxedUntil(txt);
-            const boxedUntilMs = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
-            return {
-              usage: {
-                concurrent_sessions: 0,
-                priority: { low: true, boxed_until: new Date(boxedUntilMs).toISOString(), reason: "cap_abuse" },
-              },
-            };
-          }
-        }
-        return null;
-      }
-      return await res.json() as {
-        limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
-        usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
-      };
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function fetchUsageSnapshot(apiKey: string, parentSignal?: AbortSignal): Promise<{
-    concurrentSessions: number | undefined;
-    limit: number | undefined;
-    hardCap: number | undefined;
-    priority: PriorityState;
-  } | null> {
-    const data = await fetchUsage(apiKey, 3000, parentSignal);
-    if (!data) return null;
-    return {
-      concurrentSessions: data.usage?.concurrent_sessions,
-      limit: data.limits?.concurrency?.limit ?? undefined,
-      hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
-      priority: parsePriority(data.usage?.priority),
-    };
-  }
-
-  async function fetch429Strikes(apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
-    const now = Date.now();
-    const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
-    const to = new Date(now).toISOString();
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    try {
-      const res = await fetch(
-        `${baseUrl}/v1/usage/history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=hour`,
-        {
-          signal: ctrl.signal,
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: "application/json",
-            "User-Agent": USER_AGENT,
-          },
-        },
-      );
-      if (!res.ok) {
-        if (res.status === 403) {
-          const txt = await res.text().catch(() => "");
-          if (isSuspendBody(txt)) return { count: null, suspended: true };
-        }
-        return { count: null, suspended: false };
-      }
-      const data = await res.json() as { buckets?: Array<{ bucket?: string; error_category?: string | null; requests?: number }> };
-      if (!Array.isArray(data.buckets)) return { count: null, suspended: false };
-      let lastPauseTs = 0;
-      for (const b of data.buckets) {
-        if (b.error_category === "cap_suspended" && b.bucket) {
-          const ts = new Date(b.bucket).getTime();
-          if (ts > lastPauseTs) lastPauseTs = ts;
-        }
-      }
-      const strikes = data.buckets
-        .filter((b) => b.error_category === "rate_limit_concurrency")
-        .filter((b) => {
-          if (lastPauseTs === 0) return true;
-          const ts = b.bucket ? new Date(b.bucket).getTime() : 0;
-          return ts > lastPauseTs;
-        })
-        .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
-      return { count: strikes, suspended: false };
-    } catch {
-      return { count: null, suspended: false };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function refreshStrikes(apiKey: string) {
-    const result = await fetch429Strikes(apiKey);
-    if (result.suspended) {
-      strikes24h = undefined;
-      return;
-    }
-    if (result.count === null) return;
-    const count = result.count;
-    strikes24h = count;
-    const maxInFlight = concurrencyLimit() ?? guaranteedConcurrency ?? 0;
-    if (maxInFlight <= 0) return;
-    const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
-    if (count >= strikeThreshold) {
-      const snap = concurrencyQueue.snapshot();
-      const now = Date.now();
-      const strikeUntil = now + STRIKE_PAUSE_MS;
-      if (!snap.paused || snap.pausedUntil < strikeUntil) {
-        try {
-          concurrencyQueue.pauseUntil(strikeUntil, PAUSE_REASON_STRIKES);
-        } catch (err) {
-          console.warn("umans: pauseUntil threw in refreshStrikes (continuing):", err instanceof Error ? err.message : err);
-        }
-      }
-    }
-  }
-
-  async function refreshUsage(apiKey: string) {
-    const data = await fetchUsage(apiKey, 5000);
-    if (!data) return;
-    if (data.limits) {
-      guaranteedConcurrency = data.limits.concurrency?.limit ?? undefined;
-      hardCap = data.limits.concurrency?.hard_cap ?? undefined;
-    }
-    const priority = parsePriority(data.usage?.priority);
-    if (!priority.low) {
-      const snap = concurrencyQueue.snapshot();
-      if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
-        concurrencyQueue.clearPause();
-      }
-    }
-  }
+  // Shared concurrency runtime: carries this factory's queue instance + the
+  // mutable capacity state read/written by the shared refresh/fetch machinery
+  // in utils.ts (one copy of refreshStrikes/refreshUsage/fetchUsage/etc,
+  // shared with index.ts so the strike-pause gate cannot diverge). web-search.ts
+  // has no status bar, so afterRefreshUsage is left undefined — the shared
+  // refreshUsage still updates rt.deprioritized (the strike-pause gate) + the
+  // capacity state; it just has no status-bar hook to call.
+  const rt: ConcurrencyRuntime = {
+    baseUrl,
+    queue: concurrencyQueue,
+    multiplier: cachedSettings.concurrencyMultiplier,
+    hardCap: undefined,
+    guaranteedConcurrency: undefined,
+    strikes24h: undefined,
+    deprioritized: false,
+    priorityUntil: undefined,
+    refreshTimer: undefined,
+    strikeTimer: undefined,
+    refreshStopped: false,
+  };
 
   // Acquire a concurrency slot for the web-search side-call. Mirrors index.ts's
   // acquireSlot: joins the cross-process FIFO, waits until head + claims the
@@ -498,9 +267,9 @@ export default async function (pi: ExtensionAPI) {
         throw err;
       }
       releaseToken = releaseTokenThisIter;
-      const limit = concurrencyLimit();
+      const limit = sharedConcurrencyLimit(rt);
       const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
-        const snap = await fetchUsageSnapshot(apiKey, signal);
+        const snap = await fetchUsageSnapshot(rt, apiKey, signal);
         const qSnap = concurrencyQueue.snapshot();
         const decision = isCapacityFree(snap, {
           limit,
@@ -572,20 +341,11 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  function releaseSlot(release: (() => void) | undefined): void {
-    if (!release) return;
-    try {
-      try {
-        release();
-      } catch (err) {
-        console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
-      }
-    } finally {
-      // no mainTurnRelease tracking here — web-search side-calls manage their
-      // own release in the tool execute finally (mirrors index.ts's side-call
-      // release pattern).
-    }
-  }
+  // releaseSlotCore (from utils.ts) runs the release closure swallowing
+  // throws so a transient lock/disk error does not abort the caller's turn
+  // (the 120s watchdog reaps the stale token/waiter regardless). web-search
+  // side-calls manage their own release in the tool execute finally — no
+  // mainTurnRelease tracking (index.ts-only).
 
   pi.registerTool({
     name: "umans_web_search",
@@ -621,7 +381,7 @@ export default async function (pi: ExtensionAPI) {
         const m = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text", text: `Web search failed: ${m}` }], details: {} };
       } finally {
-        releaseSlot(release);
+        releaseSlotCore(release);
       }
     },
   });
@@ -629,16 +389,21 @@ export default async function (pi: ExtensionAPI) {
   // Seed the refresh loops on session_start so the multiplier + strikes values
   // are populated before the first side-call. session_shutdown stops the
   // loops + resets this process's queue entry (mirrors index.ts).
+  // Seed the refresh loops on session_start so the multiplier + strikes values
+  // are populated before the first side-call. restartRefreshLoop starts BOTH
+  // the periodic refreshUsage (5s) AND the immediate strike poll — mirroring
+  // index.ts's session_start wiring so the multiplier + strike count stay
+  // current mid-session (a prior copy only ran refreshUsage once at startup +
+  // never started the periodic loop, leaving the limits stale mid-session).
+  // session_shutdown stops the loops + resets this process's queue entry.
   pi.on("session_start", async (_event, ctx) => {
     const apiKey = await resolveApiKey(ctx);
-    if (apiKey) await refreshUsage(apiKey);
-    if (!refreshStopped) {
-      scheduleStrikePoll(apiKey || "", true);
-    }
+    if (apiKey) await sharedRefreshUsage(rt, apiKey);
+    restartRefreshLoop(rt, apiKey || "");
   });
 
   pi.on("session_shutdown", async () => {
-    stopRefreshLoop();
+    stopRefreshLoop(rt);
     concurrencyQueue.reset();
   });
 }

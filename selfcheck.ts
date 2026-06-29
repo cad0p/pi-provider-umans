@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, formatStatusText, countdown } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, shouldReleaseOnMessageEnd, default as umansFactory, formatStatusText, countdown } from "./index.ts";
 import { default as webSearchFactory } from "./web-search.ts";
 import {
   pickSearchModel,
@@ -16,6 +16,8 @@ import {
   handle429,
   raiseForUmansStatus,
   readRetryAfter,
+  decideLaunch,
+  nextPollInterval,
   USER_AGENT,
   SEARCH_TIMEOUT_MS,
   SEARCH_MAX_TOKENS,

@@ -16,10 +16,17 @@ import {
   PRIORITY_BACKOFF_MS,
   PAUSE_REASON_429,
   PAUSE_REASON_CAP_ABUSE,
+  PAUSE_REASON_STRIKES,
+  STICKY_PAUSE_REASONS,
   extractBoxedUntil,
   isSuspendBody,
+  isCapacityFree,
+  parsePriority,
+  parseConcurrencyLimit,
   MAX_PAUSE_429_MS,
   SANITIZE_CTRL_RE,
+  type ConcurrencyQueue,
+  type PriorityState,
 } from "./concurrency-queue.ts";
 // Derive USER_AGENT from package.json so the version doesn't drift on
 // release. ESM JSON import attribute `with { type: "json" }` is stable in
@@ -220,4 +227,482 @@ export async function raiseForUmansStatus(
   // control sequences or mangle the tool result.
   const safe = sanitizeErrorBody(txt);
   throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
+}
+
+// ============================================================================
+// Concurrency refresh / fetch / capacity-poll machinery
+//
+// Shared by index.ts (the Umans provider factory) + web-search.ts (the
+// standalone web-search tool factory). Both factories create their OWN
+// ConcurrencyQueue instance (per the file-split design: two queue instances
+// in the same process coordinate through the shared state file), but the
+// refresh + fetch + strike-pause logic that reads /v1/usage + /v1/usage/history
+// + writes pauses is ONE copy here. A prior split duplicated this machinery
+// byte-for-byte; the two copies diverged on the strike-pause gate (the
+// deprioritized check was added to index.ts's copy but not web-search.ts's),
+// re-introducing a false-positive 30-min pause. Keeping one copy makes that
+// divergence structurally impossible.
+//
+// Each factory builds a ConcurrencyRuntime carrying its own queue instance +
+// mutable capacity state, then calls these functions with that runtime. The
+// factory keeps its own acquireSlot/releaseSlot closures (per-instance, capture
+// the queue) + the session_start/session_shutdown wiring + the status bar
+// (index.ts only) + the provider/tool registration.
+// ============================================================================
+
+// max time the head-waiter capacity poll will wait for a free slot before
+// failing open (launching anyway). Bounds the queue against a hostile /
+// misbehaving /usage that always reports full.
+export const CAPACITY_POLL_TIMEOUT_MS = 60_000;
+
+// 429 strike counter: the Umans account is paused for 5h after >20 concurrency
+// 429s in 24h. The queue polls /v1/usage/history every STRIKE_POLL_INTERVAL_MS,
+// sums rate_limit_concurrency buckets since the last cap_suspended (the server
+// resets the counter on reactivation), and defensively pauses when the count
+// reaches the dynamic threshold — better to self-pause briefly than risk the
+// 5h ban. The threshold is dynamic: STRIKE_SERVER_LIMIT (20) minus the max
+// in-flight (the concurrency limit, e.g. 4), so a burst of in-flight requests
+// between the poll + the server's counter update can't tip us over before we
+// react. With limit=4 → threshold=16.
+export const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+export const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
+export const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
+export const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
+
+// /usage poll-interval backoff tuning (used by nextPollInterval + acquireSlot).
+export const POLL_INTERVAL_BASE_MS = 300;
+export const POLL_INTERVAL_CAP_MS = 2_000;
+export const POLL_INTERVAL_GROWTH = 1.5;
+
+const API_KEY_ENV = "UMANS_API_KEY";
+const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
+
+/**
+ * The /v1/usage response shape (the fields the refresh machinery reads).
+ * Exported so the afterRefreshUsage status-bar hook can be typed.
+ */
+export type UsageData = {
+  limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
+  usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
+};
+
+/**
+ * Per-factory runtime carried by the shared refresh/fetch functions. The
+ * factory owns this object (one instance per factory) + the shared functions
+ * read + write its mutable fields directly so there is one copy of the
+ * refresh logic. The factory keeps its own acquireSlot/releaseSlot closures
+ * + status-bar-only locals (index.ts: currentConcurrency/requestLimit/
+ * requestsUsed) outside this object.
+ */
+export interface ConcurrencyRuntime {
+  baseUrl: string;
+  queue: ConcurrencyQueue;
+  // multiplier cached once at factory startup from readSettings(). The shared
+  // concurrencyLimit scales the server soft cap by this, clamped to hardCap.
+  multiplier: number;
+  // mutable capacity state — the shared refresh/fetch functions read + write
+  // these fields directly. `deprioritized` is the strike-pause gate: the
+  // shared refreshStrikes only pushes a strike pause when the account is
+  // deprioritized (priority.low === true), so a stale /history count on a
+  // clear account cannot push a false-positive pause.
+  hardCap: number | undefined;
+  guaranteedConcurrency: number | undefined;
+  strikes24h: number | undefined;
+  deprioritized: boolean;
+  priorityUntil: number | undefined;
+  // timer state for the periodic refreshUsage (5s) + strike poll (5min) loops.
+  refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  strikeTimer: ReturnType<typeof setTimeout> | undefined;
+  refreshStopped: boolean;
+  // status-bar hook: index.ts re-renders the status bar + updates its
+  // status-only locals (currentConcurrency/requestLimit/requestsUsed) from the
+  // raw usage data here. web-search.ts has no status bar + leaves this
+  // undefined. Called once per refreshUsage with the fetched (non-null) data.
+  afterRefreshUsage?(data: UsageData): void;
+}
+
+/**
+ * Pure decision extracted from acquireSlot's capacity-poll loop so the branch
+ * logic (free-first-poll, poll-then-free, timeout-fail-open, timeout-but-
+ * paused-keeps-waiting, mid-poll-abort) is unit-testable without the full pi
+ * runtime.
+ *
+ * - `launch`: capacity is free — proceed with the send.
+ * - `abort`: the turn's AbortSignal fired mid-poll — cancel + reject.
+ * - `failOpen`: the poll cap elapsed AND no known pause is active — launch
+ *   ungated so a wedged /usage doesn't block forever. A known active pause
+ *   keeps the gate waiting (bounded by the pause deadline + the 120s
+ *   watchdog) — fail-open for a POSITIVE deprio signal would launch into a
+ *   still-deprioritized account.
+ * - `wait`: keep polling (300ms + jitter).
+ */
+export type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
+export function decideLaunch(opts: {
+  isFree: boolean;
+  elapsedMs: number;
+  queuePaused: boolean;
+  signalAborted: boolean;
+}): LaunchDecision {
+  // signalAborted takes precedence over isFree. When the turn's AbortSignal
+  // fires mid-poll AND /usage is unreachable (fetchUsage returns null →
+  // isCapacityFree(null) returns {free:true} via the trust-headroom stance),
+  // the prior isFree-first ordering would return "launch" + hold the token
+  // until a safety net fires. For a Ctrl-C'd turn that never sends, the token
+  // leaks up to the 120s watchdog. Checking signalAborted first routes through
+  // the abort branch immediately at the abort site.
+  if (opts.signalAborted) return "abort";
+  if (opts.isFree) return "launch";
+  if (opts.elapsedMs >= CAPACITY_POLL_TIMEOUT_MS && !opts.queuePaused) return "failOpen";
+  return "wait";
+}
+
+/**
+ * Pure helper for the /usage poll interval under steady-full backoff. With N
+ * local pi processes each running their own head waiter, a saturated queue
+ * drives N×3.3 RPS to /usage continuously. Exponential backoff on the poll
+ * interval when capacity is steadily full reduces RPS from ~3.3/s to ~0.5/s
+ * during a sustained pause.
+ *
+ * - "wait": grow by GROWTH (1.5×), capped at CAP (2000ms). The ±100ms jitter
+ *   is applied by the caller, not here (keeps this pure + deterministic).
+ * - "launch" / "failOpen" / "abort": reset to BASE.
+ */
+export function nextPollInterval(currentMs: number, decision: LaunchDecision, opts?: { base?: number; cap?: number; growth?: number }): number {
+  const base = opts?.base ?? POLL_INTERVAL_BASE_MS;
+  const cap = opts?.cap ?? POLL_INTERVAL_CAP_MS;
+  const growth = opts?.growth ?? POLL_INTERVAL_GROWTH;
+  if (decision === "wait") {
+    const next = Math.round(currentMs * growth);
+    return Math.min(next > 0 ? next : base, cap);
+  }
+  return base;
+}
+
+/**
+ * Resolve the Umans API key from the env var (preferred) or the pi
+ * modelRegistry (ctx.modelRegistry.getApiKeyForProvider). The ctx param is
+ * typed loosely (any) because the pi ExtensionAPI ctx shape is not narrowed
+ * for this lookup; the key is never logged or leaked. Identical in both
+ * factories pre-extraction; one copy here.
+ */
+export async function resolveApiKey(ctx?: any): Promise<string | undefined> {
+  const envKey = process.env[API_KEY_ENV]?.trim();
+  if (envKey) return envKey;
+  try {
+    return await ctx?.modelRegistry?.getApiKeyForProvider("umans");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The effective concurrency limit for the runtime. The UMANS_CONCURRENCY_LIMIT
+ * env var is the absolute override (testing knob): when set it wins outright,
+ * bypassing the multiplier. Otherwise scale the server's soft cap
+ * (guaranteedConcurrency) by the cached multiplier, then clamp to hardCap so a
+ * high multiplier cannot push past the server's burst ceiling. floor() keeps
+ * the slot count integral (0.5 of 4 = 2). Returns undefined before /v1/usage
+ * populates guaranteedConcurrency.
+ */
+export function concurrencyLimit(rt: ConcurrencyRuntime): number | undefined {
+  if (process.env[CONCURRENCY_LIMIT_ENV] !== undefined) {
+    return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], rt.guaranteedConcurrency);
+  }
+  const serverLimit = rt.guaranteedConcurrency;
+  if (serverLimit === undefined) return undefined; // /v1/usage not yet populated
+  const scaled = Math.floor(serverLimit * rt.multiplier);
+  return rt.hardCap !== undefined ? Math.min(scaled, rt.hardCap) : scaled;
+}
+
+/**
+ * Fetch /v1/usage. A 403 FROM /v1/usage is a POSITIVE suspension signal, not
+ * absence — the server returns 403 for everything once the account is
+ * suspended. Return a synthetic priority.low + reason=cap_abuse snapshot so
+ * the cap_abuse branch in isCapacityFree fires + pushes the real pause. A
+ * non-suspend 403 (auth error on /usage) keeps fail-open (return null).
+ * Returns null on any other failure (caller leaves cached values).
+ */
+export async function fetchUsage(rt: ConcurrencyRuntime, apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<UsageData | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const composed = parentSignal ? AbortSignal.any([parentSignal, ctrl.signal]) : ctrl.signal;
+  try {
+    const res = await fetch(`${rt.baseUrl}/v1/usage`, {
+      signal: composed,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+      },
+    });
+    if (!res.ok) {
+      if (res.status === 403) {
+        const txt = await res.text().catch(() => "");
+        if (isSuspendBody(txt)) {
+          const now = Date.now();
+          const extracted = extractBoxedUntil(txt);
+          const boxedUntilMs = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
+          return {
+            usage: {
+              concurrent_sessions: 0,
+              priority: { low: true, boxed_until: new Date(boxedUntilMs).toISOString(), reason: "cap_abuse" },
+            },
+          };
+        }
+      }
+      return null;
+    }
+    return await res.json() as UsageData;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Lightweight one-shot /v1/usage fetch used by the head waiter (acquireSlot)
+ * to decide whether to launch. Shorter timeout (3s vs 5s) so a slow /usage
+ * doesn't stall the head-waiter poll; reads only the capacity-decision fields.
+ * Returns null on any failure (caller retries).
+ */
+export async function fetchUsageSnapshot(rt: ConcurrencyRuntime, apiKey: string, parentSignal?: AbortSignal): Promise<{
+  concurrentSessions: number | undefined;
+  limit: number | undefined;
+  hardCap: number | undefined;
+  priority: PriorityState;
+} | null> {
+  const data = await fetchUsage(rt, apiKey, 3000, parentSignal);
+  if (!data) return null;
+  return {
+    concurrentSessions: data.usage?.concurrent_sessions,
+    limit: data.limits?.concurrency?.limit ?? undefined,
+    hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
+    priority: parsePriority(data.usage?.priority),
+  };
+}
+
+/**
+ * Fetch the count of concurrency 429s since the last cap_suspended (5h pause)
+ * from /v1/usage/history. The server pauses the account for 5h after >20
+ * concurrency 429s in 24h AND resets the counter on reactivation (a
+ * reactivation revokes + rotates API keys), so strikes before the most recent
+ * cap_suspended bucket are excluded — matching the dashboard's behavior so the
+ * count stays accurate after a reactivation. Returns a typed result:
+ * suspend-403 (server returns 403 for /history too once suspended — caller
+ * clears the cached count) vs transient failure (caller preserves the cached
+ * count so a blip does not skip the self-pause).
+ */
+export async function fetch429Strikes(rt: ConcurrencyRuntime, apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
+  const now = Date.now();
+  const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
+  const to = new Date(now).toISOString();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const res = await fetch(
+      `${rt.baseUrl}/v1/usage/history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=hour`,
+      {
+        signal: ctrl.signal,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json",
+          "User-Agent": USER_AGENT,
+        },
+      },
+    );
+    if (!res.ok) {
+      // A 403 FROM /v1/usage/history is a POSITIVE suspension signal (the
+      // server returns 403 for everything once suspended). Distinguish it from
+      // a transient !res.ok so the caller clears the cache only on a real
+      // suspension + preserves the cached count on a transient failure.
+      if (res.status === 403) {
+        const txt = await res.text().catch(() => "");
+        if (isSuspendBody(txt)) return { count: null, suspended: true };
+      }
+      return { count: null, suspended: false };
+    }
+    const data = await res.json() as { buckets?: Array<{ bucket?: string; error_category?: string | null; requests?: number }> };
+    if (!Array.isArray(data.buckets)) return { count: null, suspended: false };
+    let lastPauseTs = 0;
+    for (const b of data.buckets) {
+      if (b.error_category === "cap_suspended" && b.bucket) {
+        const ts = new Date(b.bucket).getTime();
+        if (ts > lastPauseTs) lastPauseTs = ts;
+      }
+    }
+    const strikes = data.buckets
+      .filter((b) => b.error_category === "rate_limit_concurrency")
+      .filter((b) => {
+        // Exclude strikes before the most recent cap_suspended (counter reset).
+        if (lastPauseTs === 0) return true;
+        const ts = b.bucket ? new Date(b.bucket).getTime() : 0;
+        return ts > lastPauseTs;
+      })
+      .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
+    return { count: strikes, suspended: false };
+  } catch {
+    return { count: null, suspended: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Refresh the cached 24h 429 strike count + defensively pause if the count
+ * reaches the dynamic threshold. The strike-pause push is GATED on
+ * `deprioritized`: /v1/usage/history is eventually-consistent (lags
+ * real-time), so a poll can return a stale count at/above the threshold that
+ * the server no longer reports. /v1/usage is the capacity authority — its
+ * priority.low flag (cached as `deprioritized` by refreshUsage) is the
+ * server's own rate-limit signal. When the account is not deprioritized, a
+ * stale history count must NOT push a strike pause (otherwise a clear account
+ * gets a spurious 30-min pause). The strikes24h cache is still updated for
+ * status-bar observability; only the pause push is gated. The cap_abuse
+ * suspension path returns early above + is unaffected.
+ *
+ * This gate is the structural fix for the false-positive strike pause: one
+ * copy of refreshStrikes, shared by both factories, so the gate cannot diverge.
+ */
+export async function refreshStrikes(rt: ConcurrencyRuntime, apiKey: string): Promise<void> {
+  const result = await fetch429Strikes(rt, apiKey);
+  if (result.suspended) {
+    // /v1/usage/history may also return 403 during a suspension. Clear the
+    // cached strikes value so the status bar does not show a stale "Strikes
+    // 19/20" for the full 5h suspension. The threshold check below is skipped
+    // (extend-never-shorten holds regardless because a cap_abuse pause is
+    // sticky + longer than any strike pause).
+    rt.strikes24h = undefined;
+    return;
+  }
+  // Transient failure (network timeout, 5xx, JSON parse): preserve the cached
+  // count so a single blip does not lose the strike count + skip the defensive
+  // self-pause right when it matters most.
+  if (result.count === null) return;
+  const count = result.count;
+  rt.strikes24h = count;
+  const maxInFlight = concurrencyLimit(rt) ?? rt.guaranteedConcurrency ?? 0;
+  // Skip the threshold check at startup before guaranteedConcurrency is
+  // populated. With maxInFlight=0 the threshold would be 20 (the server limit)
+  // — pausing at the server's own trigger point is too late + risks a
+  // false-positive pause if the API transiently returns stale data. Wait for
+  // the first refreshUsage to populate the real limit.
+  if (maxInFlight <= 0) return;
+  const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
+  if (rt.deprioritized && count >= strikeThreshold) {
+    const snap = rt.queue.snapshot();
+    const now = Date.now();
+    const strikeUntil = now + STRIKE_PAUSE_MS;
+    // Only push if no active pause OR the active pause ends sooner than our
+    // strike pause (extend, never shorten). A priority.low pause from the
+    // server (boxed_until) or a 429 pause is left untouched if it's longer.
+    if (!snap.paused || snap.pausedUntil < strikeUntil) {
+      try {
+        rt.queue.pauseUntil(strikeUntil, PAUSE_REASON_STRIKES);
+      } catch (err) {
+        console.warn("umans: pauseUntil threw in refreshStrikes (continuing):", err instanceof Error ? err.message : err);
+      }
+    }
+  }
+}
+
+/**
+ * Refresh guaranteedConcurrency/hardCap/deprioritized/priorityUntil from
+ * /v1/usage. The synthetic cap_abuse return (fetchUsage on a /v1/usage 403
+ * with a suspend body) carries no `limits` field — preserve the cached
+ * guaranteedConcurrency/hardCap in that case (only update when data.limits is
+ * present). Clears a non-sticky pause pushed by a PREVIOUS priority.low tick
+ * when the account is no longer deprioritized (a stale /usage tick reporting
+ * low===false must not wipe a freshly-written sticky 429/cap_abuse/strike
+ * pause). Calls afterRefreshUsage (index.ts: status-bar re-render + status-
+ * only locals) with the raw data.
+ */
+export async function refreshUsage(rt: ConcurrencyRuntime, apiKey: string): Promise<void> {
+  const data = await fetchUsage(rt, apiKey, 5000);
+  if (!data) return; // leave cached values; status bar will show "?"
+  if (data.limits) {
+    // null ?? undefined normalizes unlimited (null) limits so the display
+    // guards hide them instead of rendering "x/null".
+    rt.guaranteedConcurrency = data.limits.concurrency?.limit ?? undefined;
+    rt.hardCap = data.limits.concurrency?.hard_cap ?? undefined;
+  }
+  // Track the deprioritization state for the status bar (DEPRIO banner) + the
+  // strike-pause gate (refreshStrikes reads rt.deprioritized). priority.low is
+  // a STATUS signal, not a stop condition: the gate lowers the cap by 1
+  // (isCapacityFree) to reduce race risk, but does NOT push a full pause.
+  const priority = parsePriority(data.usage?.priority);
+  rt.deprioritized = priority.low;
+  rt.priorityUntil = priority.until;
+  if (!priority.low) {
+    const snap = rt.queue.snapshot();
+    if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
+      rt.queue.clearPause();
+    }
+  }
+  rt.afterRefreshUsage?.(data);
+}
+
+/** Stop the periodic refreshUsage + strike-poll loops + clear their timers. */
+export function stopRefreshLoop(rt: ConcurrencyRuntime): void {
+  rt.refreshStopped = true;
+  if (rt.refreshTimer) {
+    clearTimeout(rt.refreshTimer);
+    rt.refreshTimer = undefined;
+  }
+  if (rt.strikeTimer) {
+    clearTimeout(rt.strikeTimer);
+    rt.strikeTimer = undefined;
+  }
+}
+
+/**
+ * (Re)start the periodic refreshUsage loop (5s) + the immediate strike poll.
+ * The strike poll fires immediately (no delay) so the strike count is known at
+ * startup, not 5 min in. Called from session_start (and model_select in
+ * index.ts when switching to the Umans provider).
+ */
+export function restartRefreshLoop(rt: ConcurrencyRuntime, apiKey: string): void {
+  stopRefreshLoop(rt);
+  rt.refreshStopped = false;
+  scheduleRefresh(rt, apiKey);
+  scheduleStrikePoll(rt, apiKey, true);
+}
+
+/** Schedule the next periodic refreshUsage (5s). Re-schedules itself. */
+export function scheduleRefresh(rt: ConcurrencyRuntime, apiKey: string): void {
+  if (rt.refreshStopped || !apiKey) return;
+  rt.refreshTimer = setTimeout(async () => {
+    await refreshUsage(rt, apiKey);
+    scheduleRefresh(rt, apiKey);
+  }, 5000);
+}
+
+/**
+ * Schedule the next strike-count poll (STRIKE_POLL_INTERVAL_MS, 5min). The
+ * first poll fires immediately (immediate=true) so the strike count is known
+ * at startup. Re-schedules itself.
+ */
+export function scheduleStrikePoll(rt: ConcurrencyRuntime, apiKey: string, immediate = false): void {
+  if (rt.refreshStopped || !apiKey) return;
+  rt.strikeTimer = setTimeout(async () => {
+    await refreshStrikes(rt, apiKey);
+    scheduleStrikePoll(rt, apiKey);
+  }, immediate ? 0 : STRIKE_POLL_INTERVAL_MS);
+}
+
+/**
+ * Release a concurrency slot returned by acquireSlot. Best-effort: the release
+ * closure + the in-flight/waiter removal each swallow throws (lock timeout,
+ * EACCES/ENOSPC) so a repeatedly-throwing slot does not abort the caller's
+ * turn; the 120s watchdog reaps the stale token/waiter regardless. index.ts
+ * wraps this in its own releaseSlot (adding mainTurnRelease tracking + a
+ * status-bar re-render); web-search.ts calls this directly.
+ */
+export function releaseSlotCore(release: (() => void) | undefined): void {
+  if (!release) return;
+  try {
+    release();
+  } catch (err) {
+    console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
+  }
 }
