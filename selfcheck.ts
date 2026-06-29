@@ -7426,7 +7426,7 @@ assert(deepMergeSettings(1, undefined) === 1, "deepMerge: undefined project keep
 }
 
 // readSettings: invalid multiplier values fall back to default
-// (0, negative, NaN, string, object, Infinity all rejected)
+// (0, negative, NaN, string, object, Infinity, + huge finite > the sane max)
 for (const [label, raw] of [
   ["zero", 0],
   ["negative", -1],
@@ -7434,6 +7434,10 @@ for (const [label, raw] of [
   ["string", "1.0"],
   ["object", { x: 1 }],
   ["Infinity", Infinity],
+  // Huge finite multipliers would bypass the hard_cap clamp during the startup
+  // window + self-DoS the account via 429s. Rejected at validation time.
+  ["huge 1e300", 1e300],
+  ["huge 1000", 1000],
 ] as [string, unknown][]) {
   const dir = mkdtempSync(join(tmpdir(), `umans-settings-invalid-${label}-`));
   const globalPath = join(dir, "global.json");
@@ -7508,6 +7512,10 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
   ["2.0 to hard_cap (4->8)", 2.0, 4, 8, 8],
   // multiplier 1.0, no hard_cap reported → just floor(4 * 1.0) = 4 (no clamp)
   ["1.0 no hard_cap (4->4)", 1.0, 4, undefined, 4],
+  // multiplier 0.1 → floor(4 * 0.1) = floor(0.4) = 0, floored to at least 1 so
+  // a sub-1 multiplier gets at least 1 slot instead of wedging the gate
+  // (a limit of 0 means every request polls until the 60s fail-open).
+  ["0.1 floors to 1 (4->1)", 0.1, 4, 8, 1],
 ] as [string, number, number, number | undefined, number][]) {
   const dir = mkdtempSync(join(tmpdir(), `umans-mult-${label.replace(/[^a-z0-9]/gi, "-")}-`));
   const stateFile = join(dir, "state.json");

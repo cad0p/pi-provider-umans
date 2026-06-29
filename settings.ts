@@ -39,6 +39,16 @@ import { join } from "node:path";
 /** Default multiplier: 1.0 = use the full guaranteed concurrency. */
 export const DEFAULT_CONCURRENCY_MULTIPLIER = 1.0;
 
+/**
+ * Sane maximum for the concurrency multiplier. The documented useful range is
+ * 0.5–3.0; anything above ~10 has no legitimate use. A huge finite multiplier
+ * (e.g. 1e300) bypasses the hard_cap clamp during the startup window before
+ * /v1/usage populates it (Math.floor(4 * 1e300) = 4e300 → the gate always
+ * reports free → self-DoS via 429s). Rejecting at validation time bounds the
+ * multiplier at the edge, independent of hard_cap.
+ */
+const MAX_CONCURRENCY_MULTIPLIER = 100;
+
 export interface UmansSettings {
   concurrencyMultiplier: number;
 }
@@ -139,6 +149,14 @@ function coerceSettings(parsed: unknown, sourceLabel: string): UmansSettings {
   // rejects NaN + Infinity. The > 0 check rejects 0 + negatives.
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
     console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier=${JSON.stringify(raw)} is invalid (must be a finite number > 0); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
+    return base;
+  }
+  // Sane-maximum cap: reject a huge finite multiplier (e.g. 1e300) that would
+  // bypass the hard_cap clamp during the startup window + self-DoS the account
+  // via 429s. The documented useful range is 0.5–3.0; anything above 100 has no
+  // legitimate use.
+  if (raw > MAX_CONCURRENCY_MULTIPLIER) {
+    console.warn(`umans: settings ${sourceLabel} concurrencyMultiplier=${raw} exceeds the maximum (${MAX_CONCURRENCY_MULTIPLIER}); using default ${DEFAULT_CONCURRENCY_MULTIPLIER}`);
     return base;
   }
   return { concurrencyMultiplier: raw };

@@ -410,7 +410,12 @@ export function concurrencyLimit(rt: ConcurrencyRuntime): number | undefined {
   }
   const serverLimit = rt.guaranteedConcurrency;
   if (serverLimit === undefined) return undefined; // /v1/usage not yet populated
-  const scaled = Math.floor(serverLimit * rt.multiplier);
+  // Floor the scaled value to at least 1 so a sub-1 multiplier (e.g. 0.1 with
+  // limit 4 → floor(0.4)=0) gets at least 1 slot instead of wedging the gate.
+  // A limit of 0 means "never free" → isCapacityFree reports not-free on every
+  // poll → the head waiter polls until the 60s fail-open, a hostile UX for a
+  // user who asked for "conservative". The hard_cap clamp still applies above.
+  const scaled = Math.max(1, Math.floor(serverLimit * rt.multiplier));
   return rt.hardCap !== undefined ? Math.min(scaled, rt.hardCap) : scaled;
 }
 
