@@ -836,11 +836,18 @@ export default async function (pi: ExtensionAPI) {
     // refreshUsage to populate the real limit, then the dynamic threshold applies.
     if (maxInFlight <= 0) return;
     const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
-    // Defensively self-pause when approaching the 5h-pause threshold. Better to
-    // pause briefly + let strikes age out than risk the 5h account ban. The
-    // pause is only pushed if no longer pause is already active (don't shorten a
-    // real priority.low / 429 pause with a shorter strikes pause).
-    if (count >= strikeThreshold) {
+    // Cross-check the cached /v1/usage capacity signal before pushing a strike
+    // pause. /v1/usage/history is eventually-consistent (lags real-time), so a
+    // poll can return a stale count at/above the threshold that the server no
+    // longer reports. /v1/usage is the capacity authority: its priority.low flag
+    // is the server's own rate-limit signal, refreshed by refreshUsage and
+    // cached in `deprioritized`. If the account is not deprioritized
+    // (priority.low === false), the server is not rate-limiting it, so a stale
+    // history count must not push a strike pause. The strikes24h cache above is
+    // still updated for status-bar observability; only the pause push is gated.
+    // (The cap_abuse suspension path returns early before this point and is
+    // unaffected.)
+    if (deprioritized && count >= strikeThreshold) {
       const snap = concurrencyQueue.snapshot();
       const now = Date.now();
       const strikeUntil = now + STRIKE_PAUSE_MS;

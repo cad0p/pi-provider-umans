@@ -6297,6 +6297,174 @@ if (process.platform !== "win32") {
   }
 }
 
+// --- refreshStrikes does not push a strike pause when the account is not deprioritized ---
+// /v1/usage/history is eventually-consistent (lags real-time), so a poll can
+// return a stale count at/above the threshold that the server no longer
+// reports. /v1/usage is the capacity authority: its priority.low flag is the
+// server's own rate-limit signal, cached as `deprioritized` by refreshUsage.
+// When priority.low === false (the account is not deprioritized), a stale
+// history count must NOT push a strike pause — otherwise a clear account gets a
+// spurious 30-min pause. The strikes24h cache is still updated (the status bar
+// shows the count); only the pause push is gated.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-strike-gate-clear-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // /v1/usage: account is clear (priority.low: false). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18) —
+  // stale data the server no longer reports.
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // session_start runs refreshUsage (caches priority.low=false → deprioritized=false)
+    // then schedules the immediate strike poll (setTimeout 0).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The stale 19-strike count is ≥ threshold 18, but the account is not
+    // deprioritized, so no strike pause is pushed.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason !== PAUSE_REASON_STRIKES,
+      "refreshStrikes does not push PAUSE_REASON_STRIKES when the account is not deprioritized (stale history ignored)");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- refreshStrikes pushes a strike pause when the account is deprioritized ---
+// Inverse of the gate: when /v1/usage reports priority.low === true (the server
+// is rate-limiting the account) AND the stale/real history count is ≥ the
+// threshold, the strike pause DOES fire. This confirms the gate does not break
+// the real protective path.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-strike-gate-deprio-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  const boxedUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  // /v1/usage: account is deprioritized (priority.low: true). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18).
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil, reason: "rate_limited" } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The server confirms rate-limiting (priority.low === true) AND the count is
+    // ≥ threshold 18, so the strike pause fires.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason === PAUSE_REASON_STRIKES,
+      "refreshStrikes pushes PAUSE_REASON_STRIKES when deprioritized + count ≥ threshold (real protective path)");
+    assert(typeof parsed.pausedUntil === "number" && parsed.pausedUntil > Date.now(),
+      "refreshStrikes strike pause has a future pausedUntil when deprioritized + count ≥ threshold");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- refreshUsage preserves guaranteedConcurrency when /v1/usage returns 403-suspend ---
 // The synthetic cap_abuse object (fetchUsage on a /v1/usage 403 with a suspend
 // body) carries no `limits` field. The prior code unconditionally assigned
