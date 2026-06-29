@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, formatStatusText, countdown } from "./index.ts";
+import { default as webSearchFactory } from "./web-search.ts";
 import {
   pickSearchModel,
   sanitizeErrorBody,
@@ -4198,10 +4199,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  // The main session sets UMANS_SEARCH_DISABLE=1; clear it so umans_web_search
-  // registers + its execute body drives acquireSlot.
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   // messagesStatus controls what /v1/messages returns: 200 (valid analysis) or 429.
@@ -4276,6 +4273,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     // umans_web_search must have been registered with an execute fn.
     assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
@@ -4418,9 +4416,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
-
   const realFetch = globalThis.fetch;
   // messagesMode controls what /v1/messages returns:
   //   "empty" -> content: [] (searchWeb + analyzeImage empty fallback)
@@ -4496,6 +4491,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     const searchTool = tools.get("umans_web_search")!;
     const visionTool = tools.get("umans_vision")!;
@@ -4595,8 +4591,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -4759,8 +4753,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   delete process.env.UMANS_VISION_MODEL;
   savedEnv.UMANS_VISION_DISABLE = process.env.UMANS_VISION_DISABLE;
   delete process.env.UMANS_VISION_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -5015,51 +5007,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
-// --- UMANS_SEARCH_DISABLE=1 wiring driven through real factory ---
-// When UMANS_SEARCH_DISABLE=1, the factory skips registering umans_web_search.
-// No selfcheck test set this env var + asserted the tool is absent. A regression
-// dropping the `if (!searchDisabled)` guard would not be caught.
-{
-  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov-r14-1-"));
-  const savedEnv: Record<string, string | undefined> = {};
-  const envOverrides: Record<string, string> = {
-    UMANS_API_KEY: "uk-test-key",
-    UMANS_CONCURRENCY_DISABLE: "1",
-    UMANS_SEARCH_DISABLE: "1", // disable the search tool
-  };
-  for (const [k, v] of Object.entries(envOverrides)) {
-    savedEnv[k] = process.env[k];
-    process.env[k] = v;
-  }
-  delete process.env.UMANS_DISABLE;
-
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (() => Promise.resolve(new Response("", { status: 404 }))) as any;
-  try {
-    const registeredTools: string[] = [];
-    const pi: any = {
-      on() {},
-      registerTool(name: string, _opts: any, _handler: any) { registeredTools.push(name); },
-      registerCommand() {}, registerProvider() {},
-      events: { on() {}, off() {}, emit() {} },
-    };
-
-    // UMANS_SEARCH_DISABLE=1 → tool NOT registered
-    await umansFactory(pi as any);
-    assert(!registeredTools.includes("umans_web_search"),
-      "UMANS_SEARCH_DISABLE=1 → umans_web_search NOT registered");
-    // Other tools should still be registered (only search is disabled).
-    assert(registeredTools.length > 0,
-      "UMANS_SEARCH_DISABLE=1 → other tools still registered");
-  } finally {
-    globalThis.fetch = realFetch;
-    for (const [k, v] of Object.entries(savedEnv)) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
 // --- acquireLock 2s timeout throw path ---
 // acquireLock throws `concurrency-queue: timed out acquiring lock` when the
 // deadline (now + lockTimeoutMs) passes while the lockfile is held with a
@@ -5185,8 +5132,6 @@ if (process.platform !== "win32") {
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -5250,6 +5195,7 @@ if (process.platform !== "win32") {
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
     assert(tools.has("umans_vision"), "umans_vision tool registered through wiring");
@@ -5361,8 +5307,9 @@ if (process.platform !== "win32") {
 // A regression re-inlining the block (or dropping the 429 push / sanitize at one
 // site) would not be caught by the existing side-call 429 tests alone.
 // Pin the helper exists + is called from both sites by source inspection.
-// The helper lives in utils.ts (pure helpers module); the call sites
-// (analyzeImage + searchWeb) live in index.ts until the web-search split.
+// The helper lives in utils.ts (pure helpers module); the call sites are now
+// split across files — analyzeImage in index.ts, searchWeb in web-search.ts —
+// so the source inspection reads both files to pin each call site.
 {
   const utilsSrc = readFileSync("utils.ts", "utf8");
   assert(utilsSrc.includes("export async function raiseForUmansStatus("),
@@ -5377,17 +5324,20 @@ if (process.platform !== "win32") {
   assert(helperBody.includes("sanitizeErrorBody(txt)"),
     "raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
   // Both side-call sites call the helper in their !res.ok branch.
-  const src = readFileSync("index.ts", "utf8");
-  const analyzeIdx = src.indexOf("async function analyzeImage(");
-  const searchIdx = src.indexOf("async function searchWeb(");
-  assert(analyzeIdx >= 0 && searchIdx > analyzeIdx,
-    "analyzeImage + searchWeb defined in index.ts");
-  const analyzeCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
-  const searchCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
-  assert(analyzeCallIdx > analyzeIdx && analyzeCallIdx < searchIdx,
-    "analyzeImage !res.ok branch calls raiseForUmansStatus");
+  // analyzeImage lives in index.ts; searchWeb was split into web-search.ts.
+  // Read each file + assert the helper is called inside each function body.
+  const indexSrc = readFileSync("index.ts", "utf8");
+  const webSearchSrc = readFileSync("web-search.ts", "utf8");
+  const analyzeIdx = indexSrc.indexOf("async function analyzeImage(");
+  const searchIdx = webSearchSrc.indexOf("async function searchWeb(");
+  assert(analyzeIdx >= 0, "analyzeImage defined in index.ts");
+  assert(searchIdx >= 0, "searchWeb defined in web-search.ts");
+  const analyzeCallIdx = indexSrc.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
+  const searchCallIdx = webSearchSrc.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
+  assert(analyzeCallIdx > analyzeIdx,
+    "analyzeImage !res.ok branch calls raiseForUmansStatus (index.ts)");
   assert(searchCallIdx > searchIdx,
-    "searchWeb !res.ok branch calls raiseForUmansStatus");
+    "searchWeb !res.ok branch calls raiseForUmansStatus (web-search.ts)");
 }
 
 // --- concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
@@ -7407,6 +7357,72 @@ for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
   );
   assert(d3.free === false,
     "deprio + multiplier 3.0 (clamped to hard_cap 8): 7 sessions >= cap 7 (8-1) → not free");
+}
+
+// --- web-search split: standalone factory registers umans_web_search ---
+// The web-search tool was split out of index.ts into its own default-export
+// factory in web-search.ts so `pi config` (+/- on the extensions array in
+// settings.json) can toggle it independently of the provider. Verify the
+// factory registers the tool when loaded standalone — i.e. without index.ts's
+// factory having run. Mock the pi runtime, call the factory, inspect the
+// registered tool. No live search is performed (the execute body is only
+// invoked in the dedicated wiring tests above); this pins the registration
+// contract: the tool name, label, + parameter schema survive the split.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-standalone-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  try {
+    const tools = new Map<string, { name: string; label?: string; parameters?: any; execute?: Function }>();
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    // Load ONLY web-search.ts's factory — index.ts's factory must NOT have run
+    // (the standalone contract is that web-search.ts registers the tool on its
+    // own, so `pi config` can toggle it via +/- on the extensions array).
+    await webSearchFactory(pi as any);
+    assert(tools.has("umans_web_search"),
+      "web-search.ts standalone factory registered umans_web_search");
+    const tool = tools.get("umans_web_search")!;
+    assert(tool.label === "Umans Web Search",
+      `umans_web_search label preserved across split (got '${tool.label}')`);
+    // The parameter schema must survive the split: a single 'query' string.
+    assert(tool.parameters?.properties?.query?.type === "string",
+      "umans_web_search parameter schema preserved (query: string)");
+    assert(typeof tool.execute === "function",
+      "umans_web_search execute fn registered (callable by the LLM)");
+    // The factory must NOT register umans_vision (that stays in index.ts).
+    assert(!tools.has("umans_vision"),
+      "web-search.ts standalone factory did NOT register umans_vision (stays in index.ts)");
+    // session_start + session_shutdown handlers must be registered (the
+    // factory seeds its refresh loops + tears them down on shutdown).
+    assert(handlers.has("session_start"),
+      "web-search.ts registered session_start handler (refresh loop seeding)");
+    assert(handlers.has("session_shutdown"),
+      "web-search.ts registered session_shutdown handler (refresh loop teardown)");
+  } finally {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 }
 
 console.log("\nall checks passed");

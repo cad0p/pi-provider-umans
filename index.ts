@@ -12,8 +12,6 @@
  *   UMANS_VISION_DISABLE   - "1" seeds vision handoff off (toggle live with /umans-vision)
  *   UMANS_VISION_MODEL     - seeds the vision model id (default: umans-kimi-k2.7, or first
  *                           native-vision model); change live with /umans-vision model <id>
- *   UMANS_SEARCH_DISABLE   - "1" disables the umans_web_search tool (e.g. when you use
- *                           your own MCP web-search tool). Vision handoff is unaffected.
  *   UMANS_CONCURRENCY_DISABLE - "1" disables client-side FIFO concurrency gating
  *                           (falls back to fire-and-forget; not recommended).
  *   UMANS_CONCURRENCY_LIMIT - override the capacity check value used by the queue
@@ -51,9 +49,6 @@ import {
 } from "./concurrency-queue.ts";
 import {
   USER_AGENT,
-  SEARCH_TIMEOUT_MS,
-  SEARCH_MAX_TOKENS,
-  pickSearchModel,
   sanitizeErrorBody,
   handle429,
   raiseForUmansStatus,
@@ -76,7 +71,6 @@ const STATUS_UPDATE_INTERVAL_MS = 1000;
 // Client-side vision handoff env + tuning. See header doc for the design.
 const VISION_DISABLE_ENV = "UMANS_VISION_DISABLE";
 const VISION_MODEL_ENV = "UMANS_VISION_MODEL";
-const SEARCH_DISABLE_ENV = "UMANS_SEARCH_DISABLE";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
 const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
 const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
@@ -570,7 +564,7 @@ async function analyzeImage(
       signal: composed,
     });
     if (!res.ok) {
-      // delegated to raiseForUmansStatus (shared with searchWeb) —
+      // delegated to raiseForUmansStatus (shared with searchWeb in web-search.ts) —
       // runs the 429 push, reads + sanitizes the body, throws.
       await raiseForUmansStatus(res, concurrencyQueue);
     }
@@ -581,89 +575,6 @@ async function analyzeImage(
       .join("\n")
       .trim();
     return text || "(no analysis returned)";
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Run a web search by making a sub-request to the Umans gateway with the
- * Anthropic `web_search_20250305` server tool declared. The gateway runs the
- * Exa search server-side and returns results; we surface the model's formatted
- * result text (titles, URLs, snippets) back to the calling model.
- *
- * Side-call because pi-ai only serializes client-side tools and cannot emit the
- * server-tool shape the gateway requires (see header doc). Costs one extra
- * round-trip per search; no pi-ai changes needed.
- */
-async function searchWeb(
-  apiKey: string,
-  model: string,
-  baseUrl: string,
-  query: string,
-  signal?: AbortSignal,
-  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
-): Promise<string> {
-  // compose the caller's signal + a timer-driven controller via
-  // AbortSignal.any (Node 20.3+). See analyzeImage for the rationale.
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), SEARCH_TIMEOUT_MS);
-  const composed = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
-  try {
-    const res = await fetch(`${baseUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        "anthropic-version": "2023-06-01",
-        "User-Agent": USER_AGENT,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: SEARCH_MAX_TOKENS,
-        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
-        messages: [
-          {
-            role: "user",
-            content:
-              "Search the web for the query below and return a concise list of the most relevant results. " +
-              "For each result give: title, URL, and a short snippet of the key facts. " +
-              "Do not answer beyond what the sources say.\n\nQuery: " +
-              query,
-          },
-        ],
-      }),
-      signal: composed,
-    });
-    if (!res.ok) {
-      // delegated to raiseForUmansStatus (shared with analyzeImage) —
-      // runs the 429 push, reads + sanitizes the body, throws.
-      await raiseForUmansStatus(res, concurrencyQueue);
-    }
-    const data = (await res.json()) as {
-      content?: Array<{
-        type: string;
-        text?: string;
-        content?: Array<{ url?: string; title?: string }>;
-      }>;
-    };
-    const blocks = data.content ?? [];
-    const text = blocks
-      .filter((b) => b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text!)
-      .join("\n")
-      .trim();
-    if (text) return text;
-    // No synthesized text — fall back to the raw result list.
-    const results =
-      blocks.find((b) => b.type === "web_search_tool_result")?.content ?? [];
-    if (results.length) {
-      return results
-        .map((r, i) => `${i + 1}. ${r.title ?? ""}\n   URL: ${r.url ?? ""}`)
-        .join("\n");
-    }
-    return "(no search results returned)";
   } finally {
     clearTimeout(timer);
   }
@@ -1490,64 +1401,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  // === Web search (reuses the gateway's built-in Exa via a side-call) ===
-  // The Umans gateway runs web search through Exa, but only when the request
-  // declares the Anthropic `web_search_20250305` server tool — which pi-ai
-  // cannot send (it only serializes client-side tools). So we expose a normal
-  // client-side tool: the main model calls it, we make a sub-request that does
-  // declare the server tool, and return the results. One extra round-trip per
-  // search; no pi-ai changes required.
-  //
-  // Set UMANS_SEARCH_DISABLE=1 to skip registering this tool (e.g. when you
-  // already expose web search via your own MCP tool and want to avoid a
-  // duplicate). Vision handoff is unaffected.
-  const searchDisabled = process.env[SEARCH_DISABLE_ENV] === "1";
-  const searchModelId = pickSearchModel(catalog);
-  if (!searchDisabled) {
-  pi.registerTool({
-    name: "umans_web_search",
-    label: "Umans Web Search",
-    description:
-      "Search the web (via the Umans gateway's built-in Exa) for current or real-time information " +
-      "you do not already have: recent events, live prices, latest library/SDK versions, current docs, " +
-      "or date-sensitive facts. Pass a focused search query.",
-    promptSnippet: "Search the web for current information",
-    promptGuidelines: [
-      "Use umans_web_search for current or real-time information you do not already have: recent events, live prices, latest library versions, current docs, or date-sensitive facts. Pass a focused query.",
-      "Do not use it for things you already know or can derive from the codebase.",
-    ],
-    parameters: Type.Object({
-      query: Type.String({ description: "The web search query" }),
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const apiKey = await resolveApiKey(ctx);
-      if (!apiKey) {
-        return {
-          content: [{ type: "text", text: "Umans API key unavailable; cannot run web search." }],
-          details: {},
-        };
-      }
-      // The side-call consumes a concurrency slot on the account; gate it
-      // through the same cross-process FIFO so a burst of searches can't push
-      // the main turn past the soft cap. Do NOT assign to
-      // mainTurnRelease — side-calls manage their own release via releaseSlot
-      // in the finally below. mainTurnRelease is main-turn-only (message_end
-      // releases it); a side-call assigned there could be released instead of
-      // the main turn's slot.
-      const release = await acquireSlot(apiKey, signal);
-      try {
-        const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal, concurrencyQueue);
-        return { content: [{ type: "text", text: results }], details: {} };
-      } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text", text: `Web search failed: ${m}` }], details: {} };
-      } finally {
-        releaseSlot(release);
-      }
-    },
-  });
-  }
-
   // === Client-side vision handoff (see module-level docs) ===
   // Mutable at runtime via the /umans-vision command; env vars only seed the
   // initial value (handy for headless/print mode). Read at call time by the
@@ -1614,7 +1467,7 @@ export default async function (pi: ExtensionAPI) {
           // fetch (the tool path at umans_vision already passes `signal`; only
           // the handoff path dropped it). The 60s VISION_TIMEOUT_MS still
           // bounds the worst case, but passing the signal makes the handoff
-          // consistent with the tool + searchWeb.
+          // consistent with the tool + the web-search side-call (web-search.ts).
           analysis = await analyzeImage(
             apiKey,
             model,
@@ -2008,7 +1861,7 @@ export default async function (pi: ExtensionAPI) {
     // account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
       // delegate to the shared handle429 helper (also used by
-      // analyzeImage + searchWeb) so every 429 site parses Retry-After the
+      // analyzeImage + searchWeb in web-search.ts) so every 429 site parses Retry-After the
       // same way + pushes the shared pause with the same PAUSE_REASON_429 tag.
       const until = handle429(event, concurrencyQueue);
       ctx.ui?.notify?.(
