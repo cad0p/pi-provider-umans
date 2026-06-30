@@ -12,8 +12,6 @@
  *   UMANS_VISION_DISABLE   - "1" seeds vision handoff off (toggle live with /umans-vision)
  *   UMANS_VISION_MODEL     - seeds the vision model id (default: umans-kimi-k2.7, or first
  *                           native-vision model); change live with /umans-vision model <id>
- *   UMANS_SEARCH_DISABLE   - "1" disables the umans_web_search tool (e.g. when you use
- *                           your own MCP web-search tool). Vision handoff is unaffected.
  *   UMANS_CONCURRENCY_DISABLE - "1" disables client-side FIFO concurrency gating
  *                           (falls back to fire-and-forget; not recommended).
  *   UMANS_CONCURRENCY_LIMIT - override the capacity check value used by the queue
@@ -38,68 +36,44 @@
 import { createHash } from "node:crypto";
 import {
   createConcurrencyQueue,
-  parsePriority,
-  clampPauseUntil,
-  isCapacityFree,
-  parseConcurrencyLimit,
-  PRIORITY_BACKOFF_MS,
-  PAUSE_REASON_429,
-  PAUSE_REASON_STRIKES,
-  PAUSE_REASON_CAP_ABUSE,
   PAUSE_REASON_403_BRIDGE,
   PAUSE_403_BRIDGE_MS,
-  STICKY_PAUSE_REASONS,
-  extractBoxedUntil,
-  isSuspendBody,
-  MAX_PAUSE_429_MS,
-  SANITIZE_CTRL_RE,
   type ConcurrencyQueue,
-  type PriorityState,
 } from "./concurrency-queue.ts";
+import {
+  USER_AGENT,
+  handle429,
+  raiseForUmansStatus,
+  resolveApiKey,
+  concurrencyLimit as sharedConcurrencyLimit,
+  acquireSlotCore,
+  releaseSlotCore,
+  resolveBaseUrl,
+  stopRefreshLoop,
+  restartRefreshLoop,
+  refreshUsage as sharedRefreshUsage,
+  type ConcurrencyRuntime,
+  type ModelCapabilities,
+  type ReasoningInfo,
+  type UmansModelInfo,
+} from "./utils.ts";
+import { readSettings } from "./settings.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-// Derive USER_AGENT from package.json so the version doesn't drift on
-// release. ESM JSON import attribute `with { type: "json" }` is stable in
-// Node 20.10+ (the engines floor is >=20.10.0, matching this requirement).
-import pkg from "./package.json" with { type: "json" };
 
-type ReasoningInfo = {
-  supported: boolean;
-  can_disable: boolean;
-  levels: string[];
-  default_level: string;
-};
-
-type ModelCapabilities = {
-  max_completion_tokens?: number;
-  recommended_max_tokens?: number;
-  context_window?: number;
-  supports_vision?: boolean | "via-handoff";
-  supports_tools?: boolean;
-  reasoning?: ReasoningInfo;
-};
-
-type UmansModelInfo = {
-  name: string;
-  display_name?: string;
-  description?: string;
-  deprecation?: unknown;
-  capabilities: ModelCapabilities;
-};
-
-const DEFAULT_BASE_URL = "https://api.code.umans.ai";
 const API_KEY_ENV = "UMANS_API_KEY";
-const USER_AGENT = `pi-umans-provider/${pkg.version}`;
 const STATUS_UPDATE_INTERVAL_MS = 1000;
 
 // Client-side vision handoff env + tuning. See header doc for the design.
 const VISION_DISABLE_ENV = "UMANS_VISION_DISABLE";
 const VISION_MODEL_ENV = "UMANS_VISION_MODEL";
-const SEARCH_DISABLE_ENV = "UMANS_SEARCH_DISABLE";
 const CONCURRENCY_DISABLE_ENV = "UMANS_CONCURRENCY_DISABLE";
-const CONCURRENCY_LIMIT_ENV = "UMANS_CONCURRENCY_LIMIT";
 const CONCURRENCY_STATE_FILE_ENV = "UMANS_CONCURRENCY_STATE_FILE";
+// Override for the global settings file (~/.pi/agent/umans.json). Mirrors
+// UMANS_CONCURRENCY_STATE_FILE: lets selfcheck point readSettings at a temp
+// file without monkey-patching homedir. No-op in normal use.
+const SETTINGS_FILE_ENV = "UMANS_SETTINGS_FILE";
 const VISION_MAX_TOKENS = 1024;
 const VISION_TIMEOUT_MS = 60_000;
 const VISION_ANALYSIS_PROMPT =
@@ -107,98 +81,14 @@ const VISION_ANALYSIS_PROMPT =
   "Capture: any visible text (verbatim), UI/layout, code/errors/stack traces, diagrams/charts, and other notable details. " +
   "Write a compact structured report. Do not speculate beyond what is visible.";
 
-// Web search side-call tuning. See searchWeb / the umans_web_search tool.
-const SEARCH_TIMEOUT_MS = 30_000;
-const SEARCH_MAX_TOKENS = 2048;
-
-// PRIORITY_BACKOFF_MS is imported from concurrency-queue.ts (the single
-// source of truth — it's also the parsePriority fallback for a null boxed_until).
-// max time the head-waiter capacity poll will wait for a free slot
-// before failing open (launching anyway). Bounds the queue against a
-// hostile/misbehaving /usage that always reports full.
-const CAPACITY_POLL_TIMEOUT_MS = 60_000;
-
-// 429 strike counter: the Umans account is paused for 5h after >20 concurrency
-// 429s in 24h. The queue polls /v1/usage/history every STRIKE_POLL_INTERVAL_MS,
-// sums rate_limit_concurrency buckets since the last cap_suspended (the server
-// resets the counter on reactivation), and defensively pauses when the count
-// reaches the dynamic threshold — better to self-pause briefly than risk the 5h ban.
-//
-// The threshold is dynamic: STRIKE_SERVER_LIMIT (20) minus the max in-flight
-// requests (the concurrency limit, e.g. 4), so a burst of in-flight requests
-// between the poll + the server's counter update can't tip us over before we
-// react. With limit=4 → threshold=16; with limit=3 → threshold=17.
-const STRIKE_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 min
-const STRIKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h (rolling, matches the server)
-const STRIKE_SERVER_LIMIT = 20; // server triggers 5h pause at >20 strikes/24h
-const STRIKE_PAUSE_MS = 30 * 60 * 1000; // 30 min self-pause to let strikes age out
-
-/**
- * pure decision extracted from acquireSlot's capacity-poll loop so the
- * branch logic (free-first-poll, poll-then-free, timeout-fail-open, timeout-
- * but-paused-keeps-waiting, mid-poll-abort) is unit-testable without the full
- * pi runtime. The loop in acquireSlot drives capacityFree() (I/O) and applies
- * this decision each iteration.
- *
- * - `launch`: capacity is free — proceed with the send.
- * - `abort`: the turn's AbortSignal fired mid-poll — cancel + reject.
- * - `failOpen`: the poll cap elapsed AND no known pause is active — launch
- *   ungated so a wedged /usage doesn't block forever. A
- *   known active pause keeps the gate waiting (bounded by the pause deadline
- *   + the 120s watchdog) — fail-open for a POSITIVE deprio signal would launch
- *   into a still-deprioritized account.
- * - `wait`: keep polling (300ms + jitter).
- */
-type LaunchDecision = "launch" | "wait" | "failOpen" | "abort";
-export function decideLaunch(opts: {
-  isFree: boolean;
-  elapsedMs: number;
-  queuePaused: boolean;
-  signalAborted: boolean;
-}): LaunchDecision {
-  // signalAborted takes precedence over isFree. When the turn's
-  // AbortSignal fires mid-poll AND /usage is unreachable (fetchUsage returns
-  // null → isCapacityFree(null) returns {free:true} via the trust-headroom
-  // stance), the prior isFree-first ordering would return "launch" + hold
-  // the token until a safety net (turn_end/agent_end/session_shutdown) fires.
-  // For a Ctrl-C'd turn that never sends, the token leaks up to the 120s
-  // watchdog. Checking signalAborted first routes through the abort branch
-  // (release token + cancel + return undefined) immediately at the abort site.
-  if (opts.signalAborted) return "abort";
-  if (opts.isFree) return "launch";
-  if (opts.elapsedMs >= CAPACITY_POLL_TIMEOUT_MS && !opts.queuePaused) return "failOpen";
-  return "wait";
-}
-
-/**
- * pure helper for the /usage poll interval under steady-full backoff.
- * With N local pi processes each running their own head waiter, a saturated
- * queue drives N×3.3 RPS to /usage continuously. Exponential backoff on the
- * poll interval when capacity is steadily full reduces RPS from ~3.3/s to
- * ~0.5/s during a sustained pause. Mirrors the decideLaunch /
- * shouldReleaseOnMessageEnd pattern: pure + exported so it is unit-testable
- * without the pi runtime.
- *
- * - "launch" / "failOpen": reset to BASE (the gate is about to release the
- *   token or fail open — no further polling, but if it does poll again it
- *   starts fresh at the fast cadence).
- * - "wait": grow by GROWTH (1.5×), capped at CAP (2000ms). The ±100ms jitter
- *   is applied by the caller, not here (keeps this pure + deterministic).
- */
-export const POLL_INTERVAL_BASE_MS = 300;
-export const POLL_INTERVAL_CAP_MS = 2_000;
-export const POLL_INTERVAL_GROWTH = 1.5;
-export function nextPollInterval(currentMs: number, decision: LaunchDecision, opts?: { base?: number; cap?: number; growth?: number }): number {
-  const base = opts?.base ?? POLL_INTERVAL_BASE_MS;
-  const cap = opts?.cap ?? POLL_INTERVAL_CAP_MS;
-  const growth = opts?.growth ?? POLL_INTERVAL_GROWTH;
-  if (decision === "wait") {
-    const next = Math.round(currentMs * growth);
-    return Math.min(next > 0 ? next : base, cap);
-  }
-  // launch / failOpen / abort: reset to base.
-  return base;
-}
+// The capacity-poll + strike-counter constants (CAPACITY_POLL_TIMEOUT_MS,
+// STRIKE_*, POLL_INTERVAL_*), the pure decideLaunch / nextPollInterval
+// helpers, and the resolveApiKey / resolveBaseUrl / concurrencyLimit /
+// acquireSlotCore / refresh + fetch machinery all live in utils.ts now —
+// shared with web-search.ts so the two factories cannot diverge on the
+// strike-pause gate or the capacity-poll loop. Each factory builds a
+// ConcurrencyRuntime (below) carrying its own queue instance + mutable
+// capacity state + calls the shared functions with it.
 
 /**
  * pure decision extracted from the message_end handler's release guard
@@ -444,19 +334,6 @@ export function pickVisionModel(catalog: Record<string, UmansModelInfo>): string
 }
 
 /**
- * Pick the model used to run the side-call web search. Defaults to umans-flash
- * (fastest); falls back to the first tool-capable model if flash is absent.
- */
-export function pickSearchModel(catalog: Record<string, UmansModelInfo>): string {
-  const defaultId = "umans-flash";
-  if (catalog[defaultId] && !catalog[defaultId].deprecation) return defaultId;
-  for (const [id, info] of Object.entries(catalog)) {
-    if (!info.deprecation && info.capabilities?.supports_tools) return id;
-  }
-  return defaultId;
-}
-
-/**
  * Formats a human-readable countdown to a future deadline (e.g. " 3h12m",
  * " 45m", " 2s", " 0s"). Returns "" for past deadlines (already cleared).
  * Used by the DEPRIO + PAUSED status-bar banners so the user sees how long
@@ -533,153 +410,6 @@ export function hashImageId(data: string): string {
   return "img_" + createHash("sha256").update(data).digest("hex").slice(0, 8);
 }
 
-/**
- * cap + sanitize a gateway error body before echoing it into a tool
- * result / thrown error message. Gateway error bodies are attacker-controlled
- * (a compromised/misconfigured gateway can push crafted text) + flow into the
- * model's context (prompt-injection surface). Cap to 80 chars (down from 200)
- * + strip non-printable / control / ANSI-escape chars so a crafted body cannot
- * mangle the message or inject control sequences. Mirrors sanitizeReason's
- * approach. Exported so selfcheck can unit-test the cap + strip.
- */
-const ERROR_BODY_MAX_CHARS = 80;
-// mirror sanitizeReason's strip — control + ESC + Unicode
-// bidi/RTL overrides + zero-width/BOM chars that could spoof displayed text.
-// uses the shared SANITIZE_CTRL_RE export from concurrency-queue.ts
-// so the character class stays in sync with sanitizeReason without manual
-// duplication. The 80-char cap stays local (sanitizeReason caps at 64).
-export function sanitizeErrorBody(body: string): string {
-  const cleaned = body.replace(SANITIZE_CTRL_RE, "").trim();
-  return cleaned.length > ERROR_BODY_MAX_CHARS ? cleaned.slice(0, ERROR_BODY_MAX_CHARS) : cleaned;
-}
-
-/**
- * Shared 429 handler: parse Retry-After (strict integer form only), clamp to
- * MAX_PAUSE_429_MS, push the shared pause (PAUSE_REASON_429) so sibling pi
- * processes back off, and return the resolved `until` deadline so the caller
- * can notify. COV4-2: pauseUntil can throw on disk failure (EACCES/ENOSPC/EROFS)
- * — the lost pause is bounded by the 120s watchdog + the 5s refreshUsage poll,
- * so warn + swallow so the caller's turn is not aborted.
- *
- * extracted from after_provider_response so the side-call sites
- * (analyzeImage, searchWeb) push the SAME shared pause when they receive a
- * 429. Per D6 each side-call consumes a real account concurrency slot, and
- * per Umans docs each concurrency 429 deprioritizes the whole account ~30
- * min — so a side-call 429 must back off siblings (and the main turn on its
- * next launch), not merely throw.
- *
- * Accepts either a fetch Response (res.headers.get) or a pi after_provider_
- * response event (event.headers[...]) — the Retry-After header lookup is
- * duck-typed so the same helper drives all three sites.
- */
-export function handle429(
-  source: { status: number; headers?: Headers | Record<string, string> | undefined | null },
-  concurrencyQueue: { pauseUntil(until: number, reason?: string | null): void },
-): number {
-  // readRetryAfter calls headers.get("retry-after") which could
-  // throw on a malformed pi event (a buggy/Headers-like object whose .get
-  // throws). The surrounding handle429 only wrapped pauseUntil in try/catch,
-  // so a throwing .get propagated out as an unhandled extension error. Wrap
-  // the header parse + fall back to the PRIORITY_BACKOFF_MS deadline on throw,
-  // mirroring the pauseUntil guard below.
-  let retryAfter: string | undefined;
-  try {
-    retryAfter = readRetryAfter(source.headers);
-  } catch (err) {
-    console.warn("umans: readRetryAfter threw in 429 handler (falling back to default backoff):", err instanceof Error ? err.message : err);
-    retryAfter = undefined;
-  }
-  let until = Date.now() + PRIORITY_BACKOFF_MS;
-  if (retryAfter) {
-    // RFC 7231 Retry-After is delta-seconds (a non-negative integer) or an
-    // HTTP-date. We only accept the integer form: Number() accepts hex
-    // ("0x10"=16), scientific notation ("1e10"=1e10), and other misparses
-    // that can wedge the queue. Parse strictly and cap the resulting
-    // deadline at now + MAX_PAUSE_429_MS via clampPauseUntil (a
-    // 429-sourced pause is clamped tighter than the 5h ceiling so a
-    // misconfigured UMANS_BASE_URL returning 429 forever cannot wedge the
-    // account for hours; pauseUntil also enforces this ceiling).
-    const trimmed = String(retryAfter).trim();
-    if (/^\d+$/.test(trimmed)) {
-      const secs = parseInt(trimmed, 10);
-      if (secs > 0) until = clampPauseUntil(Date.now() + secs * 1000, Date.now(), MAX_PAUSE_429_MS);
-    }
-  }
-  try {
-    concurrencyQueue.pauseUntil(until, PAUSE_REASON_429);
-  } catch (err) {
-    console.warn("umans: pauseUntil threw in 429 handler (continuing):", err instanceof Error ? err.message : err);
-  }
-  return until;
-}
-
-/**
- * shared !res.ok handler for the side-call sites (analyzeImage,
- * searchWeb). Both sites duplicated the same 429-push + read-body + sanitize +
- * throw block. This helper runs the 429 push (a side-call 429
- * deprioritizes the whole account — per D6 the side-call consumes a real
- * concurrency slot — so push the shared pause so sibling pi processes + the
- * main turn on its next launch back off, do NOT merely throw), reads + caps +
- * sanitizes the gateway error body (attacker-controlled body must not
- * inject control sequences or mangle the tool result), then throws an Error
- * carrying HTTP status + the sanitized body. The Promise<never> return type
- * preserves control-flow narrowing (no dangling code after the call).
- *
- * Accepts the same duck-typed { status, headers } shape as handle429 (a fetch
- * Response) + the optional concurrencyQueue (omitted when the caller has no
- * queue — then only the body sanitize + throw run, matching the prior inline
- * behavior).
- */
-export async function raiseForUmansStatus(
-  res: { status: number; headers?: Headers | Record<string, string> | undefined | null; text(): Promise<string> },
-  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
-): Promise<never> {
-  if (res.status === 429 && concurrencyQueue) {
-    handle429(res, concurrencyQueue);
-  }
-  // read text() ONCE into a local. A fetch Response body can only be
-  // consumed once; reading it again returns "". The 403 suspend-body check
-  // + the sanitizeErrorBody call below both operate on this same string.
-  const txt = await res.text().catch(() => "");
-  // 403 suspend-family body (account_suspended / cap_abuse / cap_suspended /
-  // billing_error) → treat like a 429: extractBoxedUntil + push
-  // PAUSE_REASON_CAP_ABUSE so siblings back off. isSuspendBody gates; a
-  // non-suspend 403 (auth error, proxy HTML) does NOT pause — the turn still
-  // throws, but the gate is not poisoned for siblings. See extractBoxedUntil
-  // for the tolerant-extraction + past-as-absent rationale.
-  if (res.status === 403 && concurrencyQueue && isSuspendBody(txt)) {
-    const now = Date.now();
-    const extracted = extractBoxedUntil(txt);
-    const until = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
-    try {
-      concurrencyQueue.pauseUntil(until, PAUSE_REASON_CAP_ABUSE);
-    } catch (err) {
-      console.warn("umans: pauseUntil threw in 403 handler (continuing):", err instanceof Error ? err.message : err);
-    }
-  }
-  // cap + sanitize the gateway error body before echoing it (cap 80,
-  // strip non-printable / ANSI-escape) so a crafted body cannot inject
-  // control sequences or mangle the tool result.
-  const safe = sanitizeErrorBody(txt);
-  throw new Error(`HTTP ${res.status}${safe ? `: ${safe}` : ""}`);
-}
-
-/** Duck-typed Retry-After header lookup (fetch Headers .get OR a plain record). */
-function readRetryAfter(headers: Headers | Record<string, string> | undefined | null): string | undefined {
-  if (!headers) return undefined;
-  // fetch Response.headers (Headers) exposes .get; pi's after_provider_response
-  // event.headers is a plain record indexed by lowercased header name.
-  if (typeof (headers as Headers).get === "function") {
-    return (headers as Headers).get("retry-after") ?? undefined;
-  }
-  const rec = headers as Record<string, string>;
-  // Try exact + case-insensitive (Retry-After / retry-after / RETRY-AFTER).
-  for (const k of Object.keys(rec)) {
-    if (k.toLowerCase() === "retry-after") return rec[k];
-  }
-  return undefined;
-}
-
 /*
  * Concurrency gating moved to ./concurrency-queue.ts (file-backed FIFO shared
  * across pi processes via ~/.pi/agent/umans-concurrency.json).
@@ -750,7 +480,7 @@ async function analyzeImage(
       signal: composed,
     });
     if (!res.ok) {
-      // delegated to raiseForUmansStatus (shared with searchWeb) —
+      // delegated to raiseForUmansStatus (shared with searchWeb in web-search.ts) —
       // runs the 429 push, reads + sanitizes the body, throws.
       await raiseForUmansStatus(res, concurrencyQueue);
     }
@@ -766,94 +496,10 @@ async function analyzeImage(
   }
 }
 
-/**
- * Run a web search by making a sub-request to the Umans gateway with the
- * Anthropic `web_search_20250305` server tool declared. The gateway runs the
- * Exa search server-side and returns results; we surface the model's formatted
- * result text (titles, URLs, snippets) back to the calling model.
- *
- * Side-call because pi-ai only serializes client-side tools and cannot emit the
- * server-tool shape the gateway requires (see header doc). Costs one extra
- * round-trip per search; no pi-ai changes needed.
- */
-async function searchWeb(
-  apiKey: string,
-  model: string,
-  baseUrl: string,
-  query: string,
-  signal?: AbortSignal,
-  concurrencyQueue?: { pauseUntil(until: number, reason?: string | null): void },
-): Promise<string> {
-  // compose the caller's signal + a timer-driven controller via
-  // AbortSignal.any (Node 20.3+). See analyzeImage for the rationale.
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), SEARCH_TIMEOUT_MS);
-  const composed = signal ? AbortSignal.any([signal, ctrl.signal]) : ctrl.signal;
-  try {
-    const res = await fetch(`${baseUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        "anthropic-version": "2023-06-01",
-        "User-Agent": USER_AGENT,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: SEARCH_MAX_TOKENS,
-        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
-        messages: [
-          {
-            role: "user",
-            content:
-              "Search the web for the query below and return a concise list of the most relevant results. " +
-              "For each result give: title, URL, and a short snippet of the key facts. " +
-              "Do not answer beyond what the sources say.\n\nQuery: " +
-              query,
-          },
-        ],
-      }),
-      signal: composed,
-    });
-    if (!res.ok) {
-      // delegated to raiseForUmansStatus (shared with analyzeImage) —
-      // runs the 429 push, reads + sanitizes the body, throws.
-      await raiseForUmansStatus(res, concurrencyQueue);
-    }
-    const data = (await res.json()) as {
-      content?: Array<{
-        type: string;
-        text?: string;
-        content?: Array<{ url?: string; title?: string }>;
-      }>;
-    };
-    const blocks = data.content ?? [];
-    const text = blocks
-      .filter((b) => b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text!)
-      .join("\n")
-      .trim();
-    if (text) return text;
-    // No synthesized text — fall back to the raw result list.
-    const results =
-      blocks.find((b) => b.type === "web_search_tool_result")?.content ?? [];
-    if (results.length) {
-      return results
-        .map((r, i) => `${i + 1}. ${r.title ?? ""}\n   URL: ${r.url ?? ""}`)
-        .join("\n");
-    }
-    return "(no search results returned)";
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export default async function (pi: ExtensionAPI) {
   if (process.env.UMANS_DISABLE === "1") return;
 
-  const baseUrl =
-    process.env.UMANS_BASE_URL?.trim().replace(/\/$/, "") || DEFAULT_BASE_URL;
+  const baseUrl = resolveBaseUrl();
 
   // The model-info endpoint is public, so this works even before the user has
   // configured an API key. It lets pi --list-models report accurate models.
@@ -947,13 +593,13 @@ export default async function (pi: ExtensionAPI) {
 
   // === Status bar: TTFT | TPS | Conc current/guaranteed ===
   const STATUS_KEY = "umans";
-  let guaranteedConcurrency: number | undefined;
+  // Status-bar-only locals (not shared with web-search.ts). The shared
+  // capacity state (guaranteedConcurrency, hardCap, strikes24h, deprioritized,
+  // priorityUntil) lives on the ConcurrencyRuntime `rt` below so the one copy
+  // of refreshStrikes/refreshUsage in utils.ts reads + writes it directly.
   let currentConcurrency: number | undefined;
   let requestLimit: number | undefined;
   let requestsUsed: number | undefined;
-  let strikes24h: number | undefined;
-  let deprioritized = false;
-  let priorityUntil: number | undefined;
   // Stash the last seen pi ctx (from session_start) so the periodic
   // refreshUsage timer can re-render the status bar (countdown, strikes,
   // concurrency) even when the user is idle at the prompt — not just during
@@ -967,8 +613,10 @@ export default async function (pi: ExtensionAPI) {
   // the live /v1/usage response polled by the head waiter, so multiple pi
   // processes (and multiple machines) coordinate through the server, not a
   // local count. UMANS_CONCURRENCY_DISABLE opts out (fire-and-forget).
-  // UMANS_CONCURRENCY_LIMIT is now only a display/testing hint: when set, the
-  // capacity check uses it instead of the server's limits.concurrency.limit.
+  // UMANS_CONCURRENCY_LIMIT is a deprecated absolute override (testing knob):
+  // when set it wins outright, bypassing the concurrency multiplier. The
+  // user-facing knob is the concurrencyMultiplier setting (~/.pi/agent/
+  // umans.json + .pi/umans.json); see concurrencyLimit + settings.ts.
   // UMANS_CONCURRENCY_STATE_FILE overrides the state file path so the
   // handler-wiring harness mock in selfcheck can point the real queue at a
   // tmpdir (isolating the test from the live ~/.pi/agent state file). Also
@@ -980,9 +628,55 @@ export default async function (pi: ExtensionAPI) {
     disabled: concurrencyDisabled,
     ...(concurrencyStateFile ? { stateFile: concurrencyStateFile } : {}),
   });
-  function concurrencyLimit(): number | undefined {
-    return parseConcurrencyLimit(process.env[CONCURRENCY_LIMIT_ENV], guaranteedConcurrency);
-  }
+  // Cache settings once at startup. concurrencyLimit() is on the hot path
+  // (called per acquireSlot poll iteration ~300ms + per status-bar render),
+  // so re-reading the file each call would hammer the filesystem. Restart
+  // picks up changes; a live-reload watcher is not required.
+  // UMANS_SETTINGS_FILE overrides the global path (~/.pi/agent/umans.json)
+  // so selfcheck can point at a temp file; the project path (.pi/umans.json)
+  // resolves against cwd as in production.
+  const settingsGlobalPath = process.env[SETTINGS_FILE_ENV]?.trim() || undefined;
+  const cachedSettings = readSettings(
+    settingsGlobalPath ? { globalPath: settingsGlobalPath } : undefined,
+  );
+  // Shared concurrency runtime: carries this factory's queue instance + the
+  // mutable capacity state read/written by the shared refresh/fetch machinery
+  // in utils.ts (one copy of refreshStrikes/refreshUsage/fetchUsage/etc, shared
+  // with web-search.ts so the strike-pause gate cannot diverge). The
+  // status-bar-only locals above stay outside rt. afterRefreshUsage is the
+  // status-bar hook: the shared refreshUsage calls it with the raw /v1/usage
+  // data so index.ts can update currentConcurrency/requestLimit/requestsUsed
+  // + re-render. web-search.ts builds an rt with no afterRefreshUsage hook.
+  const rt: ConcurrencyRuntime = {
+    baseUrl,
+    queue: concurrencyQueue,
+    multiplier: cachedSettings.concurrencyMultiplier,
+    hardCap: undefined,
+    guaranteedConcurrency: undefined,
+    strikes24h: undefined,
+    deprioritized: false,
+    priorityUntil: undefined,
+    refreshTimer: undefined,
+    strikeTimer: undefined,
+    refreshStopped: false,
+    afterRefreshUsage(data) {
+      if (data.limits) {
+        currentConcurrency = data.usage?.concurrent_sessions;
+        requestLimit = data.limits.requests?.limit ?? undefined;
+        requestsUsed = data.usage?.requests_in_window;
+      } else {
+        // Synthetic cap_abuse object: only usage.concurrent_sessions is
+        // present. Update the live concurrency display but preserve the
+        // cached limits.
+        currentConcurrency = data.usage?.concurrent_sessions;
+      }
+      // Re-render the status bar so the countdown (PAUSED/DEPRIO) +
+      // concurrency + strikes display stays live while the user is idle.
+      if (lastCtx) {
+        try { updateStatus(lastCtx); } catch { /* UI may not be available */ }
+      }
+    },
+  };
 
   type LiveRequest = {
     startTime: number;
@@ -992,110 +686,6 @@ export default async function (pi: ExtensionAPI) {
   };
   let liveRequest: LiveRequest | undefined;
   let lastMetrics: { ttft?: number; tps?: number } = {};
-
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  let strikeTimer: ReturnType<typeof setTimeout> | undefined;
-  let refreshStopped = false;
-
-  function stopRefreshLoop() {
-    refreshStopped = true;
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = undefined;
-    }
-    if (strikeTimer) {
-      clearTimeout(strikeTimer);
-      strikeTimer = undefined;
-    }
-  }
-
-  function restartRefreshLoop(apiKey: string) {
-    stopRefreshLoop();
-    refreshStopped = false;
-    scheduleRefresh(apiKey);
-    scheduleStrikePoll(apiKey, true); // immediate: know the strike count at startup
-  }
-
-  function scheduleRefresh(apiKey: string) {
-    if (refreshStopped || !apiKey) return;
-    refreshTimer = setTimeout(async () => {
-      await refreshUsage(apiKey);
-      scheduleRefresh(apiKey);
-    }, 5000);
-  }
-
-  // Strike counter poll: fetch the 24h 429 count + defensively pause if we're
-  // approaching the server's 5h-pause threshold. Runs on a longer interval than
-  // refreshUsage (5 min vs 5s) because /history is heavier + the count moves
-  // slowly. The first poll fires immediately (no delay) so we know the strike
-  // count at startup, not 5 min in.
-  function scheduleStrikePoll(apiKey: string, immediate = false) {
-    if (refreshStopped || !apiKey) return;
-    strikeTimer = setTimeout(async () => {
-      await refreshStrikes(apiKey);
-      scheduleStrikePoll(apiKey);
-    }, immediate ? 0 : STRIKE_POLL_INTERVAL_MS);
-  }
-
-  async function refreshStrikes(apiKey: string) {
-    const result = await fetch429Strikes(apiKey);
-    if (result.suspended) {
-      // /v1/usage/history may also return 403 during a suspension (the
-      // server returns 403 for everything once suspended). The prior code
-      // left the last cached strikes value, so the status bar showed a stale
-      // "Strikes 19/20" for the full 5h suspension. Clear it so the bar
-      // reflects that the count is unknown (the threshold check below is
-      // skipped — extend-never-shorten holds regardless because a cap_abuse
-      // pause is sticky + longer than any strike pause).
-      strikes24h = undefined;
-      return;
-    }
-    // Transient failure (network timeout, 5xx, JSON parse): preserve the
-    // cached count so a single blip does not lose the strike count + skip
-    // the defensive self-pause right when it matters most. The threshold
-    // check is skipped (count === null), matching the prior behavior, but
-    // the cached value survives until the next poll (5min).
-    if (result.count === null) return;
-    const count = result.count;
-    strikes24h = count;
-    // Dynamic threshold: server limit minus the max in-flight requests (the
-    // concurrency limit). A burst of in-flight requests can all 429 before our
-    // next poll (every 5 min) tips the server's counter past the limit; leaving
-    // a margin equal to the max in-flight means we pause before that burst can
-    // push us over. With limit=4 → threshold=16; with limit=3 → threshold=17.
-    const maxInFlight = concurrencyLimit() ?? guaranteedConcurrency ?? 0;
-    // Skip the threshold check at startup before guaranteedConcurrency is
-    // populated (refreshUsage runs 5s after the immediate strike poll). With
-    // maxInFlight=0 the threshold would be 20 (the server limit) — pausing at
-    // the server's own trigger point is too late + risks a false-positive
-    // pause if the API transiently returns stale data. Wait for the first
-    // refreshUsage to populate the real limit, then the dynamic threshold applies.
-    if (maxInFlight <= 0) return;
-    const strikeThreshold = Math.max(0, STRIKE_SERVER_LIMIT - maxInFlight);
-    // Defensively self-pause when approaching the 5h-pause threshold. Better to
-    // pause briefly + let strikes age out than risk the 5h account ban. The
-    // pause is only pushed if no longer pause is already active (don't shorten a
-    // real priority.low / 429 pause with a shorter strikes pause).
-    if (count >= strikeThreshold) {
-      const snap = concurrencyQueue.snapshot();
-      const now = Date.now();
-      const strikeUntil = now + STRIKE_PAUSE_MS;
-      // Only push if no active pause OR the active pause ends sooner than our
-      // strike pause (extend, never shorten). A priority.low pause from the
-      // server (boxed_until) or a 429 pause is left untouched if it's longer.
-      if (!snap.paused || snap.pausedUntil < strikeUntil) {
-        try {
-          concurrencyQueue.pauseUntil(strikeUntil, PAUSE_REASON_STRIKES);
-        } catch (err) {
-          console.warn("umans: pauseUntil threw in refreshStrikes (continuing):", err instanceof Error ? err.message : err);
-        }
-      }
-    }
-    // No updateStatus call here — refreshStrikes runs from a timer without an
-    // event ctx. The strikes24h var is picked up on the next status render
-    // (streaming event or the periodic refreshUsage path). The pause push
-    // above is what matters operationally; the display follows on the next tick.
-  }
 
   function computeCumulativeTps(req: LiveRequest, now: number): number {
     if (!req.firstTokenTime || req.estimatedTokens <= 0) return 0;
@@ -1107,18 +697,19 @@ export default async function (pi: ExtensionAPI) {
 
   function statusText(metrics?: { ttft?: number; tps?: number }) {
     // delegates to the pure formatStatusText helper so the rendering
-    // is unit-testable. The closure supplies the live inputs.
+    // is unit-testable. The closure supplies the live inputs (shared capacity
+    // state lives on rt; status-only locals stay as factory locals).
     return formatStatusText({
       metrics,
-      effectiveLimit: concurrencyLimit(),
+      effectiveLimit: sharedConcurrencyLimit(rt),
       currentConcurrency,
       requestLimit,
       requestsUsed,
       queueSnap: concurrencyQueue.snapshot(),
       concurrencyDisabled,
-      strikes24h,
-      deprioritized,
-      priorityUntil,
+      strikes24h: rt.strikes24h,
+      deprioritized: rt.deprioritized,
+      priorityUntil: rt.priorityUntil,
     });
   }
 
@@ -1148,223 +739,23 @@ export default async function (pi: ExtensionAPI) {
     setWidget(ctx, statusText(lastMetrics));
   }
 
-  // Shared /v1/usage fetch skeleton. refreshUsage and
-  // fetchUsageSnapshot both build the identical AbortController + fetch +
-  // JSON-parse skeleton; this helper dedupes ~15 lines. Returns the parsed
-  // { limits, usage } on a 2xx, or null on any failure (caller decides how to
-  // handle — refreshUsage leaves cached values, fetchUsageSnapshot returns null
-  // and the caller fails-open).
-  // accept an optional parentSignal (the turn's AbortSignal) + compose
-  // it into the fetch signal so a Ctrl-C mid capacity-poll aborts the in-flight
-  // /usage fetch immediately instead of waiting up to 3s for the timeout.
-  // composition now uses AbortSignal.any (Node 20.3+) instead of the
-  // manual addEventListener + finally removeEventListener bridge.
-  async function fetchUsage(apiKey: string, timeoutMs: number, parentSignal?: AbortSignal): Promise<{
-    limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
-    usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
-  } | null> {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const composed = parentSignal ? AbortSignal.any([parentSignal, ctrl.signal]) : ctrl.signal;
-    try {
-      const res = await fetch(`${baseUrl}/v1/usage`, {
-        signal: composed,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-          "User-Agent": USER_AGENT,
-        },
-      });
-      if (!res.ok) {
-        // a 403 FROM /v1/usage is a POSITIVE suspension signal, not absence —
-        // the server returns 403 for everything once the account is suspended.
-        // Return a synthetic priority.low + reason=cap_abuse snapshot so the
-        // cap_abuse branch in isCapacityFree fires + pushes the real pause.
-        // A non-suspend 403 (auth error on /usage) keeps fail-open (return null).
-        if (res.status === 403) {
-          const txt = await res.text().catch(() => "");
-          if (isSuspendBody(txt)) {
-            const now = Date.now();
-            const extracted = extractBoxedUntil(txt);
-            const boxedUntilMs = extracted && extracted > now ? extracted : now + PRIORITY_BACKOFF_MS;
-            return {
-              usage: {
-                concurrent_sessions: 0,
-                priority: { low: true, boxed_until: new Date(boxedUntilMs).toISOString(), reason: "cap_abuse" },
-              },
-            };
-          }
-        }
-        return null;
-      }
-      return await res.json() as {
-        limits?: { concurrency?: { limit?: number; hard_cap?: number }; requests?: { limit?: number } };
-        usage?: { requests_in_window?: number; concurrent_sessions?: number; priority?: unknown };
-      };
-    } catch {
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Fetch the count of concurrency 429s since the last cap_suspended (5h pause)
-  // from /v1/usage/history. This is the API-accessible proxy for the dashboard's
-  // "X/20 limit hits today" counter (which is not available via API key — it
-  // requires a NextAuth web session on app.umans.ai). The server pauses the
-  // account for 5h after >20 concurrency 429s in 24h AND resets the counter on
-  // reactivation (a reactivation revokes + rotates API keys), so we exclude
-  // strikes from before the most recent cap_suspended bucket — matching the
-  // dashboard's behavior so our count stays accurate after a reactivation.
-  //
-  // Returns a typed result: suspend-403 (server returns 403 for /history too
-  // once suspended — clear the cached count so the bar shows no stale
-  // "Strikes 19/20" for 5h) vs transient failure (preserve the cached count so
-  // a blip does not skip the self-pause).
-  async function fetch429Strikes(apiKey: string): Promise<{ count: number | null; suspended: boolean }> {
-    const now = Date.now();
-    const from = new Date(now - STRIKE_WINDOW_MS).toISOString();
-    const to = new Date(now).toISOString();
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    try {
-      const res = await fetch(
-        `${baseUrl}/v1/usage/history?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=hour`,
-        {
-          signal: ctrl.signal,
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: "application/json",
-            "User-Agent": USER_AGENT,
-          },
-        },
-      );
-      if (!res.ok) {
-        // A 403 FROM /v1/usage/history is a POSITIVE suspension signal (the
-        // server returns 403 for everything once suspended). Distinguish it from
-        // a transient !res.ok (5xx, etc.) so the caller clears the cache only
-        // on a real suspension + preserves the cached count on a transient
-        // failure. A non-403 !res.ok is transient (count null, suspended false)
-        // — the caller leaves the cached value.
-        if (res.status === 403) {
-          const txt = await res.text().catch(() => "");
-          if (isSuspendBody(txt)) return { count: null, suspended: true };
-        }
-        return { count: null, suspended: false };
-      }
-      const data = await res.json() as { buckets?: Array<{ bucket?: string; error_category?: string | null; requests?: number }> };
-      if (!Array.isArray(data.buckets)) return { count: null, suspended: false };
-      // Find the most recent cap_suspended bucket timestamp. Strikes before it
-      // are excluded (the counter resets on reactivation). If there's no
-      // cap_suspended in the window, all strikes count.
-      let lastPauseTs = 0;
-      for (const b of data.buckets) {
-        if (b.error_category === "cap_suspended" && b.bucket) {
-          const ts = new Date(b.bucket).getTime();
-          if (ts > lastPauseTs) lastPauseTs = ts;
-        }
-      }
-      const strikes = data.buckets
-        .filter((b) => b.error_category === "rate_limit_concurrency")
-        .filter((b) => {
-          // Exclude strikes before the most recent cap_suspended (counter reset).
-          if (lastPauseTs === 0) return true;
-          const ts = b.bucket ? new Date(b.bucket).getTime() : 0;
-          return ts > lastPauseTs;
-        })
-        .reduce((sum, b) => sum + (typeof b.requests === "number" ? b.requests : 0), 0);
-      return { count: strikes, suspended: false };
-    } catch {
-      return { count: null, suspended: false };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function refreshUsage(apiKey: string) {
-    const data = await fetchUsage(apiKey, 5000);
-    if (!data) return; // leave cached values; status bar will show "?"
-    // The synthetic cap_abuse return (fetchUsage on a /v1/usage 403 with a
-    // suspend body) carries no `limits` field. Skip the limits assignments so
-    // the cached guaranteedConcurrency / requestLimit are preserved for the
-    // suspension window (otherwise they wipe to undefined).
-    if (data.limits) {
-      // null ?? undefined normalizes unlimited (null) limits so the display
-      // guards below hide them instead of rendering "x/null".
-      guaranteedConcurrency = data.limits.concurrency?.limit ?? undefined;
-      currentConcurrency = data.usage?.concurrent_sessions;
-      requestLimit = data.limits.requests?.limit ?? undefined;
-      requestsUsed = data.usage?.requests_in_window;
-    } else {
-      // Synthetic cap_abuse object: only usage.concurrent_sessions is present
-      // (0). Update the live concurrency display but preserve the cached limits.
-      currentConcurrency = data.usage?.concurrent_sessions;
-    }
-    // Track the deprioritization state for the status bar (DEPRIO banner).
-    // priority.low is a STATUS signal, not a stop condition: the gate lowers
-    // the cap by 1 (isCapacityFree) to reduce race risk, but does NOT push a
-    // full pause. Work continues — just slower. Actual 429s + the strike
-    // counter handle the hard pause.
-    const priority = parsePriority(data.usage?.priority);
-    deprioritized = priority.low;
-    priorityUntil = priority.until;
-    // Only clear a pause pushed by a PREVIOUS priority.low tick — don't
-    // clear a sticky-origin pause (see STICKY_PAUSE_REASONS); a stale /usage
-    // tick reporting low===false before the server catches up must not wipe
-    // a freshly-written 429 / cap_abuse / strike pause.
-    if (!priority.low) {
-      const snap = concurrencyQueue.snapshot();
-      if (snap.paused && !(snap.pausedReason && STICKY_PAUSE_REASONS.has(snap.pausedReason))) {
-        concurrencyQueue.clearPause();
-      }
-    }
-    // Re-render the status bar so the countdown (PAUSED/DEPRIO) + concurrency
-    // + strikes display stays live while the user is idle at the prompt.
-    // Without this, the status bar freezes between streaming events because
-    // updateStatus is only called from event handlers.
-    if (lastCtx) {
-      try { updateStatus(lastCtx); } catch { /* UI may not be available */ }
-    }
-  }
-
-  // Lightweight one-shot /v1/usage fetch used by the head waiter to decide
-  // whether to launch. Uses a shorter timeout (3s vs 5s) so a slow /usage
-  // response doesn't stall the head-waiter poll; reads only the
-  // capacity-decision fields (concurrent_sessions + limit + hard_cap +
-  // priority). Returns null on any failure (caller retries).
-  async function fetchUsageSnapshot(apiKey: string, parentSignal?: AbortSignal): Promise<{
-    concurrentSessions: number | undefined;
-    limit: number | undefined;
-    hardCap: number | undefined;
-    priority: PriorityState;
-  } | null> {
-    const data = await fetchUsage(apiKey, 3000, parentSignal);
-    if (!data) return null;
-    return {
-      concurrentSessions: data.usage?.concurrent_sessions,
-      limit: data.limits?.concurrency?.limit ?? undefined,
-      hardCap: data.limits?.concurrency?.hard_cap ?? undefined,
-      priority: parsePriority(data.usage?.priority),
-    };
-  }
-
   // Acquire a concurrency slot for an outbound Umans request (main turn or a
-  // vision/search side-call). Joins the cross-process FIFO, waits until we are
-  // head + have claimed the launch token, then polls /v1/usage until the server
-  // reports a free slot (and no priority.low). Returns a release fn that drops
-  // the token + our waiter entry; call it on assistant message_end (the
-  // primary release path) or turn_end/agent_end as a safety net. Returns
-  // undefined when the queue is disabled (fire-and-forget) or when the turn's
-  // AbortSignal fires mid-poll (clean cancellation, not a throw). The
-  // `apiKey` is used for the head-waiter poll.
+  // vision/search side-call). Delegates to the shared acquireSlotCore (utils.ts,
+  // one copy shared with web-search.ts so the capacity-poll loop cannot diverge)
+  // which joins the cross-process FIFO, waits until head + claims the launch
+  // token, polls /v1/usage until the server reports a free slot (and no
+  // priority.low), and returns a release fn. Returns undefined when the queue is
+  // disabled (fire-and-forget) or when the turn's AbortSignal fires mid-poll
+  // (clean cancellation, not a throw). The `apiKey` is used for the head-waiter
+  // poll.
   //
   // this function BLOCKS until the slot is acquired — it is NOT a fast
   // non-blocking check. The wait is the FIFO queue wait (possibly minutes under
-  // contention) + the /usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
-  // 60s fail-open, or longer while a known pause is active). All
-  // callers (before_provider_request + the three side-call sites) await it inline
-  // on the critical path of the turn — by design, the whole point is to
-  // serialize launches so the account stays under its soft cap.
+  // contention) + the /v1/usage capacity poll (up to CAPACITY_POLL_TIMEOUT_MS =
+  // 60s fail-open, or longer while a known pause is active). All callers
+  // (before_provider_request + the side-call sites) await it inline on
+  // the critical path of the turn — by design, the whole point is to serialize
+  // launches so the account stays under its soft cap.
   //
   // Recovery for an aborted/stuck token holder is the watchdog (reapStale):
   // any token held >120s (or whose PID died) is reclaimed by the next acquirer,
@@ -1372,327 +763,11 @@ export default async function (pi: ExtensionAPI) {
   // aborted-but-alive turn (user Ctrl-C mid-wait), the `signal` plumbed through
   // waitForLaunch cancels the waiter entry and rejects immediately.
   async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<Release | undefined> {
-    const initialId = concurrencyQueue.join();
-    if (!initialId) return undefined; // queue disabled
-    // ourId may be re-assigned below when touchToken returns false
-    // (token reaped by a sibling's reapStale) and we re-join the queue. join()
-    // returns null only when the queue is disabled, which is a creation-time
-    // flag — it cannot flip mid-loop — so the re-assignment is non-null.
-    let ourId: string = initialId;
-    // Track whether we have already released our waiter entry so a throw
-    // between join() and the return of a release fn cannot leak the waiter
-    // for staleWaiterMs (5 min). waitForLaunch itself cancels on
-    // signal abort; this finally covers the non-abort throw paths (lock
-    // timeout, EACCES, ENOSPC) and the token-reaped re-join path.
-    let released = false;
-    // if our launch token is reaped by a sibling's reapStale while
-    // we hold it across a long capacity poll (a pause-bounded wait can
-    // legitimately exceed 120s), touchToken returns false and
-    // we must re-join the queue + wait our turn again rather than race a
-    // concurrent send. Guarded re-entry: bail after a bounded number of
-    // re-joins so a pathological state (e.g. a sibling that reaps + crashes
-    // in a tight loop) cannot wedge us here forever — fall back to fail-open
-    // (the watchdog bounds the sibling's hold, and the hard_cap headroom
-    // absorbs one extra send, matching the /usage-unreachable stance).
-    const MAX_TOKEN_REJOINS = 3;
-    let releaseToken: () => void = () => {};
-    try {
-    tokenAcquire: for (let rejoins = 0; rejoins <= MAX_TOKEN_REJOINS; rejoins++) {
-      let releaseTokenThisIter: () => void;
-      try {
-        releaseTokenThisIter = await concurrencyQueue.waitForLaunch(ourId, signal);
-      } catch (err) {
-        // waitForLaunch rejects with "waitForLaunch aborted" when the
-        // signal is already aborted (or aborts mid-wait). Return undefined
-        // (matching the disabled-mode shape) instead of surfacing the throw
-        // as an uncaught extension error on Ctrl-C. The handler's `if (release)`
-        // guard becomes the abort path. waitForLaunch already cancelled our
-        // waiter entry; the finally is a no-op (released stays false → cancel
-        // is a belt-and-suspenders no-op since the id is already gone).
-        if (signal?.aborted) {
-          released = true;
-          return undefined;
-        }
-        throw err; // non-abort throw (lock timeout, EACCES) — propagate
-      }
-      releaseToken = releaseTokenThisIter;
-      // We are head + hold the launch token. Poll /usage until the server reports
-      // a free slot (or the plan is unlimited) and the account isn't deprioritized.
-      // The token serializes the /usage POLL (no thundering herd on the capacity
-      // endpoint); it is released as soon as the capacity check passes (before
-      // the send), NOT held across the send. Holding the token across the send
-      // serializes to 1-at-a-time (over-serialization). Releasing immediately
-      // lets the next head poll right away; the server's /usage lag means it
-      // sees a stale-low concurrent_sessions + launches — achieving
-      // limit-concurrent saturation (4/4). The hard_cap burst headroom
-      // absorbs any overshoot from the lag.
-      const limit = concurrencyLimit();
-      // Unlimited plan: skip the capacity check (still honor priority.low).
-      // read queuePaused ONCE per poll iteration into a local const
-      // + pass the same value to capacityFree + decideLaunch. Previously
-      // capacityFree read concurrencyQueue.snapshot().paused inside itself
-      // + decideLaunch read it again after the await — two unlocked snapshot
-      // reads straddling an await, so a sibling writing pausedUntil between
-      // them could let capacityFree see queuePaused:true then decideLaunch see
-      // queuePaused:false + elapsedMs >= 60s -> failOpen into a pause. Reading
-      // once makes the fail-open-during-pause guard structural.
-      const capacityFree = async (queuePaused: boolean): Promise<boolean> => {
-        // consult the SHARED pause before launching. A 429 observed by any
-        // local process writes pausedUntil to the shared file; reading it here
-        // makes every sibling back off immediately, even before /usage
-        // propagates priority.low (5s refresh lag, or a transient gateway-side
-        // blip not yet reflected in /usage). Without this, process B would see
-        // priority.low === false and launch right into the 429 that A just hit.
-        const snap = await fetchUsageSnapshot(apiKey, signal);
-        // pass localInFlight IN (see CapacityInputs) so isCapacityFree stays
-        // pure. snapshot() calls reapStale, so inflightCount is the post-reap count.
-        const qSnap = concurrencyQueue.snapshot();
-        const decision = isCapacityFree(snap, {
-          limit,
-          queuePaused,
-          localInFlight: qSnap.inflightCount,
-        });
-        if (decision.repause) {
-          // write-amplification guard: skip the pauseUntil call when the
-          // active pause already covers the requested deadline + reason. The
-          // capacity-poll loop calls capacityFree every ~300ms; with the reason-aware
-          // iteration where priority.low && reason=cap_abuse returns a repause,
-          // + the caller pushes pauseUntil — a mutate (O_EXCL lock + readState
-          // + reapStale + writeStateAtomic + renameSync) every ~300ms. Over a
-          // 5h suspension that is ~60,000 lock acquisitions + file writes,
-          // all no-ops at the pause level (extend-never-shorten means the
-          // deadline does not move). Skip when queuePaused &&
-          // qSnap.pausedUntil >= decision.repause.until &&
-          // qSnap.pausedReason === decision.repause.reason. qSnap was read
-          // once per iteration (no straddle-await race).
-          const alreadyCovered = queuePaused &&
-            qSnap.pausedUntil >= decision.repause.until &&
-            qSnap.pausedReason === decision.repause.reason;
-          if (!alreadyCovered) {
-            // pauseUntil runs mutate -> writeStateAtomic -> renameSync,
-            // which can throw on disk failure (EACCES, ENOSPC, EROFS). The pause
-            // is a best-effort coordination signal (the server's priority.low +
-            // the 120s watchdog bound it); it must not abort a turn that already
-            // waited its FIFO place. Warn + swallow, mirroring releaseSlot's
-            // release-resilience pattern.
-            try {
-              concurrencyQueue.pauseUntil(decision.repause.until, decision.repause.reason ?? undefined);
-            } catch (err) {
-              console.warn("umans: pauseUntil threw in capacityFree (continuing):", err instanceof Error ? err.message : err);
-            }
-          }
-        }
-        return decision.free;
-      };
-      // Poll at 300ms + up to 100ms jitter while full/deprioritized. If the turn
-      // is aborted mid-poll, `signal` cancels the waiter; otherwise the watchdog
-      // reaps the token after >120s and session_shutdown clears the waiter on exit.
-      // the ±100ms jitter breaks phase-locking across machines —
-      // D1 designs for multiple machines each running their own local queue and
-      // polling /usage; without jitter, N machines' head waiters synchronize on
-      // the same 300ms tick and amplify /usage load N× per cycle.
-      // cap the total poll elapsed at CAPACITY_POLL_TIMEOUT_MS so a
-      // hostile/misbehaving /usage (always reports full, or an account stuck
-      // at the cap) cannot wedge the queue forever. After the cap, fail open
-      // (launch anyway) — matching the /usage-unreachable fallback's stance
-      // that the queue must not block indefinitely.
-      // do NOT fail open during a KNOWN active pause (shared
-      // pausedUntil, e.g. a 429 the gate observed). Fail-open for an
-      // unreachable /usage is fine (no signal); fail-open for a POSITIVE
-      // deprio signal launches into a still-deprioritized account, risking
-      // another 429 and extending the account-wide deprioritization — exactly
-      // what the gate exists to prevent. Keep waiting when a known pause is
-      // active; the pause has a bounded deadline (clamped to MAX_PAUSE_MS)
-      // and C1's touchToken keeps the watchdog from reaping a legitimately
-      // long poll (the watchdog now only reaps a TRULY hung poller).
-      const pollStart = Date.now();
-      // exponential backoff on the poll interval when capacity is
-      // steadily full. Start at 300ms, grow by 1.5× on each "wait" decision,
-      // cap at 2000ms; reset to 300ms on "launch" / "failOpen". Reduces /usage
-      // RPS from ~3.3/s to ~0.5/s during a sustained pause. The ±100ms jitter
-      // breaks phase-locking across machines.
-      let pollIntervalMs = POLL_INTERVAL_BASE_MS;
-      // the branch logic lives in decideLaunch (pure, unit-tested). The
-      // loop here drives the /usage fetch (capacityFree, I/O) and applies the
-      // decision each iteration.
-      for (;;) {
-        // re-stamp our token's ts each iteration so the 120s
-        // watchdog does not reap a legitimately long capacity poll. If the
-        // token was already reaped by a sibling's reapStale (id mismatch or
-        // absent), touchToken returns false — bail out of this poll, cancel
-        // our (now-stale) waiter entry, re-join the queue, and wait our turn
-        // again. The sibling that reaped + claimed is now sending; re-joining
-        // serializes us behind it rather than racing a concurrent send that
-        // would defeat the gate.
-        if (!concurrencyQueue.touchToken(ourId)) {
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-          if (rejoins >= MAX_TOKEN_REJOINS) {
-            // Pathological state: reaped + re-joined too many times. Fail
-            // open rather than loop forever (bounded by the watchdog + the
-            // hard_cap headroom, same stance as /usage-unreachable).
-            // clear the stale releaseToken closure before break.
-            // releaseToken still points at the prior iteration's closure
-            // (a no-op — the token was reaped — but confusing). The returned
-            // closure below calls releaseToken(); point it at an explicit
-            // no-op so fail-open proceeds without holding (or pretending to
-            // release) a token.
-            releaseToken = () => {};
-            break;
-          }
-          ourId = concurrencyQueue.join()!;
-          // join() returns null only when the queue is disabled, which is a
-          // creation-time flag — it cannot flip mid-loop. The non-null
-          // assertion mirrors the initial join() above.
-          continue tokenAcquire; // re-wait our turn
-        }
-        // read queuePaused ONCE here, pass the same value to
-        // capacityFree + decideLaunch (see capacityFree def for rationale).
-        const queuePaused = concurrencyQueue.snapshot().paused;
-        const isFree = await capacityFree(queuePaused);
-        const decision = decideLaunch({
-          isFree,
-          elapsedMs: Date.now() - pollStart,
-          queuePaused,
-          signalAborted: !!signal?.aborted,
-        });
-        if (decision === "launch") break; // capacity free — proceed to send
-        if (decision === "abort") {
-          // return undefined on abort (matching the disabled-mode shape)
-          // instead of throwing. The handler's `if (release)` guard becomes
-          // the abort path, so a Ctrl-C mid-poll surfaces as a clean
-          // cancellation rather than an uncaught extension error toast/log.
-          // We already hold the token (touchToken returned true above), so
-          // release it before returning — the watchdog would reap it
-          // eventually, but releasing now frees the next head immediately.
-          try { releaseToken(); } catch { /* best-effort */ }
-          try { concurrencyQueue.cancel(ourId); } catch { /* best-effort: COV12-1 */ }
-          released = true;
-          return undefined;
-        }
-        if (decision === "failOpen") {
-          // only fail open when no known pause is active. A known
-          // pause means the gate has a positive deprio signal; keep waiting
-          // (bounded by the pause deadline + the 120s token watchdog).
-          break; // fail open below
-        }
-        // decision === "wait"
-        await new Promise((r) => setTimeout(r, pollIntervalMs + Math.floor(Math.random() * 100)));
-        // back off the next poll interval (grows 1.5×, caps at 2000ms).
-        pollIntervalMs = nextPollInterval(pollIntervalMs, "wait");
-      }
-      // fail-open after the cap. The turn proceeds ungated; the watchdog still bounds
-      // the token hold. We deliberately do not throw — a wedged /usage should
-      // not break the user's turn, only the gate. The status bar's `q <queued>*`
-      // already reflects the wait; the launch itself is silent so as not to
-      // spam notifies on every poll.
-      //
-      // local in-flight tracking: add an in-flight entry BEFORE releasing
-      // the token (the order is load-bearing — the next head's readState
-      // must see our entry before it can claim the token, so max(localInFlight,
-      // concurrent_sessions) counts us + blocks a sibling from launching into
-      // our still-in-flight request). addInFlight is fail-closed (Adv5): a throw
-      // (lock timeout, EACCES, ENOSPC) propagates to the finally, which cancels
-      // the waiter + token + aborts the turn — do NOT swallow, a missing entry
-      // deflates the gate for siblings. The returned release fn calls
-      // removeInFlight (best-effort, mirroring releaseToken) in addition to the
-      // existing token + waiter cleanup.
-      concurrencyQueue.addInFlight(ourId);
-      // Throughput fix: release the token IMMEDIATELY (not at message_end) so
-      // the next head can poll + launch. The token serializes the /usage poll;
-      // holding it across the send serializes to 1-at-a-time. Releasing here
-      // lets the next head poll right away — the server's /usage lag means it
-      // sees a stale-low concurrent_sessions + launches, achieving
-      // limit-concurrent saturation. The hard_cap absorbs overshoot.
-      try { releaseToken(); } catch { /* best-effort — release-resilience */ }
-      releaseToken = () => {}; // no-op for the returned release fn (token already released)
-      released = true;
-      return () => {
-        releaseToken(); // no-op (token released above)
-        try { concurrencyQueue.removeInFlight(ourId); } catch { /* best-effort: watchdog reaps at 120s */ }
-        concurrencyQueue.cancel(ourId); // belt-and-suspenders: drop our waiter if still present (also splices in-flight)
-      };
-    } // end tokenAcquire
-    // Unreachable: the loop above always either returns or throws. Defensive.
-    return undefined;
-    } finally {
-      // If we exited without returning a release fn (throw, abort, or a path
-      // that didn't set `released`), cancel our waiter entry so it doesn't
-      // pollute the FIFO for staleWaiterMs. On the happy path the
-      // returned release fn owns the cancellation, so `released` is true
-      // and this is a no-op.
-      if (!released) {
-        try { concurrencyQueue.cancel(ourId); } catch { /* best-effort */ }
-      }
-    }
+    return acquireSlotCore(rt, apiKey, signal) as Promise<Release | undefined>;
   }
 
-  async function resolveApiKey(ctx?: any): Promise<string | undefined> {
-    const envKey = process.env[API_KEY_ENV]?.trim();
-    if (envKey) return envKey;
-    try {
-      return await ctx?.modelRegistry?.getApiKeyForProvider("umans");
-    } catch {
-      return undefined;
-    }
-  }
-
-  // === Web search (reuses the gateway's built-in Exa via a side-call) ===
-  // The Umans gateway runs web search through Exa, but only when the request
-  // declares the Anthropic `web_search_20250305` server tool — which pi-ai
-  // cannot send (it only serializes client-side tools). So we expose a normal
-  // client-side tool: the main model calls it, we make a sub-request that does
-  // declare the server tool, and return the results. One extra round-trip per
-  // search; no pi-ai changes required.
-  //
-  // Set UMANS_SEARCH_DISABLE=1 to skip registering this tool (e.g. when you
-  // already expose web search via your own MCP tool and want to avoid a
-  // duplicate). Vision handoff is unaffected.
-  const searchDisabled = process.env[SEARCH_DISABLE_ENV] === "1";
-  const searchModelId = pickSearchModel(catalog);
-  if (!searchDisabled) {
-  pi.registerTool({
-    name: "umans_web_search",
-    label: "Umans Web Search",
-    description:
-      "Search the web (via the Umans gateway's built-in Exa) for current or real-time information " +
-      "you do not already have: recent events, live prices, latest library/SDK versions, current docs, " +
-      "or date-sensitive facts. Pass a focused search query.",
-    promptSnippet: "Search the web for current information",
-    promptGuidelines: [
-      "Use umans_web_search for current or real-time information you do not already have: recent events, live prices, latest library versions, current docs, or date-sensitive facts. Pass a focused query.",
-      "Do not use it for things you already know or can derive from the codebase.",
-    ],
-    parameters: Type.Object({
-      query: Type.String({ description: "The web search query" }),
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const apiKey = await resolveApiKey(ctx);
-      if (!apiKey) {
-        return {
-          content: [{ type: "text", text: "Umans API key unavailable; cannot run web search." }],
-          details: {},
-        };
-      }
-      // The side-call consumes a concurrency slot on the account; gate it
-      // through the same cross-process FIFO so a burst of searches can't push
-      // the main turn past the soft cap. Do NOT assign to
-      // mainTurnRelease — side-calls manage their own release via releaseSlot
-      // in the finally below. mainTurnRelease is main-turn-only (message_end
-      // releases it); a side-call assigned there could be released instead of
-      // the main turn's slot.
-      const release = await acquireSlot(apiKey, signal);
-      try {
-        const results = await searchWeb(apiKey, searchModelId, baseUrl, params.query, signal, concurrencyQueue);
-        return { content: [{ type: "text", text: results }], details: {} };
-      } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text", text: `Web search failed: ${m}` }], details: {} };
-      } finally {
-        releaseSlot(release);
-      }
-    },
-  });
-  }
+  // resolveApiKey is imported from utils.ts (shared with web-search.ts) —
+  // it reads UMANS_API_KEY then falls back to ctx.modelRegistry.
 
   // === Client-side vision handoff (see module-level docs) ===
   // Mutable at runtime via the /umans-vision command; env vars only seed the
@@ -1760,7 +835,7 @@ export default async function (pi: ExtensionAPI) {
           // fetch (the tool path at umans_vision already passes `signal`; only
           // the handoff path dropped it). The 60s VISION_TIMEOUT_MS still
           // bounds the worst case, but passing the signal makes the handoff
-          // consistent with the tool + searchWeb.
+          // consistent with the tool + the web-search side-call (web-search.ts).
           analysis = await analyzeImage(
             apiKey,
             model,
@@ -2056,15 +1131,12 @@ export default async function (pi: ExtensionAPI) {
   // a finally so the slot is released even on throw — otherwise a
   // repeatedly-throwing slot would loop forever.
   function releaseSlot(release: Release | undefined): void {
-    if (!release) return;
+    // releaseSlotCore runs the release closure (swallowing throws so a
+    // transient lock/disk error does not abort the caller's turn; the 120s
+    // watchdog reaps the stale token/waiter regardless). The main-turn
+    // tracking + status-bar re-render stay here (index.ts only).
     try {
-      try {
-        release();
-      } catch (err) {
-        // Transient (lock timeout) or environmental (EACCES/ENOSPC); the
-        // 120s watchdog reaps the stale token/waiter entry regardless.
-        console.warn("umans: concurrency release threw (release continues):", err instanceof Error ? err.message : err);
-      }
+      releaseSlotCore(release);
     } finally {
       if (mainTurnRelease === release) mainTurnRelease = undefined;
       updateStatus(undefined as any);
@@ -2154,7 +1226,7 @@ export default async function (pi: ExtensionAPI) {
     // account for ~30 min (Retry-After overrides).
     if (event.status === 429) {
       // delegate to the shared handle429 helper (also used by
-      // analyzeImage + searchWeb) so every 429 site parses Retry-After the
+      // analyzeImage + searchWeb in web-search.ts) so every 429 site parses Retry-After the
       // same way + pushes the shared pause with the same PAUSE_REASON_429 tag.
       const until = handle429(event, concurrencyQueue);
       ctx.ui?.notify?.(
@@ -2185,8 +1257,8 @@ export default async function (pi: ExtensionAPI) {
     lastCtx = ctx; // stash for periodic updateStatus from the refreshUsage timer
     const apiKey = await resolveApiKey(ctx);
     if (ctx.model?.provider === "umans") {
-      if (apiKey) await refreshUsage(apiKey);
-      restartRefreshLoop(apiKey || "");
+      if (apiKey) await sharedRefreshUsage(rt, apiKey);
+      restartRefreshLoop(rt, apiKey || "");
       updateStatus(ctx);
     }
   });
@@ -2194,7 +1266,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
     const provider = event.model.provider;
     if (provider !== "umans") {
-      stopRefreshLoop();
+      stopRefreshLoop(rt);
       setWidget(ctx, undefined);
       liveRequest = undefined;
       lastMetrics = {};
@@ -2202,8 +1274,8 @@ export default async function (pi: ExtensionAPI) {
     }
     updateStatus(ctx);
     const apiKey = await resolveApiKey(ctx);
-    if (apiKey) await refreshUsage(apiKey);
-    restartRefreshLoop(apiKey || "");
+    if (apiKey) await sharedRefreshUsage(rt, apiKey);
+    restartRefreshLoop(rt, apiKey || "");
   });
 
   // turn_start opens the TTFT clock: it fires before API-key/HTTP/prefill, so TTFT
@@ -2307,7 +1379,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    stopRefreshLoop();
+    stopRefreshLoop(rt);
     liveRequest = undefined;
     lastMetrics = {};
     imageStore.clear();

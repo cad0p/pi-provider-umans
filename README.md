@@ -85,6 +85,36 @@ export UMANS_VISION_MODEL="umans-kimi-k2.7"   # vision model id
 export UMANS_VISION_DISABLE="1"               # start with handoff off
 ```
 
+## Web search
+
+The built-in `umans_web_search` tool searches the web via the Umans gateway's built-in Exa (useful for current information you don't already have: recent events, live prices, latest library versions, current docs). It lives in its own extension file (`web-search.ts`) so you can toggle it independently of the provider with `pi config`.
+
+### Toggling web search on/off
+
+Use `pi config` to edit the `extensions` array in `settings.json` (global `~/.pi/agent/settings.json` or project `.pi/settings.json`). The package's default extension list includes both `index.ts` (the provider) + `web-search.ts` (the search tool). To disable the built-in web search (e.g. when you expose your own MCP web-search tool):
+
+```jsonc
+// ~/.pi/agent/settings.json or .pi/settings.json
+{
+  "extensions": [
+    "+index.ts",          // provider always on
+    "-web-search.ts"      // disable the built-in umans_web_search tool
+  ]
+}
+```
+
+`+path` force-includes an exact path; `-path` force-excludes it. Omitting the prefix uses the package's default (both on). Changes take effect on the next pi restart (not mid-session).
+
+### Migration from `UMANS_SEARCH_DISABLE`
+
+The `UMANS_SEARCH_DISABLE=1` env var has been **removed**. It existed because web search was previously in `index.ts` (a single entry point) with no file-level toggle. Now that web search is its own file, `pi config` replaces it cleanly:
+
+| Before | After |
+|---|---|
+| `UMANS_SEARCH_DISABLE=1` | `pi config` to disable `web-search.ts` (or edit `settings.json` extensions: `-web-search.ts`) |
+
+`pi config` survives restarts, is discoverable via `/settings`, + works at both global + project scope — none of which the env var offered.
+
 ## Concurrency & rate-limit safety
 
 Umans enforces a **concurrency soft cap** on in-flight requests per account (e.g. 3–4 on paid plans, with ~2× headroom before hard 429 enforcement). Per the [Umans docs](https://app.umans.ai/offers/code/docs), each 429 **deprioritizes the whole account for ~30 minutes** (requests still go through, just slower), and **>10 concurrency 429s in a day triggers a 5-hour pause**. Because all keys under an account share the counter, a burst of parallel subagents — or several `pi` processes on the same machine — can trip this easily.
@@ -110,7 +140,7 @@ The concurrency env vars (`UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`
 | Env var | Default | Effect |
 |---|---|---|
 | `UMANS_CONCURRENCY_DISABLE` | `0` | `1` disables the queue entirely (fire-and-forget; not recommended — you lose 429 protection). |
-| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | Override the capacity check value (handy for testing the queue with a low number). |
+| `UMANS_CONCURRENCY_LIMIT` | (from `/v1/usage`) | **Deprecated** (testing-only absolute override). When set, wins outright over the concurrency multiplier + the live `/v1/usage` limit. Handy for testing the queue with a low number. The user-facing knob is the concurrency multiplier (see [Settings file](#settings-file)). |
 | `UMANS_CONCURRENCY_STATE_FILE` | `~/.pi/agent/umans-concurrency.json` | Override the queue state file path (handy for multi-process isolation experiments). |
 
 ### 429 strike counter
@@ -148,8 +178,50 @@ The dashboard endpoint `app.umans.ai/api/account/cap-health` (exact strike count
 | `UMANS_DISABLE` | `0` | `1` disables the extension entirely. |
 | `UMANS_VISION_DISABLE` | `0` | `1` starts vision handoff off (toggle live with `/umans-vision`). |
 | `UMANS_VISION_MODEL` | `umans-kimi-k2.7` | Seed the vision model id. |
-| `UMANS_SEARCH_DISABLE` | `0` | `1` disables the `umans_web_search` tool (e.g. when you use your own MCP web-search tool). Vision handoff is unaffected. |
-| `UMANS_CONCURRENCY_*` | — | See [Concurrency & rate-limit safety](#concurrency--rate-limit-safety) for `UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT`, and `UMANS_CONCURRENCY_STATE_FILE`. |
+| `UMANS_CONCURRENCY_*` | — | See [Concurrency & rate-limit safety](#concurrency--rate-limit-safety) for `UMANS_CONCURRENCY_DISABLE`, `UMANS_CONCURRENCY_LIMIT` (deprecated), and `UMANS_CONCURRENCY_STATE_FILE`. |
+
+### Settings file
+
+A provider-specific settings file lets you tune behavior without env vars (env vars don't survive restarts, aren't discoverable via `/settings`, + can't be scoped per-project). The file is owned by this package; pi's `settings.json` schema is owned by the pi CLI + extensions don't add fields to it.
+
+**Schema** (today only the concurrency multiplier lives here):
+
+```json
+{
+  "concurrencyMultiplier": 1.0
+}
+```
+
+**Paths** (mirrors pi's own `~/.pi/agent/settings.json` + `.pi/settings.json` layout):
+
+| Path | Scope |
+|---|---|
+| `~/.pi/agent/umans.json` | Global (all projects) |
+| `.pi/umans.json` | Project-local (deep-merged over global) |
+
+**Precedence** (highest to lowest):
+
+1. `UMANS_CONCURRENCY_LIMIT` env var (deprecated absolute override, testing only — takes precedence over everything, bypasses the multiplier)
+2. `.pi/umans.json` (project settings, deep-merged over global)
+3. `~/.pi/agent/umans.json` (global settings)
+4. Default (`concurrencyMultiplier: 1.0`)
+
+**Merge semantics** (mirror pi's `deepMergeSettings` so users get predictable, familiar config layering):
+
+- Nested objects → deep merged (project fields override only their key; global siblings survive).
+- Arrays → fully replaced (project array replaces global entirely, NOT concatenated). No arrays in the schema today, but documented so a future array field doesn't surprise.
+- Primitives → override (project wins).
+
+**`concurrencyMultiplier`** scales the effective concurrency limit:
+
+- `1.0` (default) = full guaranteed concurrency (the server's `limits.concurrency.limit`).
+- `0.5` = conservative (half the guaranteed concurrency; e.g. limit 4 → effective 2).
+- `2.0` = burst into `hard_cap` headroom (e.g. limit 4 → effective 8, the 429 threshold).
+- `3.0`+ = clamped to `hard_cap` (e.g. limit 4 × 3.0 = 12, clamped to `hard_cap` 8) so a high multiplier cannot push past the server's burst ceiling.
+
+The deprioritization lowering (`priority.low` → cap − 1) applies AFTER the multiplier: `effectiveLimit = max(0, min(floor(serverLimit × multiplier), hardCap) − (deprioritized ? 1 : 0))`.
+
+Malformed JSON → warn + defaults (don't crash the provider). Missing file → defaults. Invalid `concurrencyMultiplier` (0, negative, NaN, non-number) → warn + default.
 
 ## Development & testing
 

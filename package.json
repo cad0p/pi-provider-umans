@@ -6,6 +6,9 @@
   "main": "index.ts",
   "files": [
     "index.ts",
+    "web-search.ts",
+    "utils.ts",
+    "settings.ts",
     "concurrency-queue.ts",
     "README.md",
     "LICENSE"
@@ -44,7 +47,8 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./index.ts",
+      "./web-search.ts"
     ]
   }
 }

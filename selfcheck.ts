@@ -8,7 +8,28 @@
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNativeVision, pickVisionModel, hashImageId, decideLaunch, shouldReleaseOnMessageEnd, nextPollInterval, default as umansFactory, pickSearchModel, formatStatusText, countdown, sanitizeErrorBody, handle429, raiseForUmansStatus } from "./index.ts";
+import { isNativeVision, pickVisionModel, hashImageId, shouldReleaseOnMessageEnd, default as umansFactory, formatStatusText, countdown } from "./index.ts";
+import { default as webSearchFactory } from "./web-search.ts";
+import {
+  pickSearchModel,
+  sanitizeErrorBody,
+  handle429,
+  raiseForUmansStatus,
+  readRetryAfter,
+  decideLaunch,
+  nextPollInterval,
+  USER_AGENT,
+  SEARCH_TIMEOUT_MS,
+  SEARCH_MAX_TOKENS,
+  type UmansModelInfo,
+} from "./utils.ts";
+import {
+  readSettings,
+  defaultSettings,
+  deepMergeSettings,
+  DEFAULT_CONCURRENCY_MULTIPLIER,
+  type UmansSettings,
+} from "./settings.ts";
 import {
   parsePriority,
   readState,
@@ -3187,19 +3208,22 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // pretends to release a token we no longer hold). The fix sets
 // `releaseToken = () => {}` before the break so the returned closure's
 // releaseToken() is an explicit no-op documenting fail-open proceeds without
-// holding the token. COV7-2 already drives the live fail-open path; pin the
-// clear is present at the MAX_TOKEN_REJOINS break site by source inspection.
+// holding the token. The capacity-poll loop was extracted to acquireSlotCore
+// in utils.ts (shared with web-search.ts so the two factories cannot diverge),
+// so the source inspection reads utils.ts. COV7-2 already drives the live
+// fail-open path; pin the clear is present at the MAX_TOKEN_REJOINS break site
+// by source inspection.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   const rejoinIdx = src.indexOf("rejoins >= MAX_TOKEN_REJOINS");
-  assert(rejoinIdx >= 0, "MAX_TOKEN_REJOINS fail-open guard present in index.ts");
+  assert(rejoinIdx >= 0, "MAX_TOKEN_REJOINS fail-open guard present in utils.ts (acquireSlotCore)");
   // The clear must sit inside the if-block, before the break.
   const blockEnd = src.indexOf("break;", rejoinIdx);
   assert(blockEnd > rejoinIdx, "break present in MAX_TOKEN_REJOINS block");
   const block = src.slice(rejoinIdx, blockEnd);
   assert(block.includes("releaseToken = () => {};"),
     "releaseToken cleared to no-op before MAX_TOKEN_REJOINS break (no stale closure)");
-  assert(block.includes("clear the stale releaseToken closure"),
+  assert(block.includes("Clear the stale releaseToken closure"),
     "clear documented with a comment at the MAX_TOKEN_REJOINS break");
 }
 
@@ -3210,14 +3234,16 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
 // between the two reads could let capacityFree see queuePaused:true then
 // decideLaunch see queuePaused:false + elapsedMs >= 60s -> failOpen into a
 // pause. The fix reads queuePaused once into a local const + passes the same
-// value to both. Pin the single-read structure by source inspection.
+// value to both. The capacity-poll loop was extracted to acquireSlotCore in
+// utils.ts (shared with web-search.ts), so the source inspection reads
+// utils.ts. Pin the single-read structure by source inspection.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   // capacityFree now takes queuePaused as a parameter (no internal snapshot read).
   assert(src.includes("const capacityFree = async (queuePaused: boolean): Promise<boolean> =>"),
     "capacityFree takes queuePaused as a parameter (no internal snapshot read)");
   // The call site reads queuePaused once into a local const + passes it to both.
-  const callIdx = src.indexOf("const queuePaused = concurrencyQueue.snapshot().paused;");
+  const callIdx = src.indexOf("const queuePaused = queue.snapshot().paused;");
   assert(callIdx >= 0, "queuePaused read once into a local const before capacityFree");
   // The same const is passed to capacityFree + decideLaunch (no second snapshot read).
   assert(src.includes("const isFree = await capacityFree(queuePaused);"),
@@ -3225,14 +3251,14 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   const decideIdx = src.indexOf("const decision = decideLaunch({");
   assert(decideIdx > callIdx, "decideLaunch call follows the single queuePaused read");
   const decideBlock = src.slice(decideIdx, src.indexOf("});", decideIdx) + 3);
-  assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("concurrencyQueue.snapshot().paused"),
+  assert(decideBlock.includes("queuePaused,") && !decideBlock.includes("queue.snapshot().paused"),
     "decideLaunch receives the same queuePaused const (no second snapshot read)");
-  // No remaining `concurrencyQueue.snapshot().paused` inside capacityFree's body.
+  // No remaining `queue.snapshot().paused` inside capacityFree's body.
   const capIdx = src.indexOf("const capacityFree = async (queuePaused: boolean):");
   const capEnd = src.indexOf("return decision.free;", capIdx);
   const capBody = src.slice(capIdx, capEnd);
-  assert(!capBody.includes("concurrencyQueue.snapshot().paused"),
-    "capacityFree body no longer reads concurrencyQueue.snapshot().paused");
+  assert(!capBody.includes("queue.snapshot().paused"),
+    "capacityFree body no longer reads queue.snapshot().paused");
 }
 
 // --- concurrentSessions ?? 0 + full cap fallback chain ---
@@ -4180,10 +4206,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  // The main session sets UMANS_SEARCH_DISABLE=1; clear it so umans_web_search
-  // registers + its execute body drives acquireSlot.
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   // messagesStatus controls what /v1/messages returns: 200 (valid analysis) or 429.
@@ -4258,6 +4280,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     // umans_web_search must have been registered with an execute fn.
     assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
@@ -4400,9 +4423,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
-
   const realFetch = globalThis.fetch;
   // messagesMode controls what /v1/messages returns:
   //   "empty" -> content: [] (searchWeb + analyzeImage empty fallback)
@@ -4478,6 +4498,7 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     const searchTool = tools.get("umans_web_search")!;
     const visionTool = tools.get("umans_vision")!;
@@ -4553,6 +4574,114 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
+// --- umans_web_search.execute with empty + very-long query (no crash, no truncation) ---
+// An empty query flows into searchWeb's prompt → a /v1/messages POST with an
+// empty user query. A very-long query (10k chars) must flow through without
+// truncation or crash. The existing fallback test drove execute with a
+// non-empty benign string only; the empty + adversarial-long inputs were
+// unasserted. Drive both through the real factory wiring.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-empty-long-query-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // Capture the /v1/messages request body so the long-query case can assert the
+  // full query flows through (no truncation). /v1/messages returns content: []
+  // for both cases → searchWeb's '(no search results returned)' fallback.
+  let lastMessagesBody: string | undefined;
+  const captureMessagesBody = (init?: any): void => {
+    lastMessagesBody = typeof init?.body === "string" ? init.body : undefined;
+  };
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      captureMessagesBody(init);
+      return Promise.resolve(new Response(JSON.stringify({ content: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const searchTool = tools.get("umans_web_search")!;
+
+    // (a) empty query → /v1/messages 200 with content: [] → the
+    // '(no search results returned)' fallback. Confirms an empty query does
+    // not crash + surfaces the empty-content fallback.
+    lastMessagesBody = undefined;
+    const emptyRes = await searchTool.execute("call-empty", { query: "" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof emptyRes?.content?.[0]?.text === "string" &&
+      emptyRes.content[0].text === "(no search results returned)",
+      `empty query → '(no search results returned)' fallback (got: ${emptyRes?.content?.[0]?.text})`);
+    const emptyBody = lastMessagesBody as string | undefined;
+    assert(emptyBody !== undefined && emptyBody.includes("Query: "),
+      "empty query flows into the /v1/messages POST body (prompt suffix present)");
+    assert(emptyBody !== undefined && !emptyBody.includes("x".repeat(100)),
+      "empty query body does not carry a long query string (sanity)");
+
+    // (b) very-long query (10k chars) → no crash, + the full query flows into
+    // the POST body (no truncation at the provider boundary).
+    const longQuery = "x".repeat(10_000);
+    lastMessagesBody = undefined;
+    const longRes = await searchTool.execute("call-long", { query: longQuery }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof longRes?.content?.[0]?.text === "string",
+      "very-long query (10k chars) does not crash + returns a text result");
+    const longBody = lastMessagesBody as string | undefined;
+    assert(longBody !== undefined && longBody.includes(longQuery),
+      "very-long query (10k chars) flows into the /v1/messages POST body in full (no truncation)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 // --- multi-image transformMessageImages Promise.all path driven through wiring ---
 // transformMessageImages does Promise.all over N image blocks, each calling
 // acquireSlot → join → mutate + analyzeImage (fetch /v1/messages). The
@@ -4577,8 +4706,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -4741,8 +4868,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   delete process.env.UMANS_VISION_MODEL;
   savedEnv.UMANS_VISION_DISABLE = process.env.UMANS_VISION_DISABLE;
   delete process.env.UMANS_VISION_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -4997,51 +5122,6 @@ assert(isPidDead(9_999_999) === true, "isPidDead: unlikely pid dead");
   }
 }
 
-// --- UMANS_SEARCH_DISABLE=1 wiring driven through real factory ---
-// When UMANS_SEARCH_DISABLE=1, the factory skips registering umans_web_search.
-// No selfcheck test set this env var + asserted the tool is absent. A regression
-// dropping the `if (!searchDisabled)` guard would not be caught.
-{
-  const dir = mkdtempSync(join(tmpdir(), "umans-q-cov-r14-1-"));
-  const savedEnv: Record<string, string | undefined> = {};
-  const envOverrides: Record<string, string> = {
-    UMANS_API_KEY: "uk-test-key",
-    UMANS_CONCURRENCY_DISABLE: "1",
-    UMANS_SEARCH_DISABLE: "1", // disable the search tool
-  };
-  for (const [k, v] of Object.entries(envOverrides)) {
-    savedEnv[k] = process.env[k];
-    process.env[k] = v;
-  }
-  delete process.env.UMANS_DISABLE;
-
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (() => Promise.resolve(new Response("", { status: 404 }))) as any;
-  try {
-    const registeredTools: string[] = [];
-    const pi: any = {
-      on() {},
-      registerTool(name: string, _opts: any, _handler: any) { registeredTools.push(name); },
-      registerCommand() {}, registerProvider() {},
-      events: { on() {}, off() {}, emit() {} },
-    };
-
-    // UMANS_SEARCH_DISABLE=1 → tool NOT registered
-    await umansFactory(pi as any);
-    assert(!registeredTools.includes("umans_web_search"),
-      "UMANS_SEARCH_DISABLE=1 → umans_web_search NOT registered");
-    // Other tools should still be registered (only search is disabled).
-    assert(registeredTools.length > 0,
-      "UMANS_SEARCH_DISABLE=1 → other tools still registered");
-  } finally {
-    globalThis.fetch = realFetch;
-    for (const [k, v] of Object.entries(savedEnv)) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
 // --- acquireLock 2s timeout throw path ---
 // acquireLock throws `concurrency-queue: timed out acquiring lock` when the
 // deadline (now + lockTimeoutMs) passes while the lockfile is held with a
@@ -5167,8 +5247,6 @@ if (process.platform !== "win32") {
   }
   delete process.env.UMANS_DISABLE;
   delete process.env.UMANS_CONCURRENCY_DISABLE;
-  savedEnv.UMANS_SEARCH_DISABLE = process.env.UMANS_SEARCH_DISABLE;
-  delete process.env.UMANS_SEARCH_DISABLE;
 
   const realFetch = globalThis.fetch;
   let messagesCalls = 0;
@@ -5232,6 +5310,7 @@ if (process.platform !== "win32") {
       return result;
     }
     await umansFactory(pi as any);
+    await webSearchFactory(pi as any);
 
     assert(tools.has("umans_web_search"), "umans_web_search tool registered through wiring");
     assert(tools.has("umans_vision"), "umans_vision tool registered through wiring");
@@ -5341,32 +5420,39 @@ if (process.platform !== "win32") {
 // block inlined in their !res.ok branch. The refactor extracts a single
 // raiseForUmansStatus(res, concurrencyQueue) helper + calls it from both sites.
 // A regression re-inlining the block (or dropping the 429 push / sanitize at one
-// site) would not be caught by the existing COV9-4 side-call 429 tests alone.
+// site) would not be caught by the existing side-call 429 tests alone.
 // Pin the helper exists + is called from both sites by source inspection.
+// The helper lives in utils.ts (pure helpers module); the call sites are now
+// split across files — analyzeImage in index.ts, searchWeb in web-search.ts —
+// so the source inspection reads both files to pin each call site.
 {
-  const src = readFileSync("index.ts", "utf8");
-  assert(src.includes("async function raiseForUmansStatus("),
-    "raiseForUmansStatus helper defined in index.ts");
-  // Both side-call sites call the helper in their !res.ok branch.
-  const analyzeIdx = src.indexOf("async function analyzeImage(");
-  const searchIdx = src.indexOf("async function searchWeb(");
-  assert(analyzeIdx >= 0 && searchIdx > analyzeIdx,
-    "analyzeImage + searchWeb defined in index.ts");
-  const analyzeCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
-  const searchCallIdx = src.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
-  assert(analyzeCallIdx > analyzeIdx && analyzeCallIdx < searchIdx,
-    "analyzeImage !res.ok branch calls raiseForUmansStatus");
-  assert(searchCallIdx > searchIdx,
-    "searchWeb !res.ok branch calls raiseForUmansStatus");
+  const utilsSrc = readFileSync("utils.ts", "utf8");
+  assert(utilsSrc.includes("export async function raiseForUmansStatus("),
+    "raiseForUmansStatus helper defined in utils.ts");
   // The helper runs the 429 push (handle429) + the body sanitize
   // (sanitizeErrorBody) — pin both are referenced inside it.
-  const helperStart = src.indexOf("async function raiseForUmansStatus(");
-  const helperEnd = src.indexOf("\n}\n", helperStart);
-  const helperBody = src.slice(helperStart, helperEnd);
+  const helperStart = utilsSrc.indexOf("export async function raiseForUmansStatus(");
+  const helperEnd = utilsSrc.indexOf("\n}\n", helperStart);
+  const helperBody = utilsSrc.slice(helperStart, helperEnd);
   assert(helperBody.includes("handle429(res, concurrencyQueue)"),
     "raiseForUmansStatus runs the 429 push (handle429)");
   assert(helperBody.includes("sanitizeErrorBody(txt)"),
     "raiseForUmansStatus sanitizes the body (sanitizeErrorBody)");
+  // Both side-call sites call the helper in their !res.ok branch.
+  // analyzeImage lives in index.ts; searchWeb was split into web-search.ts.
+  // Read each file + assert the helper is called inside each function body.
+  const indexSrc = readFileSync("index.ts", "utf8");
+  const webSearchSrc = readFileSync("web-search.ts", "utf8");
+  const analyzeIdx = indexSrc.indexOf("async function analyzeImage(");
+  const searchIdx = webSearchSrc.indexOf("async function searchWeb(");
+  assert(analyzeIdx >= 0, "analyzeImage defined in index.ts");
+  assert(searchIdx >= 0, "searchWeb defined in web-search.ts");
+  const analyzeCallIdx = indexSrc.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", analyzeIdx);
+  const searchCallIdx = webSearchSrc.indexOf("await raiseForUmansStatus(res, concurrencyQueue);", searchIdx);
+  assert(analyzeCallIdx > analyzeIdx,
+    "analyzeImage !res.ok branch calls raiseForUmansStatus (index.ts)");
+  assert(searchCallIdx > searchIdx,
+    "searchWeb !res.ok branch calls raiseForUmansStatus (web-search.ts)");
 }
 
 // --- concurrent mutate calls from one process (intra-process O_EXCL lock contention) ---
@@ -5410,8 +5496,10 @@ if (process.platform !== "win32") {
 // postversion hook or a build step the hardcoded string would stay stale.
 // Pin that USER_AGENT is built from pkg.version (imported from package.json)
 // + that it currently matches the released version, so drift is caught in CI.
+// USER_AGENT + the package.json import live in utils.ts (the pure-helpers
+// module that owns the shared constants).
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   const pkg = JSON.parse(readFileSync("package.json", "utf8"));
   // USER_AGENT must be a template literal interpolating pkg.version, not a
   // hardcoded version string.
@@ -5523,17 +5611,18 @@ if (process.platform !== "win32") {
 // without a try/catch, unlike its 3 sibling cancel call sites. A lock-timeout
 // or disk error during the cancel would surface a Ctrl-C as an uncaught
 // extension error, defeating the C3 "return undefined, don't throw" contract.
+// The capacity-poll loop (including the abort path) was extracted to
+// acquireSlotCore in utils.ts (shared with web-search.ts), so the source
+// inspection reads utils.ts.
 {
-  const src = readFileSync("index.ts", "utf8");
+  const src = readFileSync("utils.ts", "utf8");
   // Find the abort path block.
   const abortBlock = src.match(/if \(decision === "abort"\) \{[\s\S]*?return undefined;\n\s*\}/)?.[0] ?? "";
   assert(abortBlock.length > 0,
-    "abort path block found in index.ts");
+    "abort path block found in utils.ts (acquireSlotCore)");
   // The cancel(ourId) call in the abort path must be wrapped in try/catch.
-  assert(abortBlock.includes('try { concurrencyQueue.cancel(ourId); } catch'),
+  assert(abortBlock.includes('try { queue.cancel(ourId); } catch'),
     "cancel(ourId) in abort path wrapped in try/catch (best-effort)");
-  // The sibling cancel calls must also be wrapped (regression guard).
-  const touchReapBlock = src.match(/touchToken.*?reaped[\s\S]*?\n\s*\}/)?.[0] ?? "";
 }
 
 // --- before_provider_request wraps acquireSlot in try/catch (fail-open on lock/disk error) ---
@@ -6324,6 +6413,345 @@ if (process.platform !== "win32") {
   }
 }
 
+// --- refreshStrikes does not push a strike pause when the account is not deprioritized ---
+// /v1/usage/history is eventually-consistent (lags real-time), so a poll can
+// return a stale count at/above the threshold that the server no longer
+// reports. /v1/usage is the capacity authority: its priority.low flag is the
+// server's own rate-limit signal, cached as `deprioritized` by refreshUsage.
+// When priority.low === false (the account is not deprioritized), a stale
+// history count must NOT push a strike pause — otherwise a clear account gets a
+// spurious 30-min pause. The strikes24h cache is still updated (the status bar
+// shows the count); only the pause push is gated.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-strike-gate-clear-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // /v1/usage: account is clear (priority.low: false). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18) —
+  // stale data the server no longer reports.
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    // session_start runs refreshUsage (caches priority.low=false → deprioritized=false)
+    // then schedules the immediate strike poll (setTimeout 0).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The stale 19-strike count is ≥ threshold 18, but the account is not
+    // deprioritized, so no strike pause is pushed.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason !== PAUSE_REASON_STRIKES,
+      "refreshStrikes does not push PAUSE_REASON_STRIKES when the account is not deprioritized (stale history ignored)");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- refreshStrikes pushes a strike pause when the account is deprioritized ---
+// Inverse of the gate: when /v1/usage reports priority.low === true (the server
+// is rate-limiting the account) AND the stale/real history count is ≥ the
+// threshold, the strike pause DOES fire. This confirms the gate does not break
+// the real protective path.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-q-strike-gate-deprio-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  const boxedUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  // /v1/usage: account is deprioritized (priority.low: true). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18).
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil, reason: "rate_limited" } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The server confirms rate-limiting (priority.low === true) AND the count is
+    // ≥ threshold 18, so the strike pause fires.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason === PAUSE_REASON_STRIKES,
+      "refreshStrikes pushes PAUSE_REASON_STRIKES when deprioritized + count ≥ threshold (real protective path)");
+    assert(typeof parsed.pausedUntil === "number" && parsed.pausedUntil > Date.now(),
+      "refreshStrikes strike pause has a future pausedUntil when deprioritized + count ≥ threshold");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- web-search factory: shared refreshStrikes gates the strike pause on deprioritized ---
+// The refresh/fetch machinery was extracted to utils.ts so both factories call
+// ONE copy of refreshStrikes. This drives the STANDALONE web-search factory
+// (index.ts's factory must NOT have run) through session_start with a stale
+// /v1/usage/history count at/above the threshold + priority.low === false,
+// + asserts no strike pause is pushed. Proves the shared gate covers the
+// web-search instance too — the divergence that re-introduced the
+// false-positive 30-min pause is structurally gone.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-strike-gate-clear-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  // /v1/usage: account is clear (priority.low: false). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18) —
+  // stale data the server no longer reports.
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    // Load ONLY the standalone web-search factory — index.ts's factory must NOT
+    // have run, so the strike poll is driven by the web-search instance's
+    // session_start handler calling the shared refreshStrikes.
+    await webSearchFactory(pi as any);
+    // session_start runs the shared refreshUsage (caches priority.low=false →
+    // rt.deprioritized=false) then restartRefreshLoop (immediate strike poll).
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The stale 19-strike count is ≥ threshold 18, but the account is not
+    // deprioritized, so the shared refreshStrikes does NOT push a strike pause.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason !== PAUSE_REASON_STRIKES,
+      "web-search factory refreshStrikes does not push a strike pause when the account is not deprioritized (shared gate covers the split factory)");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// --- web-search factory: shared refreshStrikes pushes a strike pause when deprioritized ---
+// Inverse of the web-search gate test: when /v1/usage reports priority.low ===
+// true AND the history count is ≥ the threshold, the shared refreshStrikes
+// DOES push the strike pause via the web-search instance. Confirms the gate
+// does not break the real protective path for the split factory.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-strike-gate-deprio-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  const boxedUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  // /v1/usage: account is deprioritized (priority.low: true). limit 2 → threshold 18.
+  // /v1/usage/history: 19 rate_limit_concurrency strikes (≥ threshold 18).
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 2, hard_cap: 4 } },
+        usage: { concurrent_sessions: 0, priority: { low: true, boxed_until: boxedUntil, reason: "rate_limited" } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.includes("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        buckets: [{ bucket: new Date().toISOString(), error_category: "rate_limit_concurrency", requests: 19 }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await webSearchFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    await new Promise((r) => setTimeout(r, 50));
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+    // The server confirms rate-limiting (priority.low === true) AND the count is
+    // ≥ threshold 18, so the shared refreshStrikes pushes the strike pause via
+    // the web-search instance.
+    const raw = existsSync(stateFile) ? readFileSync(stateFile, "utf8") : "{}";
+    const parsed = JSON.parse(raw);
+    assert(parsed.pausedReason === PAUSE_REASON_STRIKES,
+      "web-search factory refreshStrikes pushes a strike pause when deprioritized + count ≥ threshold (shared gate, real protective path)");
+    assert(typeof parsed.pausedUntil === "number" && parsed.pausedUntil > Date.now(),
+      "web-search factory strike pause has a future pausedUntil when deprioritized + count ≥ threshold");
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // --- refreshUsage preserves guaranteedConcurrency when /v1/usage returns 403-suspend ---
 // The synthetic cap_abuse object (fetchUsage on a /v1/usage 403 with a suspend
 // body) carries no `limits` field. The prior code unconditionally assigned
@@ -6990,6 +7418,927 @@ if (process.platform !== "win32") {
     "cap_abuse pause reason preserved after in-flight reap");
 
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- settings.ts: readSettings + deepMergeSettings + UmansSettings ---
+// The concurrency multiplier is read from ~/.pi/agent/umans.json (global) +
+// .pi/umans.json (project), deep-merged (project wins per-key). Malformed JSON
+// + invalid multiplier values fall back to defaults. The DI seam (path
+// overrides) lets these tests point at temp files without monkey-patching
+// homedir/cwd, so they're deterministic + hermetic.
+
+// deepMergeSettings: primitives → project wins
+assert(deepMergeSettings(1, 2) === 2, "deepMerge: primitive project wins");
+assert(deepMergeSettings(1, undefined) === 1, "deepMerge: undefined project keeps global");
+
+// deepMergeSettings: arrays → fully replaced (NOT concatenated)
+{
+  const merged = deepMergeSettings([1, 2], [3]) as unknown[];
+  assert(Array.isArray(merged) && merged.length === 1 && merged[0] === 3,
+    "deepMerge: array project replaces global entirely");
+}
+
+// deepMergeSettings: nested objects → deep merged (global siblings survive)
+{
+  const g = { search: { maxResults: 5, timeout: 30 } };
+  const p = { search: { maxResults: 10 } };
+  const merged = deepMergeSettings(g, p) as { search: { maxResults: number; timeout: number } };
+  assert(merged.search.maxResults === 10, "deepMerge: project overrides its key");
+  assert(merged.search.timeout === 30, "deepMerge: global sibling survives");
+}
+
+// deepMergeSettings: object replaces array (type change → project wins outright)
+{
+  const merged = deepMergeSettings([1, 2], { a: 1 });
+  assert(typeof merged === "object" && !Array.isArray(merged) && (merged as { a: number }).a === 1,
+    "deepMerge: object project replaces array global");
+}
+
+// deepMergeSettings: JSON null project wins outright (not merged)
+// A valid JSON literal {"concurrencyMultiplier": null} parses to project null.
+// deepMergeSettings returns null outright (null is not a plain object), so the
+// caller falls back to defaults via coerceSettings(null) → isPlainObject(null)
+// === false. A future refactor special-casing null would silently break.
+assert(deepMergeSettings({ a: 1 }, null) === null,
+  "deepMerge: null project wins outright (not merged)");
+
+// defaultSettings
+{
+  const d = defaultSettings();
+  assert(d.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "defaultSettings: multiplier is the default (1.0)");
+  assert(DEFAULT_CONCURRENCY_MULTIPLIER === 1.0, "DEFAULT_CONCURRENCY_MULTIPLIER is 1.0");
+}
+
+// readSettings: missing files → defaults (hermetic via DI seam)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-missing-"));
+  const globalPath = join(dir, "missing-global.json");
+  const projectPath = join(dir, "missing-project.json");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: missing files → default multiplier");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: global-only
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-global-"));
+  const globalPath = join(dir, "umans.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 0.5,
+    "readSettings: global-only → global value (0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: project-only
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-project-"));
+  const globalPath = join(dir, "missing-global.json");
+  const projectPath = join(dir, "umans.json");
+  writeFileSync(projectPath, JSON.stringify({ concurrencyMultiplier: 1.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 1.5,
+    "readSettings: project-only → project value (1.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: project overrides global
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-override-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  writeFileSync(projectPath, JSON.stringify({ concurrencyMultiplier: 1.5 }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 1.5,
+    "readSettings: project overrides global (1.5, not 0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: malformed global falls back to defaults (warns, doesn't crash)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  // trailing comma + unquoted key → invalid JSON
+  writeFileSync(globalPath, "{concurrencyMultiplier: 1.0,}");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: malformed global → default multiplier (no crash)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: malformed project falls back to global (when global is valid)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-proj-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  writeFileSync(projectPath, "{not valid json");
+  const s = readSettings({ globalPath, projectPath });
+  // Malformed project → null → deepMergeSettings(0.5-parsed, null) → the
+  // global object wins (isPlainObject(null) is false → project returned as
+  // null, but the merge treats null project as "no override" so global survives).
+  assert(s.concurrencyMultiplier === 0.5,
+    "readSettings: malformed project → global value survives (0.5)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: invalid multiplier values fall back to default
+// (0, negative, NaN, string, object, Infinity, + huge finite > the sane max)
+for (const [label, raw] of [
+  ["zero", 0],
+  ["negative", -1],
+  ["NaN", NaN],
+  ["string", "1.0"],
+  ["object", { x: 1 }],
+  ["Infinity", Infinity],
+  // A JSON literal null for the multiplier field ({"concurrencyMultiplier":null})
+  // is rejected (typeof null !== "number"). Mirrors the deepMerge null-project
+  // case: a null field falls back to the default, not a merge.
+  ["null", null],
+  // Huge finite multipliers would bypass the hard_cap clamp during the startup
+  // window + self-DoS the account via 429s. Rejected at validation time.
+  ["huge 1e300", 1e300],
+  ["huge 1000", 1000],
+] as [string, unknown][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-settings-invalid-${label}-`));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: raw }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    `readSettings: invalid multiplier (${label}) → default`);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: valid multiplier values accepted (0.5, 1.0, 2.0, 3.0)
+for (const [label, raw, expected] of [
+  ["half", 0.5, 0.5],
+  ["full", 1.0, 1.0],
+  ["double", 2.0, 2.0],
+  ["triple", 3.0, 3.0],
+] as [string, number, number][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-settings-valid-${label}-`));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: raw }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === expected,
+    `readSettings: valid multiplier (${label}=${raw}) accepted`);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: extra unknown keys ignored (forward-compat)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-extra-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: 2.0, futureField: "ignored" }));
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === 2.0,
+    "readSettings: extra unknown keys ignored (multiplier still read)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// readSettings: empty object → defaults (key absent → no warn, default returned)
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-empty-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  writeFileSync(globalPath, "{}");
+  const s = readSettings({ globalPath, projectPath });
+  assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+    "readSettings: empty object → default (key absent, no warn)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- settings file read hardened against symlink + huge file + content-leak (SEC-1, ADV-4, ADV-5) ---
+// readSettingsFile mirrors concurrency-queue.ts's readState: lstat-is-file guard
+// (rejects a planted symlink at the path), O_NOFOLLOW | O_NONBLOCK open-then-read
+// (rejects a path swap into a symlink or a FIFO wedge), a 64 KiB size cap
+// (rejects a hostile huge file before the read allocates), + a content-free
+// malformed-JSON warn (Node 20's JSON.parse message echoes a snippet of the
+// input — an info-leak vector via a symlink to a secrets file). These tests
+// pin each guard.
+{
+  const { symlinkSync } = await import("node:fs");
+  // (a) symlink settings file → defaults, no crash, no target content read.
+  // A planted symlink at the global path pointing at a fake secrets file must
+  // be rejected (lstat detects non-regular) + the target must NOT be read
+  // (the warn + the returned default carry no target content).
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-symlink-"));
+    const targetPath = join(dir, "secret-target");
+    const secretContent = "SUPERSECRET-LEAK-CANARY";
+    writeFileSync(targetPath, secretContent);
+    const globalPath = join(dir, "global.json");
+    symlinkSync(targetPath, globalPath); // global.json -> secret-target
+    const projectPath = join(dir, "missing-project.json");
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: symlink settings file → default (no crash, no content read)");
+    // The canary content must not be exfiltrated via a parsed multiplier or
+    // echoed into a warn. (A successful parse would return a multiplier; the
+    // guard returns defaults instead.)
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  // (b) >64 KiB settings file → defaults (rejected before the read allocates).
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-huge-"));
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, "missing-project.json");
+    // Write a 128 KiB file (2× the 64 KiB cap) with a valid multiplier at the
+    // start + padding. The size cap rejects it before JSON.parse runs.
+    const padding = " ".repeat(128 * 1024);
+    writeFileSync(globalPath, `{"concurrencyMultiplier":2.0}${padding}`);
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: >64 KiB settings file → default (size cap rejects before read allocates)");
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  // (c) malformed JSON → warn does NOT include the file content (info-leak guard).
+  // Node 20's JSON.parse SyntaxError message echoes ~10 chars of the input;
+  // the hardened readSettingsFile uses a content-free generic message instead.
+  // Capture console.warn + assert the canary content is not echoed.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "umans-settings-malformed-noleak-"));
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, "missing-project.json");
+    const canary = "MALFORMED-LEAK-CANARY";
+    writeFileSync(globalPath, `{"concurrencyMultiplier": ${canary}}`);
+    const originalWarn = console.warn;
+    const warned: string[] = [];
+    console.warn = (msg: string) => { warned.push(String(msg)); };
+    try {
+      const s = readSettings({ globalPath, projectPath });
+      assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+        "readSettings: malformed JSON → default");
+    } finally {
+      console.warn = originalWarn;
+    }
+    const joined = warned.join("\n");
+    assert(joined.includes("is not valid JSON"),
+      "readSettings: malformed JSON warn fires (content-free generic message)");
+    assert(!joined.includes(canary),
+      "readSettings: malformed JSON warn does not echo file content (info-leak guard)");
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- invalid multiplier value: warn does not echo attacker-controlled payload ---
+// The malformed-JSON warn is content-free (the block above). The invalid-VALUE
+// warn in coerceSettings must also be content-free: concurrencyMultiplier is
+// attacker-controlled (a hostile repo can write .pi/umans.json with a crafted
+// string or object), and echoing JSON.stringify(raw) would flow that payload
+// into console output (which pi captures into model context — an info-leak /
+// prompt-injection vector). The hardened warn echoes the value's TYPE, not the
+// value. Mirrors the malformed-JSON content-free principle.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-settings-invalid-value-noleak-"));
+  const globalPath = join(dir, "global.json");
+  const projectPath = join(dir, "missing-project.json");
+  const canary = "SECRET_TOKEN_canary";
+  writeFileSync(globalPath, JSON.stringify({ concurrencyMultiplier: canary }));
+  const originalWarn = console.warn;
+  const warned: string[] = [];
+  console.warn = (msg: string) => { warned.push(String(msg)); };
+  try {
+    const s = readSettings({ globalPath, projectPath });
+    assert(s.concurrencyMultiplier === DEFAULT_CONCURRENCY_MULTIPLIER,
+      "readSettings: string multiplier → default");
+  } finally {
+    console.warn = originalWarn;
+  }
+  const joined = warned.join("\n");
+  // The warn fires (the value is invalid) + echoes the type, not the value.
+  assert(joined.includes("concurrencyMultiplier is string"),
+    "readSettings: invalid multiplier warn echoes the type (string), not the value");
+  assert(!joined.includes(canary),
+    "readSettings: invalid multiplier warn does not echo attacker-controlled value (info-leak guard)");
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// --- concurrency multiplier wired into concurrencyLimit() (status-bar proof) ---
+// concurrencyLimit() is a closure inside the factory (not exported), so the
+// multiplier wiring is observed via the status bar's `Conc <current>/<limit>`
+// render. effectiveLimit = min(floor(serverLimit * multiplier), hardCap). The
+// deprio lowering (priority.low → cap - 1) is applied separately in
+// isCapacityFree (unchanged), so the status bar shows the pre-deprio multiplied
+// cap while the gate lowers by 1 when deprioritized — matching the prior
+// behavior where guaranteedConcurrency (pre-deprio) was shown.
+//
+// Each case: write a settings file, mock /v1/usage (limit + hard_cap),
+// dispatch session_start, assert the rendered `Conc 0/<expected>`.
+for (const [label, multiplier, serverLimit, hardCapVal, expectedLimit] of [
+  // multiplier 0.5 → floor(4 * 0.5) = 2
+  ["0.5 halves (4->2)", 0.5, 4, 8, 2],
+  // multiplier 1.0 → floor(4 * 1.0) = 4 (full server limit)
+  ["1.0 full (4->4)", 1.0, 4, 8, 4],
+  // multiplier 3.0 → floor(4 * 3.0) = 12, clamped to hard_cap 8
+  ["3.0 clamps to hard_cap (4->8)", 3.0, 4, 8, 8],
+  // multiplier 2.0 → floor(4 * 2.0) = 8, exactly hard_cap (no clamp needed)
+  ["2.0 to hard_cap (4->8)", 2.0, 4, 8, 8],
+  // multiplier 1.0, no hard_cap reported → just floor(4 * 1.0) = 4 (no clamp)
+  ["1.0 no hard_cap (4->4)", 1.0, 4, undefined, 4],
+  // multiplier 0.1 → floor(4 * 0.1) = floor(0.4) = 0, floored to at least 1 so
+  // a sub-1 multiplier gets at least 1 slot instead of wedging the gate
+  // (a limit of 0 means every request polls until the 60s fail-open).
+  ["0.1 floors to 1 (4->1)", 0.1, 4, 8, 1],
+] as [string, number, number, number | undefined, number][]) {
+  const dir = mkdtempSync(join(tmpdir(), `umans-mult-${label.replace(/[^a-z0-9]/gi, "-")}-`));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: multiplier }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_LIMIT; // no env override — multiplier path
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: serverLimit, ...(hardCapVal !== undefined ? { hard_cap: hardCapVal } : {}) } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const conc = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    assert(conc.includes(`Conc 0/${expectedLimit}`),
+      `concurrencyLimit multiplier ${label}: status shows Conc 0/${expectedLimit}, got '${conc}'`);
+    // Dispatch session_shutdown to stop the factory's refresh + strike timers so
+    // the event loop drains and the process can exit cleanly.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- UMANS_CONCURRENCY_LIMIT env override still wins (bypasses multiplier) ---
+// The env var is the deprecated absolute override (testing knob): when set it
+// takes precedence over the multiplier. A settings file with multiplier 0.5
+// (→ effective 2) is bypassed by UMANS_CONCURRENCY_LIMIT=3 → effective 3.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-mult-env-override-"));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+    UMANS_CONCURRENCY_LIMIT: "3",
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const widgetTexts: string[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget: (_key: string, content: string[] | undefined) => {
+            if (content) widgetTexts.push(content.join(""));
+          },
+          setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await umansFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const conc = widgetTexts.filter((t) => t.includes("Conc ")).pop() ?? "";
+    // Env override 3 wins over multiplier 0.5 (→ 2). hard_cap 8 doesn't clamp 3.
+    assert(conc.includes("Conc 0/3"),
+      `UMANS_CONCURRENCY_LIMIT=3 overrides multiplier 0.5: status shows Conc 0/3, got '${conc}'`);
+    // Dispatch session_shutdown to stop the factory's refresh + strike timers so
+    // the event loop drains and the process can exit cleanly.
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- deprio + multiplier interaction (isCapacityFree lowers multiplied cap) ---
+// The multiplier applies in concurrencyLimit() (pre-deprio); the deprio
+// lowering (priority.low → cap - 1) is applied in isCapacityFree (unchanged).
+// multiplier 1.0 + limit 4 → effectiveLimit 4; deprio → isCapacityFree gates
+// against 3. multiplier 0.5 + limit 4 → effectiveLimit 2; deprio → gates 1.
+// Assert the multiplied cap is lowered by 1 under deprio via the pure
+// isCapacityFree decision (no factory spin-up needed).
+{
+  // multiplier 1.0: effectiveLimit 4, deprio → cap 3
+  const d1 = isCapacityFree(
+    { concurrentSessions: 3, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d1.free === false,
+    "deprio + multiplier 1.0 (limit 4): 3 sessions >= cap 3 (4-1) → not free");
+  const d1b = isCapacityFree(
+    { concurrentSessions: 2, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 4, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d1b.free === true,
+    "deprio + multiplier 1.0 (limit 4): 2 sessions < cap 3 (4-1) → free");
+  // multiplier 0.5: effectiveLimit 2 (floor(4*0.5)), deprio → cap 1
+  const d2 = isCapacityFree(
+    { concurrentSessions: 1, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 2, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2.free === false,
+    "deprio + multiplier 0.5 (effectiveLimit 2): 1 session >= cap 1 (2-1) → not free");
+  const d2b = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 2, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2b.free === true,
+    "deprio + multiplier 0.5 (effectiveLimit 2): 0 sessions < cap 1 (2-1) → free");
+  // multiplier 3.0 clamped to hard_cap 8, deprio → cap 7
+  const d3 = isCapacityFree(
+    { concurrentSessions: 7, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 8, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d3.free === false,
+    "deprio + multiplier 3.0 (clamped to hard_cap 8): 7 sessions >= cap 7 (8-1) → not free");
+}
+
+// --- sub-1 multiplier + deprio: post-deprio cap floored to 1 (not 0) ---
+// The concurrencyLimit floor-of-1 (Math.max(1, Math.floor(serverLimit * multiplier)))
+// guarantees at least 1 slot for a sub-1 multiplier (e.g. 0.1 with limit 4 →
+// floor(0.4)=0 → floored to 1). isCapacityFree's deprio lowering must floor the
+// POST-deprio cap to 1 as well, so a sub-1 multiplier under deprio does not drop
+// the cap to 0 (max(0, 1-1)=0) → every poll reports not-free → a 60s stall before
+// fail-open on every launch while deprioritized. With the floor, the gate keeps
+// at least 1 slot live: cap = max(1, 1-1) = 1, so concurrentSessions 0 < 1 → free.
+// This is the wedge case: floor-to-1 THEN deprio lowering by 1.
+{
+  // multiplier 0.1: effectiveLimit = max(1, floor(4*0.1)) = max(1, 0) = 1.
+  // Under deprio, cap = max(1, 1-1) = max(1, 0) = 1 (floored, not 0).
+  const d = isCapacityFree(
+    { concurrentSessions: 0, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 1, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d.free === true,
+    "sub-1 multiplier (effectiveLimit 1) + deprio: 0 sessions < cap 1 (max(1, 1-1)) → free (not wedged at cap 0)");
+  // At 1 session under the same config, cap 1 is reached → not free (the gate
+  // still honors the deprio lowering — it just doesn't wedge at 0).
+  const d2 = isCapacityFree(
+    { concurrentSessions: 1, limit: 4, hardCap: 8, priority: { low: true, until: Date.now() + 30000, reason: "rate_limited" } },
+    { limit: 1, queuePaused: false, localInFlight: 0 },
+  );
+  assert(d2.free === false,
+    "sub-1 multiplier (effectiveLimit 1) + deprio: 1 session >= cap 1 (max(1, 1-1)) → not free (gate still honors deprio)");
+}
+
+// --- web-search split: standalone factory registers umans_web_search ---
+// The web-search tool was split out of index.ts into its own default-export
+// factory in web-search.ts so `pi config` (+/- on the extensions array in
+// settings.json) can toggle it independently of the provider. Verify the
+// factory registers the tool when loaded standalone — i.e. without index.ts's
+// factory having run. Mock the pi runtime, call the factory, inspect the
+// registered tool. No live search is performed (the execute body is only
+// invoked in the dedicated wiring tests above); this pins the registration
+// contract: the tool name, label, + parameter schema survive the split.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-standalone-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  try {
+    const tools = new Map<string, { name: string; label?: string; parameters?: any; execute?: Function }>();
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    // Load ONLY web-search.ts's factory — index.ts's factory must NOT have run
+    // (the standalone contract is that web-search.ts registers the tool on its
+    // own, so `pi config` can toggle it via +/- on the extensions array).
+    await webSearchFactory(pi as any);
+    assert(tools.has("umans_web_search"),
+      "web-search.ts standalone factory registered umans_web_search");
+    const tool = tools.get("umans_web_search")!;
+    assert(tool.label === "Umans Web Search",
+      `umans_web_search label preserved across split (got '${tool.label}')`);
+    // The parameter schema must survive the split: a single 'query' string.
+    assert(tool.parameters?.properties?.query?.type === "string",
+      "umans_web_search parameter schema preserved (query: string)");
+    assert(typeof tool.execute === "function",
+      "umans_web_search execute fn registered (callable by the LLM)");
+    // The factory must NOT register umans_vision (that stays in index.ts).
+    assert(!tools.has("umans_vision"),
+      "web-search.ts standalone factory did NOT register umans_vision (stays in index.ts)");
+    // session_start + session_shutdown handlers must be registered (the
+    // factory seeds its refresh loops + tears them down on shutdown).
+    assert(handlers.has("session_start"),
+      "web-search.ts registered session_start handler (refresh loop seeding)");
+    assert(handlers.has("session_shutdown"),
+      "web-search.ts registered session_shutdown handler (refresh loop teardown)");
+  } finally {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- web-search factory: rt.multiplier wired into the capacity gate ---
+// The multiplier-wiring status-bar proof (above) drives umansFactory (index.ts)
+// exclusively — web-search.ts has no status bar, so no test observes rt.multiplier
+// flowing into the web-search factory's acquireSlot/isCapacityFree path at a
+// non-default value. A regression dropping multiplier from web-search.ts's rt
+// literal (e.g. hardcoding 1.0, or omitting the field -> NaN -> gate wedges)
+// would go uncaught. This test loads ONLY webSearchFactory with a settings file
+// at concurrencyMultiplier: 0.5, mocks /v1/usage with limit 4, and drives a
+// real searchTool.execute. With multiplier 0.5, effectiveLimit = floor(4*0.5) =
+// 2. At concurrent_sessions 2 (== cap 2) the gate reports not-free -> acquireSlot
+// polls /v1/usage more than once (gated). At concurrent_sessions 0 (< cap 2) the
+// gate launches immediately (one poll). The contrast proves the cap is 2 (the
+// multiplied value), not 4 (the unmultiplied server limit) — so rt.multiplier
+// flows into the web-search factory's acquireSlot path.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-mult-wiring-"));
+  const stateFile = join(dir, "state.json");
+  const settingsFile = join(dir, "umans.json");
+  writeFileSync(settingsFile, JSON.stringify({ concurrencyMultiplier: 0.5 }));
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+    UMANS_SETTINGS_FILE: settingsFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_LIMIT; // no env override — multiplier path
+
+  const realFetch = globalThis.fetch;
+  // concurrentSessions controls what /v1/usage reports for the capacity gate.
+  // Phase 1: 2 (== multiplied cap 2) -> gated (not-free, polls repeatedly).
+  // Phase 2: 0 (< multiplied cap 2) -> free (launches after one poll).
+  let concurrentSessions = 2;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: concurrentSessions, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/messages")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        content: [{ type: "text", text: "search result text" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const tools = new Map<string, { execute: (id: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any> }>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool(def: any) { tools.set(def.name, def); },
+      registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    // Load ONLY the standalone web-search factory — index.ts's factory must NOT
+    // have run, so the capacity gate is driven by the web-search instance's rt.
+    await webSearchFactory(pi as any);
+    await dispatch("session_start", { type: "session_start", timestamp: Date.now() });
+    const searchTool = tools.get("umans_web_search")!;
+
+    // Phase 1: concurrent_sessions 2 == multiplied cap 2 (floor(4*0.5)). The
+    // gate reports not-free -> acquireSlot polls /v1/usage repeatedly. Use a
+    // short abort timeout so the gated execute returns (fail-open or abort)
+    // rather than waiting the full 60s. Assert >1 /v1/usage poll happened
+    // (the gate is live + gating against the multiplied cap, not 4).
+    concurrentSessions = 2;
+    usageCalls = 0;
+    const abortCtrl1 = new AbortController();
+    const exec1 = searchTool.execute("call-1", { query: "test gated" }, abortCtrl1.signal, undefined, makeCtx());
+    // Give the gate a moment to poll a few times, then abort to unblock.
+    await new Promise((r) => setTimeout(r, 500));
+    abortCtrl1.abort();
+    await exec1.catch(() => {});
+    assert(usageCalls > 1,
+      `web-search factory multiplier 0.5: concurrent_sessions 2 == cap 2 -> acquireSlot polled /v1/usage ${usageCalls} times (gated, not free)`);
+
+    // Phase 2: concurrent_sessions 0 < multiplied cap 2. The gate reports free
+    // immediately -> acquireSlot polls /v1/usage once + launches. The /v1/messages
+    // fetch fires (the side-call proceeded). Assert exactly the launch happened.
+    concurrentSessions = 0;
+    usageCalls = 0;
+    const res = await searchTool.execute("call-2", { query: "test free" }, new AbortController().signal, undefined, makeCtx());
+    assert(typeof res?.content?.[0]?.text === "string" && res.content[0].text.length > 0,
+      "web-search factory multiplier 0.5: concurrent_sessions 0 < cap 2 -> side-call launched (result text returned)");
+    // At least one /v1/usage poll + the /v1/messages side-call fired (proving
+    // the gate let the launch through). usageCalls >= 1 (the launch poll);
+    // it may be >1 if the periodic refreshUsage also ran, so just assert >= 1.
+    assert(usageCalls >= 1,
+      `web-search factory multiplier 0.5: concurrent_sessions 0 -> gate let launch through (polled /v1/usage ${usageCalls} times)`);
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- web-search factory: model_select stops the refresh loop on provider switch ---
+// web-search.ts's session_start seeds the periodic refreshUsage (5s) + strike
+// poll (5min). index.ts has a model_select handler that stops its refresh
+// loop when the user switches away from the umans provider; web-search.ts
+// must mirror that so it doesn't keep polling /v1/usage + /v1/usage/history
+// against an account the user is no longer actively driving. Load ONLY
+// webSearchFactory, dispatch session_start (drives refreshUsage), then
+// model_select to a non-umans provider, wait >5s (the periodic interval),
+// + assert no further /v1/usage poll fired (the loop stopped). Then dispatch
+// model_select back to umans + assert refreshUsage re-drove (re-seed path).
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-model-select-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  let usageCalls = 0;
+  globalThis.fetch = ((input: any) => {
+    const url = typeof input === "string" ? input : String(input);
+    if (url.endsWith("/v1/usage")) {
+      usageCalls++;
+      return Promise.resolve(new Response(JSON.stringify({
+        limits: { concurrency: { limit: 4, hard_cap: 8 } },
+        usage: { concurrent_sessions: 0, priority: { low: false } },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (url.endsWith("/v1/usage/history")) {
+      return Promise.resolve(new Response(JSON.stringify({ strikes: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    return Promise.resolve(new Response("", { status: 404 }));
+  }) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {}, registerCommand() {}, registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(model?: any): any {
+      return {
+        model: model ?? { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: { setWidget() {}, setStatus() {}, notify() {}, theme: { fg: (_n: string, t: string) => t } },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any, ctx?: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, ctx ?? makeCtx());
+    }
+    await webSearchFactory(pi as any);
+
+    // session_start seeds the refresh loop: refreshUsage fires immediately +
+    // the periodic 5s loop is armed.
+    await dispatch("session_start", { type: "session_start" });
+    await new Promise((r) => setTimeout(r, 30));
+    const usageAfterStart = usageCalls;
+    assert(usageAfterStart > 0, "web-search session_start drove refreshUsage (fetch /v1/usage)");
+
+    // model_select to a non-umans provider: must stop the refresh loop. Wait
+    // >5s (the periodic interval) + assert no further /v1/usage poll fired.
+    await dispatch("model_select",
+      { type: "model_select", model: { provider: "openai", id: "gpt-4" } },
+      makeCtx({ provider: "openai", id: "gpt-4" }));
+    await new Promise((r) => setTimeout(r, 5200));
+    assert(usageCalls === usageAfterStart,
+      `web-search model_select non-umans stopped the refresh loop (no further /v1/usage poll; calls still ${usageCalls}, was ${usageAfterStart})`);
+
+    // model_select back to umans: re-seeds the refresh loop. refreshUsage
+    // fires immediately, so usageCalls must increase.
+    const usageBeforeReSeed = usageCalls;
+    await dispatch("model_select",
+      { type: "model_select", model: { provider: "umans", id: "umans-flash" } },
+      makeCtx({ provider: "umans", id: "umans-flash" }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert(usageCalls > usageBeforeReSeed,
+      "web-search model_select back to umans re-seeded the refresh loop (refreshUsage re-drove)");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+// --- /umans-web-search operator command registered through wiring ---
+// The standalone web-search factory registers a /umans-web-search operator
+// command for discoverability (prints toggle status + pi config instructions).
+// Load ONLY webSearchFactory, capture the command def, + assert it's registered
+// + dispatching its handler produces a notify mentioning the toggle + pi config.
+{
+  const dir = mkdtempSync(join(tmpdir(), "umans-web-search-cmd-"));
+  const stateFile = join(dir, "state.json");
+  const savedEnv: Record<string, string | undefined> = {};
+  const envOverrides: Record<string, string> = {
+    UMANS_API_KEY: "uk-test-key",
+    UMANS_CONCURRENCY_STATE_FILE: stateFile,
+  };
+  for (const [k, v] of Object.entries(envOverrides)) {
+    savedEnv[k] = process.env[k];
+    process.env[k] = v;
+  }
+  delete process.env.UMANS_DISABLE;
+  delete process.env.UMANS_CONCURRENCY_DISABLE;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: any) =>
+    Promise.resolve(new Response("", { status: 404 }))) as any;
+  try {
+    const handlers = new Map<string, ((event: any, ctx: any) => Promise<any> | any)[]>();
+    const cmds = new Map<string, { handler: (args: string, ctx: any) => Promise<any> }>();
+    const notifications: { msg: string; type: string }[] = [];
+    const pi: any = {
+      on(event: string, h: (event: any, ctx: any) => Promise<any> | any) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(h);
+      },
+      registerTool() {},
+      registerCommand(name: string, def: any) { cmds.set(name, def); },
+      registerProvider() {},
+      events: { on() {}, off() {}, emit() {} },
+    };
+    function makeCtx(): any {
+      return {
+        model: { provider: "umans", id: "umans-flash" },
+        signal: new AbortController().signal, mode: "print", hasUI: false, cwd: dir, isIdle: () => true,
+        ui: {
+          setWidget() {}, setStatus() {},
+          notify: (msg: string, type?: string) => { notifications.push({ msg, type: type ?? "info" }); },
+          theme: { fg: (_n: string, t: string) => t },
+        },
+        modelRegistry: { getApiKeyForProvider: async () => "uk-test-key" }, sessionManager: {},
+      };
+    }
+    async function dispatch(event: string, payload: any): Promise<void> {
+      const hs = handlers.get(event);
+      if (!hs) return;
+      for (const h of hs) await h(payload, makeCtx());
+    }
+    await webSearchFactory(pi as any);
+    assert(cmds.has("umans-web-search"), "/umans-web-search command registered through wiring");
+    const cmd = cmds.get("umans-web-search")!;
+    notifications.length = 0;
+    await cmd.handler("", makeCtx());
+    const note = notifications.find((n) => n.msg.includes("Umans web search"));
+    assert(!!note, "/umans-web-search handler produced a notify");
+    assert(note!.msg.includes("enabled"), "/umans-web-search notify mentions enabled status");
+    assert(note!.msg.includes("pi config"), "/umans-web-search notify mentions pi config toggle instructions");
+
+    await dispatch("session_shutdown", { type: "session_shutdown" });
+  } finally {
+    globalThis.fetch = realFetch;
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 }
 
 console.log("\nall checks passed");
