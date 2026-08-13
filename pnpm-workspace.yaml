@@ -1,0 +1,6 @@
+# Build-script approval for the @earendil-works/pi-ai peer graph (mirrors
+# pi-steering/pi-napkin): genai's postinstall is needed for its JS runtime;
+# protobufjs works without its postinstall.
+allowBuilds:
+  '@google/genai': true
+  protobufjs: false

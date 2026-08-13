@@ -13,6 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # pnpm 11 — same install path pi uses for this extension, so an
+      # unapproved build script (ERR_PNPM_IGNORED_BUILDS) fails CI instead
+      # of breaking `pi update` locally.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -22,12 +30,13 @@ jobs:
           # derivation in index.ts). "20" alone is looser + a 20.0/20.1
           # setup-node image would fail at runtime.
           node-version: "20.10"
+          cache: pnpm
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
 
       - name: Type check
-        run: npm run check
+        run: pnpm run check
 
       - name: Selfcheck
-        run: npm test
+        run: pnpm test
