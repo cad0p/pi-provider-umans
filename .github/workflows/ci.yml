@@ -24,12 +24,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # CLN11-6/CLN12-8: pin to 20.10 (the engines floor in package.json,
-          # required for AbortSignal.any used in concurrency-queue.ts AND the
-          # `with { type: "json" }` ESM import attribute used for USER_AGENT
-          # derivation in index.ts). "20" alone is looser + a 20.0/20.1
-          # setup-node image would fail at runtime.
-          node-version: "20.10"
+          # CLN11-6/CLN12-8: pin to the engines floor's major (20.10+).
+          # 20.10 exactly is too old for pnpm 11 (needs node:util styleText,
+          # added in 20.12) — 22 is LTS and satisfies the >=20.10 floor.
+          node-version: "22"
           cache: pnpm
 
       - name: Install dependencies
