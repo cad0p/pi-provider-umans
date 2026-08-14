@@ -1,6 +1,9 @@
 {
-  "name": "pi-provider-umans",
+  "name": "@cad0p/pi-provider-umans",
   "version": "1.4.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Umans.ai provider for pi — Anthropic Messages-compatible endpoint with dynamic model discovery",
   "type": "module",
   "main": "index.ts",
@@ -28,12 +31,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/umans-ai/pi-provider-umans.git"
+    "url": "git+https://github.com/cad0p/pi-provider-umans.git"
   },
   "bugs": {
-    "url": "https://github.com/umans-ai/pi-provider-umans/issues"
+    "url": "https://github.com/cad0p/pi-provider-umans/issues"
   },
-  "homepage": "https://github.com/umans-ai/pi-provider-umans#readme",
+  "homepage": "https://github.com/cad0p/pi-provider-umans#readme",
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --experimental-strip-types selfcheck.ts",

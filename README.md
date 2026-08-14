@@ -6,7 +6,7 @@
 
 ```bash
 # From npm (once published)
-pi install npm:pi-provider-umans
+pi install npm:@cad0p/pi-provider-umans
 
 # From git
 pi install git:github.com/umans-ai/pi-provider-umans
