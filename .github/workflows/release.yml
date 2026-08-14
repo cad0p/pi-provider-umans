@@ -1,105 +1,34 @@
-name: Release
+name: Auto Release
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, 'release/*']
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
 
 jobs:
   release:
-    if: "!contains(github.event.head_commit.message, 'chore: bump version to')"
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      has_changes: ${{ steps.release.outputs.has_changes }}
+    steps:
+      - id: release
+        uses: cad0p/semver-calver-release/release@v1
+        with:
+          skip_release: ${{ github.ref != 'refs/heads/main' }}
+
+  publish:
+    needs: release
+    if: github.ref == 'refs/heads/main' && needs.release.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: cad0p/semver-calver-release/npm-publish@v1
         with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          # CLN11-6/CLN12-8: pin to 20.10 (the engines floor in package.json,
-          # required for AbortSignal.any used in concurrency-queue.ts AND the
-          # `with { type: "json" }` ESM import attribute used for USER_AGENT
-          # derivation in index.ts). "20" alone is looser + a 20.0/20.1
-          # setup-node image would fail at runtime.
-          node-version: "20.10"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Determine next version
-        id: version
-        run: |
-          set -euo pipefail
-
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "Latest tag: $LATEST_TAG"
-
-          if [ "$(git rev-list -n1 "$LATEST_TAG" 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]; then
-            echo "No new commits since $LATEST_TAG, skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-
-          COMMITS=$(git log "${LATEST_TAG}..HEAD" --pretty=format:"%s")
-
-          BUMP="patch"
-          if echo "$COMMITS" | grep -qE '^(feat|feat\(.*\)):'; then
-            BUMP="minor"
-          fi
-          if echo "$COMMITS" | grep -qE '(BREAKING CHANGE|^.+!: )'; then
-            BUMP="major"
-          fi
-
-          VERSION=${LATEST_TAG#v}
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          case $BUMP in
-            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH+1)) ;;
-          esac
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          NEW_TAG="v${NEW_VERSION}"
-
-          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
-
-          echo "=> Bumping ${BUMP}: ${LATEST_TAG} → ${NEW_TAG}"
-
-      - name: Update package.json
-        if: steps.version.outputs.skip != 'true'
-        run: npm version ${{ steps.version.outputs.new_version }} --no-git-tag-version
-
-      - name: Commit version bump and tag
-        if: steps.version.outputs.skip != 'true'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: bump version to ${{ steps.version.outputs.new_tag }}"
-          file_pattern: package.json
-          tagging_message: ${{ steps.version.outputs.new_tag }}
-
-      - name: Install dependencies
-        if: steps.version.outputs.skip != 'true'
-        run: npm install
-
-      - name: Verify (tsc + selfcheck)
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          npm run check
-          npm test
-
-      - name: Dry-run publish
-        if: steps.version.outputs.skip != 'true'
-        run: npm pack --dry-run
-
-      - name: Publish to npm
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          # OIDC Trusted Publishing needs npm >= 11.5.1 (Node 20 ships npm 10).
-          npm install -g npm@latest
-          npm publish --provenance --access public
+          tag: v${{ needs.release.outputs.version }}
