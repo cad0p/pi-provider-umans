@@ -24,10 +24,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # CLN11-6/CLN12-8: pin to the engines floor's major (20.10+).
-          # 20.10 exactly is too old for pnpm 11 (needs node:util styleText,
-          # added in 20.12) — 22 is LTS and satisfies the >=20.10 floor.
-          node-version: "22"
+          # CLN11-6/CLN12-8: node floor is >=20.10, but pnpm 11 needs 22.13+
+          # and pi-coding-agent 0.84.1 engines pin >=22.19.0 — exercise pi's
+          # minimum rather than the package's own (looser) floor.
+          node-version: "22.19"
           cache: pnpm
 
       - name: Install dependencies
