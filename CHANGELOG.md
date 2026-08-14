@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 - Cross-process FIFO concurrency queue + UMANS_SEARCH_DISABLE ([#1](https://github.com/cad0p/pi-provider-umans/pull/1))
 - Web search as separate file (pi config toggle) + concurrency multiplier ([#2](https://github.com/cad0p/pi-provider-umans/pull/2))
+- Declare engines node >=22.19.0 (pi's minimum) ([#6](https://github.com/cad0p/pi-provider-umans/pull/6))
 
 ### ⚙️ Miscellaneous Tasks
 
