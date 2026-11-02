@@ -14,6 +14,10 @@ All notable changes to this project will be documented in this file.
 - Web search as separate file (pi config toggle) + concurrency multiplier ([#2](https://github.com/cad0p/pi-provider-umans/pull/2))
 - Declare engines node >=22.19.0 (pi's minimum) ([#6](https://github.com/cad0p/pi-provider-umans/pull/6))
 
+### 🐛 Bug Fixes
+
+- *(package)* Ship CHANGELOG.md so Pi shows Extension Updates (closes #7)
+
 ### ⚙️ Miscellaneous Tasks
 
 - Migrate from npm to pnpm (pi-napkin pattern) ([#3](https://github.com/cad0p/pi-provider-umans/pull/3))
